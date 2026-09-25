@@ -1,0 +1,36 @@
+# --- Proje Özel Dosyalar ve Klasörler ---
+bin/
+dump/
+playground/
+node_modules/
+libbridge.so
+*.txt
+project_dump.js
+
+# --- İşletim Sistemi ve Editör Artıkları ---
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Linux
+~
+.fuse_hidden*
+.directory
+.Trash-*
+
+# Editörler / IDE'ler (VS Code vb.)
+.vscode/
+.idea/
+*.swp
+*.swo
