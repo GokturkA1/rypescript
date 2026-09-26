@@ -1052,10 +1052,11 @@ export class ASTLowerer {
             this.builder.markFeature("union");
           }
           const isArr = this.unwrapType(typeAnnot)?.type === "TSArrayType";
-          const pType = isFn ? fnSig.mlirType : (isUnion || isArr) ? "!llvm.ptr" : this.resolveType(typeAnnot);
+          const isStr = this.isStringType(typeAnnot);
+          const pType = isFn ? fnSig.mlirType : (isUnion || isArr || isStr) ? "!llvm.ptr" : this.resolveType(typeAnnot);
           const enumName = this.getEnumName(typeAnnot);
           const isChan = this.unwrapType(typeAnnot)?.typeName?.name === "Channel";
-          params.push({ name: param.name || `arg_${i}`, type: pType, isUnion, isArray: isArr, isFunction: isFn, fnSig, enumName, isChannel: isChan });
+          params.push({ name: param.name || `arg_${i}`, type: pType, isUnion, isArray: isArr, isFunction: isFn, fnSig, enumName, isChannel: isChan, isString: isStr });
           paramTypes.push(pType);
         });
 
@@ -1560,12 +1561,13 @@ export class ASTLowerer {
         const fnSig = isFn ? this.extractFunctionType(typeAnnot) : null;
         const isUnion = this.isUnionType(typeAnnot);
         const isArr = this.unwrapType(typeAnnot)?.type === "TSArrayType";
-        const pType = isFn ? fnSig.mlirType : (isUnion || isArr) ? "!llvm.ptr" : this.resolveType(typeAnnot);
+        const isStr = this.isStringType(typeAnnot);
+        const pType = isFn ? fnSig.mlirType : (isUnion || isArr || isStr) ? "!llvm.ptr" : this.resolveType(typeAnnot);
         const structName = this.getStructName(typeAnnot);
         const ssaArg = `%arg_${pName}`;
 
         paramStrings.push(`${ssaArg}: ${pType}`);
-        params.push({ name: pName, ssa: ssaArg, type: pType, structName, isUnion, isArray: isArr, isFunction: isFn, fnSig, typeAnnot });
+        params.push({ name: pName, ssa: ssaArg, type: pType, structName, isUnion, isArray: isArr, isFunction: isFn, fnSig, typeAnnot, isString: isStr });
       });
 
       const retType = isConstructor ? "none" : this.resolveType(fnExpr.returnType);
@@ -1623,7 +1625,7 @@ export class ASTLowerer {
           } else {
             const slot = this.builder.allocateStack(p.type);
             this.builder.store(slot.ptr, { ssa: p.ssa, type: p.type });
-            this.symbolTable.set(p.name, { ptr: slot.ptr, type: p.type, isRef: true });
+            this.symbolTable.set(p.name, { ptr: slot.ptr, type: p.type, isRef: true, isString: p.isString });
           }
         }
 
@@ -1672,13 +1674,14 @@ export class ASTLowerer {
       }
       const isArr = this.unwrapType(typeAnnot)?.type === "TSArrayType";
       const isChan = this.unwrapType(typeAnnot)?.typeName?.name === "Channel";
-      const pType = isFn ? fnSig.mlirType : (isUnion || isArr || isChan) ? "!llvm.ptr" : this.resolveType(typeAnnot);
+      const isStr = this.isStringType(typeAnnot);
+      const pType = isFn ? fnSig.mlirType : (isUnion || isArr || isChan || isStr) ? "!llvm.ptr" : this.resolveType(typeAnnot);
       const structName = this.getStructName(typeAnnot);
 
       const ssaArg = `%arg_${pName}`;
       paramStrings.push(`${ssaArg}: ${pType}`);
       paramTypes.push(pType);
-      params.push({ name: pName, ssa: ssaArg, type: pType, structName, isUnion, isArray: isArr, isFunction: isFn, fnSig, typeAnnot, isChannel: isChan });
+      params.push({ name: pName, ssa: ssaArg, type: pType, structName, isUnion, isArray: isArr, isFunction: isFn, fnSig, typeAnnot, isChannel: isChan, isString: isStr });
     });
 
     const innerRetType = fnMeta?.innerRetType || "f64";
@@ -1700,7 +1703,7 @@ export class ASTLowerer {
         for (const p of params) {
           const slot = this.builder.allocateStack(p.type);
           this.builder.store(slot.ptr, { ssa: p.ssa, type: p.type });
-          this.symbolTable.set(p.name, { ptr: slot.ptr, type: p.type, isRef: true });
+          this.symbolTable.set(p.name, { ptr: slot.ptr, type: p.type, isRef: true, isString: p.isString });
         }
 
         if (node.body?.body) {
@@ -1869,7 +1872,7 @@ export class ASTLowerer {
         } else {
           const slot = this.builder.allocateStack(p.type);
           this.builder.store(slot.ptr, { ssa: p.ssa, type: p.type });
-          this.symbolTable.set(p.name, { ptr: slot.ptr, type: p.type, isRef: true });
+          this.symbolTable.set(p.name, { ptr: slot.ptr, type: p.type, isRef: true, isString: p.isString });
         }
       }
 
