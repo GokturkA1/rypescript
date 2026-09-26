@@ -2,7 +2,9 @@
 import { dlopen, getRawPointer, suffix } from "node:ffi";
 import { existsSync, unlinkSync, readFileSync } from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const libMLIR = existsSync("/usr/local/lib/libMLIR-C.so")
   ? "/usr/local/lib/libMLIR-C.so"
   : `/usr/lib/libMLIR-C.so`;
@@ -81,7 +83,11 @@ const { functions: llvm } = dlopen(libLLVM, {
 });
 
 // 4. LLD In-Process Bridge (bridge.cpp)
-const libBridge = existsSync("./libbridge.so") ? "./libbridge.so" : `/usr/lib/libbridge.so`;
+const libBridge = existsSync(path.join(__dirname, "libbridge.so"))
+  ? path.join(__dirname, "libbridge.so")
+  : existsSync("./libbridge.so")
+  ? "./libbridge.so"
+  : `/usr/lib/libbridge.so`;
 const { functions: bridge } = dlopen(libBridge, {
   link_elf: { arguments: ["int32", "pointer"], return: "bool" },
   link_coff: { arguments: ["int32", "pointer"], return: "bool" },
@@ -242,7 +248,7 @@ export class CompilerEngine {
     const cpuBuf = Buffer.from("generic\0", "utf8");
     // RelocMode: 2 (LLVMRelocPIC) - Paylaşımlı kütüphaneler (.so, .node) ve PIE için zorunludur
     const relocMode = (format === "elf" || format === "so" || format === "node") ? 2 : 0;
-    const tm = llvm.LLVMCreateTargetMachine(target, tripleBuf, cpuBuf, emptyBuf, 2, 2, 0);
+    const tm = llvm.LLVMCreateTargetMachine(target, tripleBuf, cpuBuf, emptyBuf, 2, relocMode, 0);
 
     // Tipik derleyici davranışı: .o dosyası çıktı adına göre belirlenir ve kalıcıdır
     const outExt = path.extname(outputFile);
@@ -308,9 +314,11 @@ export class CompilerEngine {
           ...searchDirs.map((d) => `-L${d}`),
           "-lc",
           "-lm",
+          "-lpthread",
           "-o", outputFile,
         ];
-      } else if (format === "coff") {
+      }
+ else if (format === "coff") {
         linkerArgs = [objFile, `/out:${outputFile}`, "/entry:main", "/subsystem:console"];
       } else if (format === "macho") {
         linkerArgs = ["-o", outputFile, objFile, "-lSystem"];

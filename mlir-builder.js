@@ -278,6 +278,20 @@ export class MLIRBuilder {
     this.markFeature("strings");
     this.markFeature("heap");
 
+    if (val.isNull) {
+      const nullStr = this.getOrRegisterString("null");
+      const ssa = this.nextSSA();
+      this.emit(`${ssa} = llvm.mlir.addressof ${nullStr} : !llvm.ptr`);
+      return { ssa, ptr: ssa, type: "!llvm.ptr", isString: true, isHeap: false };
+    }
+
+    if (val.isUndefined) {
+      const undefStr = this.getOrRegisterString("undefined");
+      const ssa = this.nextSSA();
+      this.emit(`${ssa} = llvm.mlir.addressof ${undefStr} : !llvm.ptr`);
+      return { ssa, ptr: ssa, type: "!llvm.ptr", isString: true, isHeap: false };
+    }
+
     if (val.type === "i64" || val.type === "i32") {
       let intVal = val;
       if (val.type === "i32") {
@@ -326,6 +340,31 @@ export class MLIRBuilder {
       return { ssa, ptr: ssa, type: "!llvm.ptr", isString: true, isHeap: true };
     }
 
+    if (val.type === "!llvm.ptr") {
+      const nullPtr = this.nextSSA();
+      this.emit(`${nullPtr} = llvm.mlir.zero : !llvm.ptr`);
+      const isNullSSA = this.nextSSA();
+      this.emit(`${isNullSSA} = llvm.icmp "eq" ${val.ssa || val.ptr}, ${nullPtr} : !llvm.ptr`);
+
+      const nullStr = this.getOrRegisterString("null");
+      const nullStrSSA = this.nextSSA();
+      this.emit(`${nullStrSSA} = llvm.mlir.addressof ${nullStr} : !llvm.ptr`);
+
+      const objStr = this.getOrRegisterString("[object Object]");
+      const objStrSSA = this.nextSSA();
+      this.emit(`${objStrSSA} = llvm.mlir.addressof ${objStr} : !llvm.ptr`);
+
+      const slot = this.allocateStack("!llvm.ptr");
+      this.createIf(
+        { ssa: isNullSSA, type: "i1" },
+        () => this.emit(`llvm.store ${nullStrSSA}, ${slot.ptr} : !llvm.ptr, !llvm.ptr`),
+        () => this.emit(`llvm.store ${objStrSSA}, ${slot.ptr} : !llvm.ptr, !llvm.ptr`)
+      );
+      const res = this.load(slot.ptr, "!llvm.ptr");
+      res.isString = true;
+      return res;
+    }
+
     return val;
   }
 
@@ -370,12 +409,25 @@ export class MLIRBuilder {
     this.emit(`func.call @rts_print_newline() : () -> ()`);
   }
 
+  printPointer(ptr) {
+    this.markFeature("printf");
+    this.emit(`func.call @rts_print_ptr(${ptr}) : (!llvm.ptr) -> ()`);
+  }
+
   buildFullModule(options = {}) {
     const isWasm = (options.format || "elf") === "wasm";
     const triple = isWasm ? "wasm32-unknown-unknown" : "x86_64-pc-linux-gnu";
     let header = `module attributes {llvm.data_layout = "", llvm.target_triple = "${triple}"} {\n`;
 
-    const needsHeap = this.usedFeatures.heap || this.usedFeatures.map || this.usedFeatures.strings || this.usedFeatures.union || this.usedFeatures.channels || this.usedFeatures.allocators || this.usedFeatures.napi;
+    const needsHeap =
+      this.usedFeatures.heap ||
+      this.usedFeatures.map ||
+      this.usedFeatures.strings ||
+      this.usedFeatures.union ||
+      this.usedFeatures.channels ||
+      this.usedFeatures.allocators ||
+      this.usedFeatures.napi ||
+      this.usedFeatures.threads;
 
     // 1. Dış Bağımlılıklar (sprintf tamamen kaldırıldı!)
     if (this.usedFeatures.printf) {
@@ -447,17 +499,18 @@ export class MLIRBuilder {
       header += `  llvm.mlir.global internal constant @fmt_i32("%d\\00")\n`;
       header += `  llvm.mlir.global internal constant @fmt_i64("%ld\\00")\n`;
       header += `  llvm.mlir.global internal constant @fmt_str("%s\\00")\n`;
+      header += `  llvm.mlir.global internal constant @fmt_ptr("%p\\00")\n`;
       header += `  llvm.mlir.global internal constant @fmt_space(" \\00")\n`;
       header += `  llvm.mlir.global internal constant @fmt_nl("\\0A\\00")\n`;
     }
 
     if (this.usedFeatures.exceptions) {
       header += `  llvm.mlir.global internal constant @fmt_uncaught_err("Uncaught Exception: %s\\0A\\00")\n\n`;
-      header += `  llvm.mlir.global internal @rts_current_jmpbuf() : !llvm.ptr {\n`;
+      header += `  llvm.mlir.global internal thread_local @rts_current_jmpbuf() : !llvm.ptr {\n`;
       header += `    %0 = llvm.mlir.zero : !llvm.ptr\n`;
       header += `    llvm.return %0 : !llvm.ptr\n`;
       header += `  }\n\n`;
-      header += `  llvm.mlir.global internal @rts_current_exception() : !llvm.ptr {\n`;
+      header += `  llvm.mlir.global internal thread_local @rts_current_exception() : !llvm.ptr {\n`;
       header += `    %0 = llvm.mlir.zero : !llvm.ptr\n`;
       header += `    llvm.return %0 : !llvm.ptr\n`;
       header += `  }\n\n`;
@@ -587,20 +640,25 @@ export class MLIRBuilder {
       header += `    %c1 = llvm.mlir.constant(1 : i64) : i64\n`;
       header += `    %c0_i8 = llvm.mlir.constant(0 : i8) : i8\n`;
       header += `    %c1_i32 = arith.constant 1 : i32\n`;
+      header += `    %null = llvm.mlir.zero : !llvm.ptr\n`;
+      header += `    %is_null = llvm.icmp "eq" %arg0, %null : !llvm.ptr\n`;
       header += `    %idx_slot = llvm.alloca %c1_i32 x i64 : (i32) -> !llvm.ptr\n`;
       header += `    llvm.store %c0, %idx_slot : i64, !llvm.ptr\n`;
-      header += `    scf.while : () -> () {\n`;
-      header += `      %idx = llvm.load %idx_slot : !llvm.ptr -> i64\n`;
-      header += `      %c_ptr = llvm.getelementptr %arg0[%idx] : (!llvm.ptr, i64) -> !llvm.ptr, i8\n`;
-      header += `      %ch = llvm.load %c_ptr : !llvm.ptr -> i8\n`;
-      header += `      %cond = arith.cmpi ne, %ch, %c0_i8 : i8\n`;
-      header += `      scf.condition(%cond)\n`;
-      header += `    } do {\n`;
-      header += `    ^bb0:\n`;
-      header += `      %idx = llvm.load %idx_slot : !llvm.ptr -> i64\n`;
-      header += `      %next = arith.addi %idx, %c1 : i64\n`;
-      header += `      llvm.store %next, %idx_slot : i64, !llvm.ptr\n`;
-      header += `      scf.yield\n`;
+      header += `    scf.if %is_null {\n`;
+      header += `    } else {\n`;
+      header += `      scf.while : () -> () {\n`;
+      header += `        %idx = llvm.load %idx_slot : !llvm.ptr -> i64\n`;
+      header += `        %c_ptr = llvm.getelementptr %arg0[%idx] : (!llvm.ptr, i64) -> !llvm.ptr, i8\n`;
+      header += `        %ch = llvm.load %c_ptr : !llvm.ptr -> i8\n`;
+      header += `        %cond = arith.cmpi ne, %ch, %c0_i8 : i8\n`;
+      header += `        scf.condition(%cond)\n`;
+      header += `      } do {\n`;
+      header += `      ^bb0:\n`;
+      header += `        %idx = llvm.load %idx_slot : !llvm.ptr -> i64\n`;
+      header += `        %next = arith.addi %idx, %c1 : i64\n`;
+      header += `        llvm.store %next, %idx_slot : i64, !llvm.ptr\n`;
+      header += `        scf.yield\n`;
+      header += `      }\n`;
       header += `    }\n`;
       header += `    %res = llvm.load %idx_slot : !llvm.ptr -> i64\n`;
       header += `    func.return %res : i64\n`;
@@ -746,36 +804,77 @@ export class MLIRBuilder {
 
       // 4. @rts_f64_to_str (Freestanding ftoa: kesir yoksa tam sayı, varsa 4 basamak)
       header += `  func.func @rts_f64_to_str(%val: f64) -> !llvm.ptr {\n`;
-      header += `    %i_part = arith.fptosi %val : f64 to i64\n`;
-      header += `    %i_f64 = arith.sitofp %i_part : i64 to f64\n`;
-      header += `    %diff = arith.subf %val, %i_f64 : f64\n`;
       header += `    %c0_f64 = arith.constant 0.0 : f64\n`;
-      header += `    %s_int = func.call @rts_i64_to_str(%i_part) : (i64) -> !llvm.ptr\n`;
+      header += `    %val_is_neg = arith.cmpf olt, %val, %c0_f64 : f64\n`;
+      header += `    %abs_val = scf.if %val_is_neg -> (f64) {\n`;
+      header += `      %neg = arith.subf %c0_f64, %val : f64\n`;
+      header += `      scf.yield %neg : f64\n`;
+      header += `    } else {\n`;
+      header += `      scf.yield %val : f64\n`;
+      header += `    }\n`;
+      header += `    %i_part = arith.fptosi %abs_val : f64 to i64\n`;
+      header += `    %i_f64 = arith.sitofp %i_part : i64 to f64\n`;
+      header += `    %diff = arith.subf %abs_val, %i_f64 : f64\n`;
+      header += `    %s_int_raw = func.call @rts_i64_to_str(%i_part) : (i64) -> !llvm.ptr\n`;
+      header += `    %s_int = scf.if %val_is_neg -> (!llvm.ptr) {\n`;
+      header += `      %c2 = llvm.mlir.constant(2 : i64) : i64\n`;
+      header += `      %minus_buf = llvm.call @malloc(%c2) : (i64) -> !llvm.ptr\n`;
+      header += `      %c45_i8 = llvm.mlir.constant(45 : i8) : i8\n`;
+      header += `      %c0_i8 = llvm.mlir.constant(0 : i8) : i8\n`;
+      header += `      llvm.store %c45_i8, %minus_buf : i8, !llvm.ptr\n`;
+      header += `      %c1 = llvm.mlir.constant(1 : i64) : i64\n`;
+      header += `      %m_term = llvm.getelementptr %minus_buf[%c1] : (!llvm.ptr, i64) -> !llvm.ptr, i8\n`;
+      header += `      llvm.store %c0_i8, %m_term : i8, !llvm.ptr\n`;
+      header += `      %neg_s = func.call @rts_str_concat(%minus_buf, %s_int_raw) : (!llvm.ptr, !llvm.ptr) -> !llvm.ptr\n`;
+      header += `      scf.yield %neg_s : !llvm.ptr\n`;
+      header += `    } else {\n`;
+      header += `      scf.yield %s_int_raw : !llvm.ptr\n`;
+      header += `    }\n`;
       header += `    %is_zero = arith.cmpf oeq, %diff, %c0_f64 : f64\n`;
       header += `    %res = scf.if %is_zero -> (!llvm.ptr) {\n`;
       header += `      scf.yield %s_int : !llvm.ptr\n`;
       header += `    } else {\n`;
-      header += `      %is_neg = arith.cmpf olt, %diff, %c0_f64 : f64\n`;
-      header += `      %pos_diff = scf.if %is_neg -> (f64) {\n`;
-      header += `        %neg = arith.subf %c0_f64, %diff : f64\n`;
-      header += `        scf.yield %neg : f64\n`;
-      header += `      } else {\n`;
-      header += `        scf.yield %diff : f64\n`;
-      header += `      }\n`;
-      header += `      %scale = arith.constant 10000.0 : f64\n`;
-      header += `      %scaled_frac = arith.mulf %pos_diff, %scale : f64\n`;
-      header += `      %frac_int = arith.fptosi %scaled_frac : f64 to i64\n`;
-      header += `      %c2 = llvm.mlir.constant(2 : i64) : i64\n`;
-      header += `      %dot_buf = llvm.call @malloc(%c2) : (i64) -> !llvm.ptr\n`;
+      header += `      %c1_i32 = arith.constant 1 : i32\n`;
+      header += `      %c0_i64 = llvm.mlir.constant(0 : i64) : i64\n`;
+      header += `      %c1_i64 = llvm.mlir.constant(1 : i64) : i64\n`;
+      header += `      %c4_i64 = llvm.mlir.constant(4 : i64) : i64\n`;
+      header += `      %c6_i64 = llvm.mlir.constant(6 : i64) : i64\n`;
+      header += `      %frac_buf = llvm.call @malloc(%c6_i64) : (i64) -> !llvm.ptr\n`;
       header += `      %c46_i8 = llvm.mlir.constant(46 : i8) : i8\n`;
+      header += `      %c48_i8 = llvm.mlir.constant(48 : i8) : i8\n`;
       header += `      %c0_i8 = llvm.mlir.constant(0 : i8) : i8\n`;
-      header += `      llvm.store %c46_i8, %dot_buf : i8, !llvm.ptr\n`;
-      header += `      %c1 = llvm.mlir.constant(1 : i64) : i64\n`;
-      header += `      %dot_term = llvm.getelementptr %dot_buf[%c1] : (!llvm.ptr, i64) -> !llvm.ptr, i8\n`;
-      header += `      llvm.store %c0_i8, %dot_term : i8, !llvm.ptr\n`;
-      header += `      %s_frac = func.call @rts_i64_to_str(%frac_int) : (i64) -> !llvm.ptr\n`;
-      header += `      %tmp = func.call @rts_str_concat(%s_int, %dot_buf) : (!llvm.ptr, !llvm.ptr) -> !llvm.ptr\n`;
-      header += `      %full = func.call @rts_str_concat(%tmp, %s_frac) : (!llvm.ptr, !llvm.ptr) -> !llvm.ptr\n`;
+      header += `      llvm.store %c46_i8, %frac_buf : i8, !llvm.ptr\n`;
+      header += `      %c10_f64 = arith.constant 10.0 : f64\n`;
+      header += `      %cur_diff_slot = llvm.alloca %c1_i32 x f64 : (i32) -> !llvm.ptr\n`;
+      header += `      llvm.store %diff, %cur_diff_slot : f64, !llvm.ptr\n`;
+      header += `      %idx_slot = llvm.alloca %c1_i32 x i64 : (i32) -> !llvm.ptr\n`;
+      header += `      llvm.store %c0_i64, %idx_slot : i64, !llvm.ptr\n`;
+      header += `      scf.while : () -> () {\n`;
+      header += `        %idx = llvm.load %idx_slot : !llvm.ptr -> i64\n`;
+      header += `        %cond = arith.cmpi slt, %idx, %c4_i64 : i64\n`;
+      header += `        scf.condition(%cond)\n`;
+      header += `      } do {\n`;
+      header += `      ^bb0:\n`;
+      header += `        %idx = llvm.load %idx_slot : !llvm.ptr -> i64\n`;
+      header += `        %cur_d = llvm.load %cur_diff_slot : !llvm.ptr -> f64\n`;
+      header += `        %d10 = arith.mulf %cur_d, %c10_f64 : f64\n`;
+      header += `        %digit = arith.fptosi %d10 : f64 to i64\n`;
+      header += `        %digit_f64 = arith.sitofp %digit : i64 to f64\n`;
+      header += `        %next_d = arith.subf %d10, %digit_f64 : f64\n`;
+      header += `        llvm.store %next_d, %cur_diff_slot : f64, !llvm.ptr\n`;
+      header += `        %digit_i8 = arith.trunci %digit : i64 to i8\n`;
+      header += `        %char_val = arith.addi %digit_i8, %c48_i8 : i8\n`;
+      header += `        %pos = arith.addi %idx, %c1_i64 : i64\n`;
+      header += `        %dst = llvm.getelementptr %frac_buf[%pos] : (!llvm.ptr, i64) -> !llvm.ptr, i8\n`;
+      header += `        llvm.store %char_val, %dst : i8, !llvm.ptr\n`;
+      header += `        %next_idx = arith.addi %idx, %c1_i64 : i64\n`;
+      header += `        llvm.store %next_idx, %idx_slot : i64, !llvm.ptr\n`;
+      header += `        scf.yield\n`;
+      header += `      }\n`;
+      header += `      %c5_i64 = llvm.mlir.constant(5 : i64) : i64\n`;
+      header += `      %term = llvm.getelementptr %frac_buf[%c5_i64] : (!llvm.ptr, i64) -> !llvm.ptr, i8\n`;
+      header += `      llvm.store %c0_i8, %term : i8, !llvm.ptr\n`;
+      header += `      %full = func.call @rts_str_concat(%s_int, %frac_buf) : (!llvm.ptr, !llvm.ptr) -> !llvm.ptr\n`;
       header += `      scf.yield %full : !llvm.ptr\n`;
       header += `    }\n`;
       header += `    func.return %res : !llvm.ptr\n`;
@@ -803,6 +902,12 @@ export class MLIRBuilder {
 
       header += `  func.func @rts_print_str(%arg0: !llvm.ptr) {\n`;
       header += `    %fmt = llvm.mlir.addressof @fmt_str : !llvm.ptr\n`;
+      header += `    llvm.call @printf(%fmt, %arg0) {var_callee_type = !llvm.func<i32 (!llvm.ptr, ...)>} : (!llvm.ptr, !llvm.ptr) -> i32\n`;
+      header += `    func.return\n`;
+      header += `  }\n\n`;
+
+      header += `  func.func @rts_print_ptr(%arg0: !llvm.ptr) {\n`;
+      header += `    %fmt = llvm.mlir.addressof @fmt_ptr : !llvm.ptr\n`;
       header += `    llvm.call @printf(%fmt, %arg0) {var_callee_type = !llvm.func<i32 (!llvm.ptr, ...)>} : (!llvm.ptr, !llvm.ptr) -> i32\n`;
       header += `    func.return\n`;
       header += `  }\n\n`;

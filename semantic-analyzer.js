@@ -35,8 +35,19 @@ export class SemanticAnalyzer {
     this.functionSignatures.set("panic", { params: ["string"], returnType: "never" });
     this.functionSignatures.set("assert", { params: ["boolean", "string"], returnType: "void" });
     this.functionSignatures.set("join", { params: ["pointer"], returnType: "void" });
+    this.functionSignatures.set("Ok", { params: ["any"], returnType: "Result" });
+    this.functionSignatures.set("Err", { params: ["any"], returnType: "Result" });
+    this.functionSignatures.set("unwrap", { params: ["any"], returnType: "any" });
 
     // Standart Sınıflar ve Özel Bellek Yöneticileri
+    this.structSignatures.set("Result", {
+      fields: new Map([
+        ["ok", { type: "boolean" }],
+        ["value", { type: "any" }],
+        ["error", { type: "any" }],
+      ]),
+      methods: new Map(),
+    });
     this.structSignatures.set("Arena", {
       fields: new Map(),
       methods: new Map([
@@ -147,6 +158,8 @@ export class SemanticAnalyzer {
     if (expected === "any" || actual === "any") return true;
     if (expected === actual) return true;
     if (expected === "pointer" && actual.endsWith("*")) return true;
+    if (actual === "pointer" && (expected === "pointer" || this.structSignatures.has(expected))) return true;
+    if (expected === "pointer" && (actual === "pointer" || this.structSignatures.has(actual))) return true;
 
     // 1. Enum Uyumluluğu
     if (this.enumSignatures.has(expected)) {
@@ -232,8 +245,18 @@ export class SemanticAnalyzer {
 
         if (decl.type === "TSTypeAliasDeclaration") {
           const aliasName = decl.id.name;
-          const inner = decl.typeAnnotation;
+          let inner = decl.typeAnnotation;
           this.typeAliasRegistry.set(aliasName, inner);
+
+          if (
+            inner.type === "TSTypeReference" &&
+            (inner.typeName?.name === "Untagged" || inner.typeName?.value === "Untagged")
+          ) {
+            const typeArg = inner.typeParameters?.params?.[0] || inner.typeArguments?.params?.[0];
+            if (typeArg) {
+              inner = typeArg;
+            }
+          }
 
           if (inner.type === "TSIntersectionType") {
             const mergedFields = new Map();
@@ -247,6 +270,19 @@ export class SemanticAnalyzer {
               }
             }
             this.structSignatures.set(aliasName, { name: aliasName, fields: mergedFields, methods: new Map(), node: decl });
+          } else if (inner.type === "TSTypeLiteral") {
+            const rawMembers =
+              inner.members ||
+              inner.body?.body ||
+              inner.body?.members ||
+              (Array.isArray(inner.body) ? inner.body : []);
+            const fields = new Map();
+            for (const member of rawMembers) {
+              const fName = member.key?.name || member.key?.value || member.name || member.id?.name;
+              const fType = this.resolveType(member.typeAnnotation);
+              fields.set(fName, { type: fType, node: member });
+            }
+            this.structSignatures.set(aliasName, { name: aliasName, fields, methods: new Map(), node: decl });
           } else if (inner.type === "TSUnionType") {
             const variants = (inner.types || []).map((t) => this.resolveType(t));
             this.unionRegistry.set(aliasName, variants);
@@ -487,6 +523,9 @@ export class SemanticAnalyzer {
   inferExpressionType(expr, expectedType = null) {
     if (!expr) return "void";
 
+    if (expr.type === "NullLiteral" || (expr.type === "Literal" && expr.value === null)) {
+      return "pointer";
+    }
     if (expr.type === "NumericLiteral" || (expr.type === "Literal" && typeof expr.value === "number")) {
       return "number";
     }
@@ -506,11 +545,45 @@ export class SemanticAnalyzer {
       return "function";
     }
     if (expr.type === "AwaitExpression") {
+      if (expr.argument.type === "Identifier") {
+        const sym = this.lookupSymbol(expr.argument.name);
+        if (sym?.defNode?.id?.typeAnnotation) {
+          const unwrapped = this.unwrapType(sym.defNode.id.typeAnnotation);
+          const typeName = unwrapped?.typeName?.name || unwrapped?.typeName?.value;
+          if (typeName === "Promise") {
+            const innerParam = unwrapped.typeParameters?.params?.[0] || unwrapped.typeArguments?.params?.[0];
+            if (innerParam) return this.resolveType(innerParam);
+          }
+        }
+      }
+      if (expr.argument.type === "CallExpression" && expr.argument.callee.type === "Identifier") {
+        const fnMeta = this.functionSignatures.get(expr.argument.callee.name);
+        if (fnMeta?.returnType) return fnMeta.returnType;
+      }
+      const argType = this.inferExpressionType(expr.argument);
+      if (argType && argType.startsWith("Promise<") && argType.endsWith(">")) {
+        return argType.slice(8, -1);
+      }
+      return expectedType || "any";
+    }
+    if (expr.type === "UnaryExpression") {
+      if (expr.operator === "!" || expr.operator === "delete") return "boolean";
+      if (expr.operator === "typeof") return "string";
+      if (expr.operator === "-" || expr.operator === "+" || expr.operator === "~") {
+        this.inferExpressionType(expr.argument);
+        return "number";
+      }
+      return "any";
+    }
+    if (expr.type === "UpdateExpression") {
       this.inferExpressionType(expr.argument);
       return "number";
     }
 
     if (expr.type === "Identifier") {
+      if (expr.name === "undefined") {
+        return "any";
+      }
       if (this.enumSignatures.has(expr.name)) {
         return expr.name;
       }
