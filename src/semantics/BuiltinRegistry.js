@@ -103,5 +103,25 @@ export class BuiltinRegistry {
         ["has", { params: ["any"], returnType: "boolean" }],
       ]),
     });
+
+    // 8. Math Yardımcıları
+    this.structSignatures.set("Math", {
+      fields: new Map([
+        ["PI", { type: "number" }],
+        ["E", { type: "number" }],
+      ]),
+      methods: new Map([
+        ["sqrt", { params: ["number"], returnType: "number" }],
+        ["sin", { params: ["number"], returnType: "number" }],
+        ["cos", { params: ["number"], returnType: "number" }],
+        ["floor", { params: ["number"], returnType: "number" }],
+        ["ceil", { params: ["number"], returnType: "number" }],
+        ["round", { params: ["number"], returnType: "number" }],
+        ["abs", { params: ["number"], returnType: "number" }],
+        ["min", { params: ["number", "number"], returnType: "number" }],
+        ["max", { params: ["number", "number"], returnType: "number" }],
+        ["pow", { params: ["number", "number"], returnType: "number" }],
+      ]),
+    });
   }
 }

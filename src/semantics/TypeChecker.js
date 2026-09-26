@@ -5,11 +5,16 @@
  * ve statik denetim mantığını yöneten motor.
  */
 export class TypeChecker {
-  constructor(builtinRegistry, scopeManager, reporter, getCurrentFilePath = () => "") {
+  constructor(builtinRegistry, scopeManager, reporter, getCurrentFilePath = () => "", checkStatement = null) {
     this.builtins = builtinRegistry;
     this.scopeManager = scopeManager;
     this.reporter = reporter;
     this.getCurrentFilePath = getCurrentFilePath;
+    this.checkStatementCallback = checkStatement;
+  }
+
+  setCheckStatement(fn) {
+    this.checkStatementCallback = fn;
   }
 
   get currentFilePath() {
@@ -42,16 +47,41 @@ export class TypeChecker {
         return "boolean";
       case "TSVoidKeyword":
         return "void";
-      case "TSArrayType":
-        return "array";
+      case "TSAnyKeyword":
+        return "any";
+      case "TSNeverKeyword":
+        return "never";
+      case "TSNullKeyword":
+        return "null";
+      case "TSUndefinedKeyword":
+        return "undefined";
+      case "TSArrayType": {
+        const elem = this.resolveType(curr.elementType);
+        return `${elem}[]`;
+      }
       case "TSTypeReference": {
         const name = curr.typeName?.name || curr.typeName?.value;
+        if (!name) return "any";
         if (["i64", "i32", "f64", "f32"].includes(name)) return "number";
         if (name === "bool") return "boolean";
-        if (name === "Promise") {
-          return "pointer";
+        if (name === "Array") {
+          const param = curr.typeParameters?.params?.[0] || curr.typeArguments?.params?.[0];
+          const elem = param ? this.resolveType(param) : "any";
+          return `${elem}[]`;
         }
-        return name || "pointer";
+        if (name === "Promise") {
+          const param = curr.typeParameters?.params?.[0] || curr.typeArguments?.params?.[0];
+          const inner = param ? this.resolveType(param) : "any";
+          return `Promise<${inner}>`;
+        }
+        if (name === "Result") {
+          return "Result";
+        }
+        if (name === "Untagged") {
+          const param = curr.typeParameters?.params?.[0] || curr.typeArguments?.params?.[0];
+          return param ? this.resolveType(param) : "any";
+        }
+        return name;
       }
       default:
         return "any";
@@ -62,9 +92,43 @@ export class TypeChecker {
     if (!expected || !actual) return true;
     if (expected === "any" || actual === "any") return true;
     if (expected === actual) return true;
+    if (expected === "void" && actual === "void") return true;
+    if (expected === "never") return false;
+    if (actual === "never") return true;
+
+    // null / undefined atanabilirliği
+    if (actual === "null" || actual === "undefined") {
+      if (
+        expected === "pointer" ||
+        expected.endsWith("*") ||
+        this.builtins.structSignatures.has(expected) ||
+        expected.endsWith("[]") ||
+        expected === "array"
+      ) {
+        return true;
+      }
+    }
+
     if (expected === "pointer" && actual.endsWith("*")) return true;
     if (actual === "pointer" && (expected === "pointer" || this.builtins.structSignatures.has(expected))) return true;
     if (expected === "pointer" && (actual === "pointer" || this.builtins.structSignatures.has(actual))) return true;
+
+    // Dizi uyumluluğu
+    if (expected === "array" && (actual === "array" || actual.endsWith("[]"))) return true;
+    if (actual === "array" && (expected === "array" || expected.endsWith("[]"))) return true;
+    if (expected.endsWith("[]") && actual.endsWith("[]")) {
+      const expElem = expected.slice(0, -2);
+      const actElem = actual.slice(0, -2);
+      return this.typesAreCompatible(expElem, actElem);
+    }
+
+    // Promise uyumluluğu
+    if (expected.startsWith("Promise<") && actual.startsWith("Promise<")) {
+      const expInner = expected.slice(8, -1);
+      const actInner = actual.slice(8, -1);
+      return this.typesAreCompatible(expInner, actInner);
+    }
+    if (expected === "pointer" && actual.startsWith("Promise<")) return true;
 
     // 1. Enum Uyumluluğu
     if (this.builtins.enumSignatures.has(expected)) {
@@ -78,7 +142,7 @@ export class TypeChecker {
       if (en.kind === "numeric" && expected === "number") return true;
     }
 
-    // 2. Union Type Alias Uyumluluğu (Örn: FlexibleData = string | number)
+    // 2. Union Type Alias Uyumluluğu
     if (this.builtins.unionRegistry.has(expected)) {
       const variants = this.builtins.unionRegistry.get(expected);
       if (variants.some((v) => this.typesAreCompatible(v, actual))) return true;
@@ -88,14 +152,14 @@ export class TypeChecker {
       if (variants.every((v) => this.typesAreCompatible(expected, v))) return true;
     }
 
-    // 3. Tip Takma Adı Çözümleme (Örn: EntityID = number)
+    // 3. Tip Takma Adı Çözümleme
     if (this.builtins.typeAliasRegistry.has(expected)) {
       const resolvedExpected = this.resolveType(this.builtins.typeAliasRegistry.get(expected));
-      if (this.typesAreCompatible(resolvedExpected, actual)) return true;
+      if (resolvedExpected !== expected && this.typesAreCompatible(resolvedExpected, actual)) return true;
     }
     if (this.builtins.typeAliasRegistry.has(actual)) {
       const resolvedActual = this.resolveType(this.builtins.typeAliasRegistry.get(actual));
-      if (this.typesAreCompatible(expected, resolvedActual)) return true;
+      if (resolvedActual !== actual && this.typesAreCompatible(expected, resolvedActual)) return true;
     }
 
     // 4. Sınıf Kalıtım Hiyerarşisi (Polymorphism: Warrior extends Entity)
@@ -106,10 +170,8 @@ export class TypeChecker {
       curr = meta.superClass;
     }
 
-    // 5. Birinci Sınıf Fonksiyon ve Dizi Tipleri
+    // 5. Birinci Sınıf Fonksiyon Tipleri
     if ((expected === "function" || this.builtins.functionTypeAliases.has(expected)) && actual === "function") return true;
-    if (expected === "array" && actual === "array") return true;
-    if (expected === "number" && actual === "number") return true;
 
     return false;
   }
@@ -117,8 +179,9 @@ export class TypeChecker {
   inferExpressionType(expr, expectedType = null) {
     if (!expr) return "void";
 
+    // 1. Değişmezler (Literals)
     if (expr.type === "NullLiteral" || (expr.type === "Literal" && expr.value === null)) {
-      return "pointer";
+      return "null";
     }
     if (expr.type === "NumericLiteral" || (expr.type === "Literal" && typeof expr.value === "number")) {
       return "number";
@@ -130,14 +193,68 @@ export class TypeChecker {
       return "boolean";
     }
     if (expr.type === "TemplateLiteral") {
+      for (const e of expr.expressions || []) {
+        this.inferExpressionType(e);
+      }
       return "string";
     }
+
+    // 2. Dizi İfadesi (ArrayExpression)
     if (expr.type === "ArrayExpression") {
-      return "array";
+      let expectedElemType = expectedType && expectedType.endsWith("[]") ? expectedType.slice(0, -2) : null;
+      let inferredElemType = expectedElemType;
+
+      for (let i = 0; i < (expr.elements || []).length; i++) {
+        const el = expr.elements[i];
+        if (!el) continue;
+        const elType = this.inferExpressionType(el, expectedElemType);
+        if (!inferredElemType && elType !== "any") {
+          inferredElemType = elType;
+        }
+        if (expectedElemType && elType !== "any" && !this.typesAreCompatible(expectedElemType, elType)) {
+          this.reporter.addError(
+            this.currentFilePath,
+            el,
+            `Dizi elemanı tür uyuşmazlığı: '${expectedElemType}' beklenirken '${elType}' verildi.`
+          );
+        }
+      }
+      return `${inferredElemType || "any"}[]`;
     }
+
+    // 3. Fonksiyon İfadeleri (Arrow / Function Expression)
     if (expr.type === "ArrowFunctionExpression" || expr.type === "FunctionExpression") {
+      const fnExpectedRet = expr.returnType ? this.resolveType(expr.returnType) : null;
+      this.scopeManager.enterScope({ isFunction: true, expectedReturnType: fnExpectedRet });
+
+      for (const p of expr.params || []) {
+        const pName = p.name || p.pattern?.name;
+        const pType = this.resolveType(p.typeAnnotation || p.pattern?.typeAnnotation);
+        this.scopeManager.registerSymbol(pName, { type: pType, isParam: true, defNode: p });
+      }
+
+      if (expr.body?.type === "BlockStatement") {
+        if (this.checkStatementCallback) {
+          for (const s of expr.body.body || []) {
+            this.checkStatementCallback(s);
+          }
+        }
+      } else if (expr.body) {
+        const actualRet = this.inferExpressionType(expr.body, fnExpectedRet);
+        if (fnExpectedRet && fnExpectedRet !== "any" && !this.typesAreCompatible(fnExpectedRet, actualRet)) {
+          this.reporter.addError(
+            this.currentFilePath,
+            expr.body,
+            `Dönüş türü uyuşmazlığı: Fonksiyon '${fnExpectedRet}' döndürmeli, ancak '${actualRet}' döndürüldü.`
+          );
+        }
+      }
+
+      this.scopeManager.exitScope();
       return "function";
     }
+
+    // 4. Await İfadesi
     if (expr.type === "AwaitExpression") {
       if (expr.argument.type === "Identifier") {
         const sym = this.scopeManager.lookupSymbol(expr.argument.name);
@@ -160,38 +277,223 @@ export class TypeChecker {
       }
       return expectedType || "any";
     }
+
+    // 5. Tekli Operatörler (UnaryExpression)
     if (expr.type === "UnaryExpression") {
-      if (expr.operator === "!" || expr.operator === "delete") return "boolean";
-      if (expr.operator === "typeof") return "string";
-      if (expr.operator === "-" || expr.operator === "+" || expr.operator === "~") {
+      if (expr.operator === "!" || expr.operator === "delete") {
         this.inferExpressionType(expr.argument);
+        return "boolean";
+      }
+      if (expr.operator === "typeof") {
+        this.inferExpressionType(expr.argument);
+        return "string";
+      }
+      if (expr.operator === "-" || expr.operator === "+" || expr.operator === "~") {
+        const argType = this.inferExpressionType(expr.argument);
+        if (argType !== "number" && argType !== "any") {
+          this.reporter.addError(
+            this.currentFilePath,
+            expr.argument,
+            `'${expr.operator}' tekli operatörü yalnızca sayı türleri üzerinde kullanılabilir ('${argType}' verildi).`
+          );
+        }
         return "number";
       }
       return "any";
     }
+
+    // 6. Güncelleme Operatörleri (UpdateExpression: ++, --)
     if (expr.type === "UpdateExpression") {
-      this.inferExpressionType(expr.argument);
+      if (expr.argument.type === "Identifier") {
+        const sym = this.scopeManager.lookupSymbol(expr.argument.name);
+        if (sym?.isConst) {
+          this.reporter.addError(
+            this.currentFilePath,
+            expr.argument,
+            `'${expr.argument.name}' bir sabittir (const); '${expr.operator}' operatörü ile değiştirilemez.`
+          );
+        } else if (!sym && !this.builtins.functionSignatures.has(expr.argument.name)) {
+          this.reporter.addError(
+            this.currentFilePath,
+            expr.argument,
+            `Tanımsız değişken: '${expr.argument.name}'`
+          );
+        }
+      }
+      const argType = this.inferExpressionType(expr.argument);
+      if (argType !== "number" && argType !== "any") {
+        this.reporter.addError(
+          this.currentFilePath,
+          expr.argument,
+          `'${expr.operator}' güncelleme operatörü yalnızca sayı türleri üzerinde kullanılabilir ('${argType}' verildi).`
+        );
+      }
       return "number";
     }
 
-    if (expr.type === "Identifier") {
-      if (expr.name === "undefined") {
+    // 7. İkili Operatörler (BinaryExpression)
+    if (expr.type === "BinaryExpression") {
+      const leftType = this.inferExpressionType(expr.left);
+      const rightType = this.inferExpressionType(expr.right);
+      const op = expr.operator;
+
+      // 7.1. Toplama ve String Birleştirme (+)
+      if (op === "+") {
+        if (leftType === "string" || rightType === "string") {
+          return "string";
+        }
+        if (leftType === "number" && rightType === "number") {
+          return "number";
+        }
+        if (leftType === "any" || rightType === "any") {
+          return expectedType || "number";
+        }
+        this.reporter.addError(
+          this.currentFilePath,
+          expr,
+          `'+' operatörü '${leftType}' ve '${rightType}' türleri üzerinde uygulanamaz. Yalnızca sayılar veya metinler (string) desteklenir.`
+        );
+        return "number";
+      }
+
+      // 7.2. Aritmetik Operatörler (-, *, /, %)
+      if (["-", "*", "/", "%"].includes(op)) {
+        if (leftType !== "number" && leftType !== "any") {
+          this.reporter.addError(
+            this.currentFilePath,
+            expr.left,
+            `'${op}' aritmetik operatörü yalnızca sayı türleri üzerinde kullanılabilir ('${leftType}' verildi).`
+          );
+        }
+        if (rightType !== "number" && rightType !== "any") {
+          this.reporter.addError(
+            this.currentFilePath,
+            expr.right,
+            `'${op}' aritmetik operatörü yalnızca sayı türleri üzerinde kullanılabilir ('${rightType}' verildi).`
+          );
+        }
+        return "number";
+      }
+
+      // 7.3. Bitwise Operatörler (&, |, ^, <<, >>, >>>)
+      if (["&", "|", "^", "<<", ">>", ">>>"].includes(op)) {
+        if (leftType !== "number" && leftType !== "any") {
+          this.reporter.addError(
+            this.currentFilePath,
+            expr.left,
+            `'${op}' bitwise operatörü yalnızca sayı türleri üzerinde kullanılabilir ('${leftType}' verildi).`
+          );
+        }
+        if (rightType !== "number" && rightType !== "any") {
+          this.reporter.addError(
+            this.currentFilePath,
+            expr.right,
+            `'${op}' bitwise operatörü yalnızca sayı türleri üzerinde kullanılabilir ('${rightType}' verildi).`
+          );
+        }
+        return "number";
+      }
+
+      // 7.4. Karşılaştırma Operatörleri (<, <=, >, >=)
+      if (["<", "<=", ">", ">="].includes(op)) {
+        const bothNumbers = (leftType === "number" || leftType === "any") && (rightType === "number" || rightType === "any");
+        const bothStrings = (leftType === "string" || leftType === "any") && (rightType === "string" || rightType === "any");
+        if (!bothNumbers && !bothStrings) {
+          this.reporter.addError(
+            this.currentFilePath,
+            expr,
+            `'${op}' karşılaştırma operatörü uyumsuz türler arasında kullanılamaz ('${leftType}' ve '${rightType}').`
+          );
+        }
+        return "boolean";
+      }
+
+      // 7.5. Eşitlik Operatörleri (==, !=, ===, !==)
+      if (["==", "!=", "===", "!=="].includes(op)) {
+        if (
+          (leftType === "number" && rightType === "string") ||
+          (leftType === "string" && rightType === "number") ||
+          (leftType === "boolean" && (rightType === "string" || rightType === "number")) ||
+          ((leftType === "string" || leftType === "number") && rightType === "boolean")
+        ) {
+          this.reporter.addError(
+            this.currentFilePath,
+            expr,
+            `Uyumsuz tür karşılaştırması: '${leftType}' ile '${rightType}' türleri hiçbir zaman eşit olamaz.`
+          );
+        }
+        return "boolean";
+      }
+
+      return "any";
+    }
+
+    // 8. Mantıksal Operatörler (&&, ||, ??)
+    if (expr.type === "LogicalExpression") {
+      this.inferExpressionType(expr.left);
+      this.inferExpressionType(expr.right);
+      return "boolean";
+    }
+
+    // 9. Koşul Operatörü (ConditionalExpression: a ? b : c)
+    if (expr.type === "ConditionalExpression") {
+      this.inferExpressionType(expr.test, "boolean");
+      const thenType = this.inferExpressionType(expr.consequent, expectedType);
+      const elseType = this.inferExpressionType(expr.alternate, expectedType);
+      if (thenType !== "any" && elseType !== "any" && this.typesAreCompatible(thenType, elseType)) {
+        return thenType;
+      }
+      return expectedType || thenType || elseType || "any";
+    }
+
+    // 10. This İfadesi (ThisExpression)
+    if (expr.type === "ThisExpression" || (expr.type === "Identifier" && expr.name === "this")) {
+      if (!this.scopeManager.isInClass()) {
+        this.reporter.addError(
+          this.currentFilePath,
+          expr,
+          `'this' anahtar sözcüğü yalnızca sınıf metotları veya yapıcıları içinde kullanılabilir.`
+        );
         return "any";
       }
+      const cls = this.scopeManager.getCurrentClass();
+      return cls?.name || "pointer";
+    }
+
+    // 11. Değişken ve Sembol Tanımlayıcıları (Identifier)
+    if (expr.type === "Identifier") {
+      if (expr.name === "undefined") return "undefined";
+      if (expr.name === "NaN" || expr.name === "Infinity") return "number";
+      if (expr.name === "console") return "any";
+      if (expr.name === "Math") return "Math";
+      if (expr.name === "borrow") return "any";
+
+      // Enum kontrolü
       if (this.builtins.enumSignatures.has(expr.name)) {
         return expr.name;
       }
 
+      // Kapsamdaki sembol kontrolü
       const sym = this.scopeManager.lookupSymbol(expr.name);
-      if (!sym) {
-        if (!this.builtins.functionSignatures.has(expr.name) && expr.name !== "console") {
-          this.reporter.addError(this.currentFilePath, expr, `Tanımsız değişken: '${expr.name}'`);
-        }
-        return "any";
+      if (sym) {
+        return sym.type;
       }
-      return sym.type;
+
+      // Genel fonksiyon kontrolü
+      if (this.builtins.functionSignatures.has(expr.name)) {
+        return "function";
+      }
+
+      // Sınıf / Interface kontrolü
+      if (this.builtins.structSignatures.has(expr.name)) {
+        return expr.name;
+      }
+
+      this.reporter.addError(this.currentFilePath, expr, `Tanımsız değişken: '${expr.name}'`);
+      return "any";
     }
 
+    // 11. Nesne Değişmezi (ObjectExpression: { a: 1, b: 'hi' })
     if (expr.type === "ObjectExpression") {
       if (expectedType && this.builtins.structSignatures.has(expectedType)) {
         const structMeta = this.builtins.structSignatures.get(expectedType);
@@ -205,7 +507,7 @@ export class TypeChecker {
             this.reporter.addError(
               this.currentFilePath,
               prop.key || prop,
-              `Bilinmeyen alan: '${pName}', '${expectedType}' interface'inde tanımlı değil.`
+              `Bilinmeyen alan: '${pName}', '${expectedType}' yapısında tanımlı değil.`
             );
             continue;
           }
@@ -237,6 +539,7 @@ export class TypeChecker {
       return "object";
     }
 
+    // 12. Üye Erişimi (MemberExpression: obj.prop veya arr[idx])
     if (expr.type === "MemberExpression") {
       let baseType = null;
       let isEnum = false;
@@ -249,19 +552,57 @@ export class TypeChecker {
       }
       const propName = expr.property?.name || expr.property?.value;
 
+      // Enum eleman erişimi
       if (isEnum) {
         if (expr.computed) return "string";
         const en = this.builtins.enumSignatures.get(baseType);
+        if (!en.members.has(propName)) {
+          this.reporter.addError(
+            this.currentFilePath,
+            expr.property,
+            `'${baseType}' enum'ında '${propName}' üyesi bulunamadı!`
+          );
+        }
         return en.kind === "string" ? "string" : "number";
       }
 
-      if ((baseType === "array" || baseType === "string") && propName === "length") {
-        return "number";
-      }
-      if (baseType === "array" && expr.computed) {
-        return "number";
+      // Dizi eleman / length erişimi
+      if (baseType === "array" || baseType.endsWith("[]")) {
+        if (propName === "length" && !expr.computed) {
+          return "number";
+        }
+        if (expr.computed) {
+          const indexType = this.inferExpressionType(expr.property, "number");
+          if (indexType !== "number" && indexType !== "any") {
+            this.reporter.addError(
+              this.currentFilePath,
+              expr.property,
+              `Dizi indeksi sayısal bir tür olmalıdır, '${indexType}' verildi.`
+            );
+          }
+          return baseType.endsWith("[]") ? baseType.slice(0, -2) : "number";
+        }
       }
 
+      // String length / index erişimi
+      if (baseType === "string") {
+        if (propName === "length" && !expr.computed) {
+          return "number";
+        }
+        if (expr.computed) {
+          const indexType = this.inferExpressionType(expr.property, "number");
+          if (indexType !== "number" && indexType !== "any") {
+            this.reporter.addError(
+              this.currentFilePath,
+              expr.property,
+              `Karakter dizisi indeksi sayısal bir tür olmalıdır, '${indexType}' verildi.`
+            );
+          }
+          return "string";
+        }
+      }
+
+      // Struct / Interface / Class üye erişimi
       if (this.builtins.structSignatures.has(baseType)) {
         const structMeta = this.builtins.structSignatures.get(baseType);
         if (structMeta.fields.has(propName)) {
@@ -274,8 +615,8 @@ export class TypeChecker {
         let curr = structMeta.superClass;
         while (curr && this.builtins.structSignatures.has(curr)) {
           const parentMeta = this.builtins.structSignatures.get(curr);
-          if (parentMeta.fields.has(propName)) return parentMeta.fields.get(propName).type;
-          if (parentMeta.methods.has(propName)) return parentMeta.methods.get(propName).returnType;
+          if (parentMeta.fields?.has(propName)) return parentMeta.fields.get(propName).type;
+          if (parentMeta.methods?.has(propName)) return parentMeta.methods.get(propName).returnType;
           curr = parentMeta.superClass;
         }
 
@@ -287,7 +628,13 @@ export class TypeChecker {
         return "any";
       }
 
-      if (baseType !== "any" && baseType !== "object" && baseType !== "array" && expr.object.name !== "console") {
+      if (
+        baseType !== "any" &&
+        baseType !== "object" &&
+        baseType !== "pointer" &&
+        expr.object.name !== "console" &&
+        expr.object.name !== "Math"
+      ) {
         this.reporter.addError(
           this.currentFilePath,
           expr.object,
@@ -297,52 +644,304 @@ export class TypeChecker {
       return "any";
     }
 
+    // 13. Atama İfadeleri (AssignmentExpression: x = val, x += val)
     if (expr.type === "AssignmentExpression") {
-      const targetType = this.inferExpressionType(expr.left);
-      const valType = this.inferExpressionType(expr.right, targetType);
+      // Hedefin yazılabilirliği (const kontrolü)
+      if (expr.left.type === "Identifier") {
+        const targetName = expr.left.name;
+        const sym = this.scopeManager.lookupSymbol(targetName);
+        if (sym?.isConst) {
+          this.reporter.addError(
+            this.currentFilePath,
+            expr.left,
+            `'${targetName}' bir sabittir (const); yeniden değer atanamaz.`
+          );
+        } else if (this.builtins.functionSignatures.has(targetName)) {
+          this.reporter.addError(
+            this.currentFilePath,
+            expr.left,
+            `'${targetName}' bir fonksiyondur; yeniden değer atanamaz.`
+          );
+        } else if (this.builtins.structSignatures.has(targetName) || this.builtins.enumSignatures.has(targetName)) {
+          this.reporter.addError(
+            this.currentFilePath,
+            expr.left,
+            `'${targetName}' bir tip/sınıftır; değişken gibi değer atanamaz.`
+          );
+        } else if (!sym) {
+          this.reporter.addError(
+            this.currentFilePath,
+            expr.left,
+            `Atama yapılan tanımsız değişken: '${targetName}'`
+          );
+        }
+      }
 
-      if (targetType !== "any" && valType !== "any" && !this.typesAreCompatible(targetType, valType)) {
-        this.reporter.addError(
-          this.currentFilePath,
-          expr.right,
-          `Atama tür uyuşmazlığı: '${targetType}' türündeki hedefe '${valType}' atanamaz.`
-        );
+      const targetType = this.inferExpressionType(expr.left);
+      const op = expr.operator;
+
+      let expectedValType = targetType;
+      if (op === "+=") {
+        expectedValType = targetType === "string" ? "any" : "number";
+      } else if (op !== "=") {
+        expectedValType = "number";
+        if (targetType !== "number" && targetType !== "any") {
+          this.reporter.addError(
+            this.currentFilePath,
+            expr.left,
+            `'${op}' bileşik atama operatörü yalnızca sayısal türler üzerinde kullanılabilir ('${targetType}' verildi).`
+          );
+        }
+      }
+
+      const valType = this.inferExpressionType(expr.right, expectedValType);
+
+      if (op === "=") {
+        if (targetType !== "any" && valType !== "any" && !this.typesAreCompatible(targetType, valType)) {
+          this.reporter.addError(
+            this.currentFilePath,
+            expr.right,
+            `Atama tür uyuşmazlığı: '${targetType}' türündeki hedefe '${valType}' atanamaz.`
+          );
+        }
+      } else if (op === "+=") {
+        if (targetType === "number" && valType !== "number" && valType !== "any") {
+          this.reporter.addError(
+            this.currentFilePath,
+            expr.right,
+            `'+=' operatöründe sayısal hedefe '${valType}' eklenemez.`
+          );
+        }
+      } else {
+        if (valType !== "number" && valType !== "any") {
+          this.reporter.addError(
+            this.currentFilePath,
+            expr.right,
+            `'${op}' operatöründe sağ taraf bir sayı olmalıdır ('${valType}' verildi).`
+          );
+        }
       }
       return targetType;
     }
 
+    // 14. Çağrı İfadeleri (CallExpression)
     if (expr.type === "CallExpression") {
       const callee = expr.callee;
 
+      // 14.1. super(...) çağrısı
+      if (callee.type === "Super") {
+        if (!this.scopeManager.isInClass()) {
+          this.reporter.addError(
+            this.currentFilePath,
+            expr,
+            `'super()' çağrısı yalnızca sınıf yapıcıları içinde kullanılabilir.`
+          );
+          return "void";
+        }
+        const clsMeta = this.scopeManager.getCurrentClass();
+        if (!clsMeta?.superClass) {
+          this.reporter.addError(
+            this.currentFilePath,
+            expr,
+            `'${clsMeta?.name || "Sınıf"}' bir üst sınıfa (superClass) sahip değil; 'super()' çağrılamaz.`
+          );
+          return "void";
+        }
+        const parentMeta = this.builtins.structSignatures.get(clsMeta.superClass);
+        const parentConstructor = parentMeta?.methods?.get("constructor");
+        if (parentConstructor) {
+          const actualArgs = expr.arguments || [];
+          const expectedParams = parentConstructor.params || [];
+          if (actualArgs.length !== expectedParams.length) {
+            this.reporter.addError(
+              this.currentFilePath,
+              expr,
+              `'super()' argüman sayısı uyuşmazlığı: Üst sınıf yapıcısı ${expectedParams.length} argüman beklerken ${actualArgs.length} verildi.`
+            );
+          }
+          actualArgs.forEach((arg, idx) => {
+            const expectedParamType = expectedParams[idx];
+            const actualArgType = this.inferExpressionType(arg, expectedParamType);
+            if (expectedParamType && !this.typesAreCompatible(expectedParamType, actualArgType)) {
+              this.reporter.addError(
+                this.currentFilePath,
+                arg,
+                `'super()' için geçersiz argüman türü: Parametre ${idx + 1} için '${expectedParamType}' beklenirken '${actualArgType}' verildi.`
+              );
+            }
+          });
+        }
+        return "void";
+      }
+
+      // 14.2. super.method(...) çağrısı
+      if (callee.type === "MemberExpression" && callee.object?.type === "Super") {
+        if (!this.scopeManager.isInClass()) {
+          this.reporter.addError(
+            this.currentFilePath,
+            expr,
+            `'super' yalnızca sınıf metotları içinde kullanılabilir.`
+          );
+          return "any";
+        }
+        const clsMeta = this.scopeManager.getCurrentClass();
+        if (!clsMeta?.superClass) {
+          this.reporter.addError(
+            this.currentFilePath,
+            callee,
+            `'${clsMeta?.name || "Sınıf"}' bir üst sınıfa (superClass) sahip değil; 'super' erişimi yapılamaz.`
+          );
+          return "any";
+        }
+        const methodName = callee.property?.name || callee.property?.value;
+        const parentMeta = this.builtins.structSignatures.get(clsMeta.superClass);
+        const parentMethod = parentMeta?.methods?.get(methodName);
+        if (!parentMethod) {
+          this.reporter.addError(
+            this.currentFilePath,
+            callee.property,
+            `Üst sınıf '${clsMeta.superClass}' üzerinde '${methodName}' metodu bulunamadı!`
+          );
+          return "any";
+        }
+        const actualArgs = expr.arguments || [];
+        const expectedParams = parentMethod.params || [];
+        if (actualArgs.length !== expectedParams.length) {
+          this.reporter.addError(
+            this.currentFilePath,
+            expr,
+            `'super.${methodName}()' argüman sayısı uyuşmazlığı: ${expectedParams.length} argüman beklerken ${actualArgs.length} verildi.`
+          );
+        }
+        actualArgs.forEach((arg, idx) => {
+          const expectedParamType = expectedParams[idx];
+          const actualArgType = this.inferExpressionType(arg, expectedParamType);
+          if (expectedParamType && !this.typesAreCompatible(expectedParamType, actualArgType)) {
+            this.reporter.addError(
+              this.currentFilePath,
+              arg,
+              `'super.${methodName}()' için geçersiz argüman: Parametre ${idx + 1} için '${expectedParamType}' beklenirken '${actualArgType}' verildi.`
+            );
+          }
+        });
+        return parentMethod.returnType || "any";
+      }
+
+      // 14.3. Metot Çağrısı (obj.method(...))
       if (callee.type === "MemberExpression") {
         const objType = this.inferExpressionType(callee.object);
         const method = callee.property?.name || callee.property?.value;
 
-        if (callee.object.name === "console" && method === "log") {
+        if (callee.object.name === "console" && ["log", "warn", "error"].includes(method)) {
           for (const a of expr.arguments || []) this.inferExpressionType(a);
           return "void";
         }
 
         if (this.builtins.structSignatures.has(objType)) {
           const structMeta = this.builtins.structSignatures.get(objType);
-          if (structMeta?.methods.has(method)) {
-            return structMeta.methods.get(method).returnType;
-          }
-          let curr = structMeta.superClass;
-          while (curr && this.builtins.structSignatures.has(curr)) {
+          let methodMeta = structMeta?.methods?.get(method);
+          let curr = structMeta?.superClass;
+          while (!methodMeta && curr && this.builtins.structSignatures.has(curr)) {
             const parentMeta = this.builtins.structSignatures.get(curr);
-            if (parentMeta.methods.has(method)) return parentMeta.methods.get(method).returnType;
+            if (parentMeta.methods?.has(method)) {
+              methodMeta = parentMeta.methods.get(method);
+              break;
+            }
             curr = parentMeta.superClass;
           }
+
+          if (!methodMeta) {
+            if (structMeta.fields?.has(method)) {
+              for (const a of expr.arguments || []) this.inferExpressionType(a);
+              return "any";
+            }
+            this.reporter.addError(
+              this.currentFilePath,
+              callee.property,
+              `'${objType}' türünde '${method}' metodu bulunamadı!`
+            );
+            for (const a of expr.arguments || []) this.inferExpressionType(a);
+            return "any";
+          }
+
+          const actualArgs = expr.arguments || [];
+          const expectedParams = methodMeta.params || [];
+          if (actualArgs.length !== expectedParams.length) {
+            this.reporter.addError(
+              this.currentFilePath,
+              expr,
+              `Argüman sayısı uyuşmazlığı: '${objType}.${method}' ${expectedParams.length} argüman beklerken ${actualArgs.length} verildi.`
+            );
+          }
+          actualArgs.forEach((arg, idx) => {
+            const expectedParamType = expectedParams[idx];
+            const actualArgType = this.inferExpressionType(arg, expectedParamType);
+            if (expectedParamType && !this.typesAreCompatible(expectedParamType, actualArgType)) {
+              this.reporter.addError(
+                this.currentFilePath,
+                arg,
+                `'${objType}.${method}' için geçersiz argüman türü: Parametre ${idx + 1} için '${expectedParamType}' beklenirken '${actualArgType}' verildi.`
+              );
+            }
+          });
+          return methodMeta.returnType || "any";
         }
         return "any";
       }
 
+      // 14.4. Doğrudan Fonksiyon Çağrısı (fn(...))
       if (callee.type === "Identifier") {
         const fnName = callee.name;
 
         if (fnName === "borrow") {
+          if (!expr.arguments || expr.arguments.length !== 1) {
+            this.reporter.addError(this.currentFilePath, expr, "borrow() fonksiyonu tam olarak 1 argüman bekler.");
+            return "any";
+          }
           return this.inferExpressionType(expr.arguments[0]);
+        }
+
+        if (fnName === "unwrap") {
+          if (!expr.arguments || expr.arguments.length !== 1) {
+            this.reporter.addError(this.currentFilePath, expr, "unwrap() fonksiyonu tam olarak 1 argüman bekler.");
+            return "any";
+          }
+          const argType = this.inferExpressionType(expr.arguments[0]);
+          if (argType !== "Result" && argType !== "any") {
+            this.reporter.addError(
+              this.currentFilePath,
+              expr.arguments[0],
+              `unwrap() yalnızca 'Result' türü üzerinde çağrılabilir, '${argType}' verildi.`
+            );
+          }
+          return "any";
+        }
+
+        if (fnName === "sleep") {
+          if (!expr.arguments || expr.arguments.length !== 1) {
+            this.reporter.addError(this.currentFilePath, expr, "sleep() fonksiyonu tam olarak 1 argüman bekler.");
+          } else {
+            const argType = this.inferExpressionType(expr.arguments[0], "number");
+            if (argType !== "number" && argType !== "any") {
+              this.reporter.addError(
+                this.currentFilePath,
+                expr.arguments[0],
+                `sleep() fonksiyonu sayısal bir milisaniye değeri bekler, '${argType}' verildi.`
+              );
+            }
+          }
+          return "void";
+        }
+
+        if (fnName === "panic") {
+          if (expr.arguments?.[0]) this.inferExpressionType(expr.arguments[0], "string");
+          return "never";
+        }
+
+        if (fnName === "assert") {
+          if (expr.arguments?.[0]) this.inferExpressionType(expr.arguments[0], "boolean");
+          if (expr.arguments?.[1]) this.inferExpressionType(expr.arguments[1], "string");
+          return "void";
         }
 
         const localSym = this.scopeManager.lookupSymbol(fnName);
@@ -352,61 +951,111 @@ export class TypeChecker {
         }
 
         const fnMeta = this.builtins.functionSignatures.get(fnName);
-        if (fnMeta) {
-          const actualArgs = expr.arguments || [];
-          const rawTypeArgs = expr.typeParameters?.params || expr.typeArguments?.params || [];
+        if (!fnMeta) {
+          this.reporter.addError(this.currentFilePath, callee, `Tanımsız fonksiyon çağrısı: '${fnName}()'`);
+          for (const a of expr.arguments || []) this.inferExpressionType(a);
+          return "any";
+        }
 
-          const subst = new Map();
-          if (fnMeta.typeParams && fnMeta.typeParams.length > 0) {
-            fnMeta.typeParams.forEach((tpName, i) => {
-              if (rawTypeArgs[i]) {
-                subst.set(tpName, this.resolveType(rawTypeArgs[i]));
-              }
-            });
-            if (subst.size === 0) {
-              fnMeta.params.forEach((pType, i) => {
-                if (fnMeta.typeParams.includes(pType) && actualArgs[i]) {
-                  const inferredArg = this.inferExpressionType(actualArgs[i]);
-                  if (inferredArg !== "any") subst.set(pType, inferredArg);
-                }
-              });
-            }
-          }
+        const actualArgs = expr.arguments || [];
+        const rawTypeArgs = expr.typeParameters?.params || expr.typeArguments?.params || [];
 
-          const substitute = (t) => (subst.has(t) ? subst.get(t) : t);
-          const expectedParams = fnMeta.params.map(substitute);
-          const returnType = substitute(fnMeta.outerReturnType || fnMeta.returnType);
-
-          if (actualArgs.length !== expectedParams.length) {
-            this.reporter.addError(
-              this.currentFilePath,
-              expr,
-              `Argüman sayısı uyuşmazlığı: '${fnName}' ${expectedParams.length} argüman beklerken ${actualArgs.length} verildi.`
-            );
-          }
-
-          actualArgs.forEach((arg, idx) => {
-            const expectedParamType = expectedParams[idx];
-            const actualArgType = this.inferExpressionType(arg, expectedParamType);
-
-            if (expectedParamType && !this.typesAreCompatible(expectedParamType, actualArgType)) {
-              this.reporter.addError(
-                this.currentFilePath,
-                arg,
-                `'${fnName}' için geçersiz argüman türü: Parametre ${idx + 1} için '${expectedParamType}' beklenirken '${actualArgType}' verildi.`
-              );
+        const subst = new Map();
+        if (fnMeta.typeParams && fnMeta.typeParams.length > 0) {
+          fnMeta.typeParams.forEach((tpName, i) => {
+            if (rawTypeArgs[i]) {
+              subst.set(tpName, this.resolveType(rawTypeArgs[i]));
             }
           });
-
-          return returnType;
+          if (subst.size === 0) {
+            fnMeta.params.forEach((pType, i) => {
+              if (fnMeta.typeParams.includes(pType) && actualArgs[i]) {
+                const inferredArg = this.inferExpressionType(actualArgs[i]);
+                if (inferredArg !== "any") subst.set(pType, inferredArg);
+              }
+            });
+          }
         }
+
+        const substitute = (t) => (subst.has(t) ? subst.get(t) : t);
+        const expectedParams = fnMeta.params.map(substitute);
+        const returnType = substitute(fnMeta.outerReturnType || fnMeta.returnType);
+
+        if (actualArgs.length !== expectedParams.length) {
+          this.reporter.addError(
+            this.currentFilePath,
+            expr,
+            `Argüman sayısı uyuşmazlığı: '${fnName}' ${expectedParams.length} argüman beklerken ${actualArgs.length} verildi.`
+          );
+        }
+
+        actualArgs.forEach((arg, idx) => {
+          const expectedParamType = expectedParams[idx];
+          const actualArgType = this.inferExpressionType(arg, expectedParamType);
+
+          if (expectedParamType && !this.typesAreCompatible(expectedParamType, actualArgType)) {
+            this.reporter.addError(
+              this.currentFilePath,
+              arg,
+              `'${fnName}' için geçersiz argüman türü: Parametre ${idx + 1} için '${expectedParamType}' beklenirken '${actualArgType}' verildi.`
+            );
+          }
+        });
+
+        return returnType;
       }
       return "any";
     }
 
+    // 15. New İfadesi (NewExpression: new Cls(...))
     if (expr.type === "NewExpression") {
       const clsName = expr.callee.name;
-      return clsName || "pointer";
+      if (!clsName || !this.builtins.structSignatures.has(clsName)) {
+        this.reporter.addError(
+          this.currentFilePath,
+          expr.callee,
+          `Tanımsız sınıf veya yapı: '${clsName}'`
+        );
+        return "any";
+      }
+
+      const structMeta = this.builtins.structSignatures.get(clsName);
+      const constructorMethod = structMeta.methods?.get("constructor");
+      if (constructorMethod) {
+        const actualArgs = expr.arguments || [];
+        const rawTypeArgs = expr.typeParameters?.params || expr.typeArguments?.params || [];
+        const subst = new Map();
+        if (structMeta.typeParams && structMeta.typeParams.length > 0) {
+          structMeta.typeParams.forEach((tpName, i) => {
+            if (rawTypeArgs[i]) {
+              subst.set(tpName, this.resolveType(rawTypeArgs[i]));
+            }
+          });
+        }
+
+        const substitute = (t) => (subst.has(t) ? subst.get(t) : t);
+        const expectedParams = (constructorMethod.params || []).map(substitute);
+
+        if (actualArgs.length !== expectedParams.length) {
+          this.reporter.addError(
+            this.currentFilePath,
+            expr,
+            `Yapıcı (constructor) argüman sayısı uyuşmazlığı: '${clsName}' ${expectedParams.length} argüman beklerken ${actualArgs.length} verildi.`
+          );
+        }
+        actualArgs.forEach((arg, idx) => {
+          const expectedParamType = expectedParams[idx];
+          const actualArgType = this.inferExpressionType(arg, expectedParamType);
+          if (expectedParamType && !this.typesAreCompatible(expectedParamType, actualArgType)) {
+            this.reporter.addError(
+              this.currentFilePath,
+              arg,
+              `'${clsName}' yapıcısı için geçersiz argüman türü: Parametre ${idx + 1} için '${expectedParamType}' beklenirken '${actualArgType}' verildi.`
+            );
+          }
+        });
+      }
+      return clsName;
     }
 
     return "any";

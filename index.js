@@ -74,7 +74,7 @@ for (const mod of modules) {
   reporter.registerSource(mod.filePath, code);
 }
 
-const analyzer = new SemanticAnalyzer(modules, reporter);
+const analyzer = new SemanticAnalyzer(modules, reporter, headerFiles);
 analyzer.analyze();
 
 if (reporter.hasErrors()) {
