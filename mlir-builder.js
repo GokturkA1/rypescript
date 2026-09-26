@@ -18,6 +18,7 @@ export class MLIRBuilder {
       threads: false,
       channels: false,
       allocators: false,
+      napi: false,
       sleep: false,
       exceptions: false,
       strings: false,
@@ -170,6 +171,17 @@ export class MLIRBuilder {
     let r = right;
 
     if (l.type === "!llvm.ptr" || r.type === "!llvm.ptr") {
+      // Eğer bir taraf pointer, diğer taraf integer 0 (null) ise tamsayıyı null pointer'a dönüştür
+      if (l.type === "!llvm.ptr" && r.type !== "!llvm.ptr") {
+        const nullPtr = this.nextSSA();
+        this.emit(`${nullPtr} = llvm.mlir.zero : !llvm.ptr`);
+        r = { ssa: nullPtr, type: "!llvm.ptr" };
+      } else if (r.type === "!llvm.ptr" && l.type !== "!llvm.ptr") {
+        const nullPtr = this.nextSSA();
+        this.emit(`${nullPtr} = llvm.mlir.zero : !llvm.ptr`);
+        l = { ssa: nullPtr, type: "!llvm.ptr" };
+      }
+
       const ssa = this.nextSSA();
       const predMap = { "==": "eq", "===": "eq", "!=": "ne", "!==": "ne" };
       const pred = predMap[op] || "eq";
@@ -222,9 +234,11 @@ export class MLIRBuilder {
     });
     this.block("do", () => {
       this.emit("^bb0:");
+      this.hasTerminated = false;
       bodyFn();
       this.emit("scf.yield");
     });
+    this.hasTerminated = false;
   }
 
   createReturn(val) {
@@ -361,11 +375,22 @@ export class MLIRBuilder {
     const triple = isWasm ? "wasm32-unknown-unknown" : "x86_64-pc-linux-gnu";
     let header = `module attributes {llvm.data_layout = "", llvm.target_triple = "${triple}"} {\n`;
 
-    const needsHeap = this.usedFeatures.heap || this.usedFeatures.map || this.usedFeatures.strings || this.usedFeatures.union || this.usedFeatures.channels || this.usedFeatures.allocators;
+    const needsHeap = this.usedFeatures.heap || this.usedFeatures.map || this.usedFeatures.strings || this.usedFeatures.union || this.usedFeatures.channels || this.usedFeatures.allocators || this.usedFeatures.napi;
 
     // 1. Dış Bağımlılıklar (sprintf tamamen kaldırıldı!)
     if (this.usedFeatures.printf) {
       header += `  llvm.func @printf(!llvm.ptr, ...) -> i32\n`;
+    }
+
+    if (this.usedFeatures.napi) {
+      header += `  llvm.func @napi_get_cb_info(!llvm.ptr, !llvm.ptr, !llvm.ptr, !llvm.ptr, !llvm.ptr, !llvm.ptr) -> i32\n`;
+      header += `  llvm.func @napi_get_value_double(!llvm.ptr, !llvm.ptr, !llvm.ptr) -> i32\n`;
+      header += `  llvm.func @napi_create_double(!llvm.ptr, f64, !llvm.ptr) -> i32\n`;
+      header += `  llvm.func @napi_get_value_string_utf8(!llvm.ptr, !llvm.ptr, !llvm.ptr, i64, !llvm.ptr) -> i32\n`;
+      header += `  llvm.func @napi_create_string_utf8(!llvm.ptr, !llvm.ptr, i64, !llvm.ptr) -> i32\n`;
+      header += `  llvm.func @napi_get_value_bool(!llvm.ptr, !llvm.ptr, !llvm.ptr) -> i32\n`;
+      header += `  llvm.func @napi_get_boolean(!llvm.ptr, i1, !llvm.ptr) -> i32\n`;
+      header += `  llvm.func @napi_define_properties(!llvm.ptr, !llvm.ptr, i64, !llvm.ptr) -> i32\n`;
     }
 
     if (!isWasm) {

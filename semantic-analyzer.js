@@ -24,6 +24,9 @@ export class SemanticAnalyzer {
     this.functionSignatures.set("noinline", { params: [], returnType: "any" });
     this.functionSignatures.set("packed", { params: [], returnType: "any" });
     this.functionSignatures.set("export_name", { params: ["string"], returnType: "any" });
+    this.functionSignatures.set("napi", { params: [], returnType: "any" });
+    this.functionSignatures.set("unique", { params: [], returnType: "any" });
+    this.functionSignatures.set("move", { params: [], returnType: "any" });
 
     this.functionSignatures.set("malloc", { params: ["number"], returnType: "pointer" });
     this.functionSignatures.set("free", { params: ["pointer"], returnType: "void" });
@@ -131,8 +134,7 @@ export class SemanticAnalyzer {
         if (["i64", "i32", "f64", "f32"].includes(name)) return "number";
         if (name === "bool") return "boolean";
         if (name === "Promise") {
-          const inner = curr.typeParameters?.params?.[0] || curr.typeArguments?.params?.[0];
-          return inner ? this.resolveType(inner) : "any";
+          return "pointer";
         }
         return name || "pointer";
       }
@@ -195,7 +197,6 @@ export class SemanticAnalyzer {
   }
 
   analyze() {
-    // 1. GEÇİŞ: Enum, Interface, Class ve Fonksiyon İmzalarını Topla
     for (const mod of this.modules) {
       this.currentFilePath = mod.filePath;
       for (const rawNode of mod.program.body) {
@@ -276,19 +277,44 @@ export class SemanticAnalyzer {
 
         if (decl.type === "FunctionDeclaration") {
           const fnName = decl.id.name;
+          const isAsync = Boolean(decl.async);
           const rawTypeParams = decl.typeParameters?.params || [];
           const typeParams = rawTypeParams.map((p) => p.name?.name || p.name?.value || p.name || "");
           const params = (decl.params || []).map((p) => {
             const annot = p.typeAnnotation || p.pattern?.typeAnnotation;
             return this.resolveType(annot);
           });
-          const returnType = decl.returnType ? this.resolveType(decl.returnType) : "any";
-          this.functionSignatures.set(fnName, { params, returnType, typeParams, node: decl });
+
+          let innerReturnType = "any";
+          let outerReturnType = "any";
+
+          if (decl.returnType) {
+            const unwrapped = this.unwrapType(decl.returnType);
+            const typeName = unwrapped?.typeName?.name || unwrapped?.typeName?.value;
+            if (typeName === "Promise") {
+              const innerParam = unwrapped.typeParameters?.params?.[0] || unwrapped.typeArguments?.params?.[0];
+              innerReturnType = innerParam ? this.resolveType(innerParam) : "any";
+              outerReturnType = "pointer";
+            } else {
+              innerReturnType = this.resolveType(decl.returnType);
+              outerReturnType = isAsync ? "pointer" : innerReturnType;
+            }
+          } else {
+            innerReturnType = isAsync ? "number" : "any";
+            outerReturnType = isAsync ? "pointer" : innerReturnType;
+          }
+
+          this.functionSignatures.set(fnName, { 
+            params, 
+            returnType: innerReturnType, 
+            outerReturnType, 
+            typeParams, 
+            node: decl 
+          });
         }
       }
     }
 
-    // 2. GEÇİŞ: Kapsam, Alan Denetimi, Sahiplik ve Tip Uyuşmazlığı Doğrulaması
     for (const mod of this.modules) {
       this.currentFilePath = mod.filePath;
       this.enterScope(false);
@@ -318,24 +344,6 @@ export class SemanticAnalyzer {
 
           if (decl.init) {
             inferredType = this.inferExpressionType(decl.init, explicitType);
-
-            if (decl.init.type === "Identifier") {
-              const srcSym = this.lookupSymbol(decl.init.name);
-              if (srcSym) {
-                if (srcSym.isMoved) {
-                  this.reporter.addError(
-                    this.currentFilePath,
-                    decl.init,
-                    `Taşınmış değer kullanılamaz: '${decl.init.name}'!`,
-                    srcSym.moveNode,
-                    `Değerin sahipliği daha önce burada devredilmişti.`
-                  );
-                } else if (srcSym.type !== "number" && srcSym.type !== "boolean") {
-                  srcSym.isMoved = true;
-                  srcSym.moveNode = decl.init;
-                }
-              }
-            }
           }
 
           const finalType = explicitType || inferredType;
@@ -351,16 +359,15 @@ export class SemanticAnalyzer {
           const scope = this.scopes[this.scopes.length - 1];
           scope.symbols.set(varName, {
             type: finalType,
-            isMoved: false,
             defNode: decl,
-            moveNode: null,
           });
         }
         break;
       }
 
       case "FunctionDeclaration": {
-        const retType = stmt.returnType ? this.resolveType(stmt.returnType) : "any";
+        const fnMeta = this.functionSignatures.get(stmt.id.name);
+        const retType = fnMeta ? fnMeta.returnType : "any";
         this.enterScope(true, retType);
 
         for (const p of stmt.params || []) {
@@ -368,7 +375,6 @@ export class SemanticAnalyzer {
           const pType = this.resolveType(p.typeAnnotation || p.pattern?.typeAnnotation);
           this.scopes[this.scopes.length - 1].symbols.set(pName, {
             type: pType,
-            isMoved: false,
             defNode: p,
           });
         }
@@ -469,6 +475,15 @@ export class SemanticAnalyzer {
     }
   }
 
+  unwrapType(typeNode) {
+    if (!typeNode) return null;
+    let curr = typeNode;
+    while (curr && (curr.type === "TSTypeAnnotation" || curr.type === "TSType") && curr.typeAnnotation) {
+      curr = curr.typeAnnotation;
+    }
+    return curr;
+  }
+
   inferExpressionType(expr, expectedType = null) {
     if (!expr) return "void";
 
@@ -491,8 +506,8 @@ export class SemanticAnalyzer {
       return "function";
     }
     if (expr.type === "AwaitExpression") {
-      const inner = this.inferExpressionType(expr.argument);
-      return inner || "number";
+      this.inferExpressionType(expr.argument);
+      return "number";
     }
 
     if (expr.type === "Identifier") {
@@ -507,20 +522,9 @@ export class SemanticAnalyzer {
         }
         return "any";
       }
-
-      if (sym.isMoved) {
-        this.reporter.addError(
-          this.currentFilePath,
-          expr,
-          `Taşınmış değer kullanılamaz: '${expr.name}'!`,
-          sym.moveNode,
-          `Değerin sahipliği daha önce burada devredilmişti.`
-        );
-      }
       return sym.type;
     }
 
-    // NESNE (STRUCT / INTERFACE) LİTERAL DENETİMİ
     if (expr.type === "ObjectExpression") {
       if (expectedType && this.structSignatures.has(expectedType)) {
         const structMeta = this.structSignatures.get(expectedType);
@@ -566,7 +570,6 @@ export class SemanticAnalyzer {
       return "object";
     }
 
-    // ALAN VE METOT ERİŞİMİ (obj.field, enum.Member, HttpCode[404], arr.length)
     if (expr.type === "MemberExpression") {
       let baseType = null;
       let isEnum = false;
@@ -580,7 +583,7 @@ export class SemanticAnalyzer {
       const propName = expr.property?.name || expr.property?.value;
 
       if (isEnum) {
-        if (expr.computed) return "string"; // Reverse mapping: HttpCode[404] -> string
+        if (expr.computed) return "string";
         const en = this.enumSignatures.get(baseType);
         return en.kind === "string" ? "string" : "number";
       }
@@ -686,7 +689,6 @@ export class SemanticAnalyzer {
           const actualArgs = expr.arguments || [];
           const rawTypeArgs = expr.typeParameters?.params || expr.typeArguments?.params || [];
 
-          // Generics Çözümleme ve Tip İkamesi (Type Substitution: T -> concreteType)
           const subst = new Map();
           if (fnMeta.typeParams && fnMeta.typeParams.length > 0) {
             fnMeta.typeParams.forEach((tpName, i) => {
@@ -694,7 +696,6 @@ export class SemanticAnalyzer {
                 subst.set(tpName, this.resolveType(rawTypeArgs[i]));
               }
             });
-            // Eğer açıkça typeArgument verilmediyse argümandan çıkarsama yap
             if (subst.size === 0) {
               fnMeta.params.forEach((pType, i) => {
                 if (fnMeta.typeParams.includes(pType) && actualArgs[i]) {
@@ -707,7 +708,7 @@ export class SemanticAnalyzer {
 
           const substitute = (t) => (subst.has(t) ? subst.get(t) : t);
           const expectedParams = fnMeta.params.map(substitute);
-          const returnType = substitute(fnMeta.returnType);
+          const returnType = substitute(fnMeta.outerReturnType || fnMeta.returnType);
 
           if (actualArgs.length !== expectedParams.length) {
             this.reporter.addError(
@@ -727,14 +728,6 @@ export class SemanticAnalyzer {
                 arg,
                 `'${fnName}' için geçersiz argüman türü: Parametre ${idx + 1} için '${expectedParamType}' beklenirken '${actualArgType}' verildi.`
               );
-            }
-
-            if (arg.type === "Identifier" && expectedParamType !== "number" && expectedParamType !== "boolean") {
-              const sym = this.lookupSymbol(arg.name);
-              if (sym && !sym.isMoved) {
-                sym.isMoved = true;
-                sym.moveNode = arg;
-              }
             }
           });
 

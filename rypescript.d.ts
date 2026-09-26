@@ -186,6 +186,9 @@ declare global {
 
   /** Fonksiyonun dışarıya aktarılacak saf C sembol adını belirler (C-ABI export alias). */
   function export_name(name: string): (...args: any[]) => any;
+
+  /** Fonksiyonu doğrudan Node.js eklentisi (.node) olarak dışa aktaran N-API köprüsü üretir. */
+  function napi(...args: any[]): any;
 }
 
 export {};

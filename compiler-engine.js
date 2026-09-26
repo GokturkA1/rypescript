@@ -240,8 +240,8 @@ export class CompilerEngine {
 
     const emptyBuf = Buffer.from("\0", "utf8");
     const cpuBuf = Buffer.from("generic\0", "utf8");
-    // RelocMode: 2 (LLVMRelocPIC) - Paylaşımlı kütüphaneler (.so) ve PIE için zorunludur
-    const relocMode = (format === "elf" || format === "so") ? 2 : 0;
+    // RelocMode: 2 (LLVMRelocPIC) - Paylaşımlı kütüphaneler (.so, .node) ve PIE için zorunludur
+    const relocMode = (format === "elf" || format === "so" || format === "node") ? 2 : 0;
     const tm = llvm.LLVMCreateTargetMachine(target, tripleBuf, cpuBuf, emptyBuf, 2, 2, 0);
 
     // Tipik derleyici davranışı: .o dosyası çıktı adına göre belirlenir ve kalıcıdır
@@ -292,7 +292,7 @@ export class CompilerEngine {
           crtn,
           "-o", outputFile,
         ];
-      } else if (format === "so") {
+      } else if (format === "so" || format === "node") {
         const searchDirs = [
           "/usr/lib",
           "/usr/lib64",
@@ -338,7 +338,7 @@ export class CompilerEngine {
       }
 
       let linkOk = false;
-      if (format === "elf" || format === "so") linkOk = bridge.link_elf(linkerArgs.length, argvBuf);
+      if (format === "elf" || format === "so" || format === "node") linkOk = bridge.link_elf(linkerArgs.length, argvBuf);
       else if (format === "coff") linkOk = bridge.link_coff(linkerArgs.length, argvBuf);
       else if (format === "macho") linkOk = bridge.link_macho(linkerArgs.length, argvBuf);
       else if (format === "wasm") linkOk = bridge.link_wasm(linkerArgs.length, argvBuf);
