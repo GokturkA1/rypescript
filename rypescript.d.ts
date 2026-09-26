@@ -1,9 +1,68 @@
 // rypescript.d.ts
-// RypeScript Sistem Dili - Standart Küresel Tip Deklarasyonları
+// RypeScript Sistem Programlama Dili - Kapsamlı Standart Tip Deklarasyonları (Ambient Declarations)
+// IDE (VS Code, WebStorm, Neovim vb.) dil sunucusu için tam entegrasyon ve sıfır-hata desteği sağlar.
 
 declare global {
   // ==========================================
-  // 1. DETERMINİSTİK HATA YÖNETİMİ (RESULT MODELİ)
+  // 1. SKALER VE SİSTEM TİP TANIMLARI (PRIMITIVES)
+  // ==========================================
+
+  /** 32-bit işaretli tamsayı (LLVM i32). Aralık: -2,147,483,648 .. 2,147,483,647 */
+  type i32 = number;
+
+  /** 64-bit işaretli tamsayı (LLVM i64). Aralık: -9,223,372,036,854,775,808 .. 9,223,372,036,854,775,807 */
+  type i64 = number;
+
+  /** 32-bit işaretsiz tamsayı (LLVM i32). Aralık: 0 .. 4,294,967,295 */
+  type u32 = number;
+
+  /** 64-bit işaretsiz tamsayı (LLVM i64). Aralık: 0 .. 18,446,744,073,709,551,615 */
+  type u64 = number;
+
+  /** 32-bit tek duyarlıklı kayan noktalı sayı (LLVM f32 / IEEE 754 float) */
+  type f32 = number;
+
+  /** 64-bit çift duyarlıklı kayan noktalı sayı (LLVM f64 / IEEE 754 double) */
+  type f64 = number;
+
+  /** 1-bit mantıksal doğruluk değeri (LLVM i1 / boolean) */
+  type bool = boolean;
+
+  /** 32-bit işaretli tamsayı takma adı (C `int` uyumlu) */
+  type int = number;
+
+  /** 32-bit kayan nokta takma adı (C `float` uyumlu) */
+  type float = number;
+
+  /** 64-bit kayan nokta takma adı (C `double` uyumlu) */
+  type double = number;
+
+  /** 8-bit işaretsiz bayt (LLVM i8) */
+  type byte = number;
+
+  /** Platform mimarisine bağlı işaretçi boyutunda işaretsiz tamsayı (x86_64 için 64-bit, wasm32 için 32-bit) */
+  type usize = number;
+
+  /** Platform mimarisine bağlı işaretçi boyutunda işaretli tamsayı */
+  type isize = number;
+
+  /**
+   * Çıplak C / LLVM seviyesi bellek işaretçisi (!llvm.ptr).
+   * Null, undefined, nesne veya sayısal adresleri tutabilir.
+   */
+  type pointer = any;
+
+  /** Çıplak işaretçi takma adı (pointer) */
+  type ptr = pointer;
+
+  /**
+   * C-Style saf bellek paylaşımı (type-punning / C union) sağlayan untagged union tanımlayıcısı.
+   * Tüm alanlar belleğin 0. ofsetini paylaşır, ek yük (discriminant) taşımaz.
+   */
+  type Untagged<T> = T;
+
+  // ==========================================
+  // 2. DETERMINİSTİK HATA YÖNETİMİ (RESULT & PANIC MODELİ)
   // ==========================================
 
   /**
@@ -11,29 +70,32 @@ declare global {
    * `T`: Başarı değeri tipi, `E`: Hata tipi (Varsayılan: string).
    */
   interface Result<T, E = string> {
+    /** İşlemin başarı durumunu belirtir (`true` ise başarılı, `false` ise hatalı). */
     readonly ok: boolean;
+    /** İşlem başarılıysa (`ok === true`) üretilen sonuç değeri; aksi halde tanımsızdır. */
     readonly value: T;
+    /** İşlem başarısızsa (`ok === false`) dönen hata mesajı veya nesnesi; aksi halde tanımsızdır. */
     readonly error: E;
   }
 
   /**
    * Başarılı bir Result nesnesi üretir (`ok = true`).
-   * @param val Döndürülecek başarı değeri.
+   * @param val Başarı değeri.
    */
-  function Ok<T>(val: T): Result<T, never>;
+  function Ok<T, E = never>(val: T): Result<T, E>;
 
   /**
    * Hatalı bir Result nesnesi üretir (`ok = false`).
-   * @param err Hata mesajı veya hata nesnesi.
+   * @param err Hata mesajı veya nesnesi.
    */
-  function Err<E = string>(err: E): Result<never, E>;
+  function Err<E = string, T = never>(err: E): Result<T, E>;
 
   /**
-   * Result içindeki değeri döner.
-   * Eğer Result hatalıysa (`ok = false`), program panic üreterek anında sonlanır (abort/trap).
+   * Result içindeki değeri çözer (unwrap).
+   * Eğer Result hatalıysa (`ok === false`), program anında panik üreterek sonlanır (LLVM abort/trap).
    * @param res Çözümlenecek Result nesnesi.
    */
-  function unwrap<T, E>(res: Result<T, E>): T;
+  function unwrap<T, E = any>(res: Result<T, E>): T;
 
   /**
    * Kurtarılamaz bir sistem hatasında programı anında panik durumuna geçirip sonlandırır (abort).
@@ -42,14 +104,15 @@ declare global {
   function panic(message?: string): never;
 
   /**
-   * Koşulun doğruluğunu denetler; koşul false ise programı abort eder.
+   * Çalışma zamanı koşul denetimi yapar; koşul false ise programı abort eder.
+   * TypeScript asserts mekanizması ile tam uyumludur.
    * @param condition Doğrulanacak boolean ifade.
    * @param message Başarısızlık durumunda ekrana basılacak mesaj.
    */
   function assert(condition: boolean, message?: string): asserts condition;
 
   // ==========================================
-  // 2. SAHİPLİK VE ÖDÜNÇ ALMA (BORROW CHECKER)
+  // 3. SAHİPLİK VE ÖDÜNÇ ALMA (OWNERSHIP & BORROW CHECKER)
   // ==========================================
 
   /**
@@ -59,15 +122,22 @@ declare global {
    */
   function borrow<T>(target: T): T;
 
+  /**
+   * Bir kaynağın sahipliğini açıkça (explicit) yeni bir değişkene veya kapsama taşır.
+   * Kaynak taşındıktan sonra eski değişken artık kullanılamaz (use-after-move derleme hatası).
+   * @param target Taşınacak nesne veya kaynak.
+   */
+  function move<T>(target: T): T;
+
   // ==========================================
-  // 3. EŞZAMANLILIK (CONCURRENCY: CHANNELS & THREADS)
+  // 4. EŞZAMANLILIK (CONCURRENCY: CHANNELS & THREADS)
   // ==========================================
 
   /**
    * Thread'ler arası FIFO kuyruğu ile veri taşıyan thread-safe kanal primitifi.
-   * POSIX pthread_mutex ve pthread_cond tabanlıdır.
+   * POSIX pthread_mutex ve pthread_cond tabanlı sıfır-kopyalama (zero-copy) mimarisine sahiptir.
    */
-  class Channel<T> {
+  class Channel<T = any> {
     /**
      * Belirtilen kapasitede dairesel tamponlu (bounded buffer) kanal oluşturur.
      * @param capacity Kanal kapasitesi (Varsayılan: 1).
@@ -81,69 +151,80 @@ declare global {
     send(value: T): void;
 
     /**
-     * Kanaldan değer okur. Kanal boşsa veri gelene kadar iş parçacığını kilitler.
+     * Kanaldan değer okur. Kanal boşsa veri gelene kadar çağıran iş parçacığını kilitler.
      */
     recv(): T;
+
+    /** Kanalı kapatır ve bekleyen tüm iş parçacıklarını uyandırır. */
+    close(): void;
   }
+
+  /**
+   * OS seviyesinde bir iş parçacığı veya asenkron görev tanıtıcısı (Thread Handle).
+   */
+  type ThreadHandle = any;
 
   /**
    * Bir fonksiyonu arka planda bağımsız bir işletim sistemi iş parçacığında (OS pthread) başlatır.
    * @param worker Çalıştırılacak iş parçacığı fonksiyonu.
-   * @param arg İş parçacığına aktarılacak argüman (örneğin Channel).
-   * @returns İş parçacığı tanıtıcısı (Thread Handle).
+   * @param arg İş parçacığına aktarılacak argüman (örneğin Channel veya veri yapısı).
+   * @returns İş parçacığı tanıtıcısı (ThreadHandle).
    */
   function spawn<A>(worker: (arg: A) => void, arg: A): ThreadHandle;
   function spawn(worker: () => void): ThreadHandle;
+  function spawn<T, A extends any[]>(worker: (...args: A) => T, ...args: A): ThreadHandle;
 
   /**
-   * Belirtilen iş parçacığının tamamlanmasını bekler (pthread_join) ve kaynağı serbest bırakır.
-   * @param threadHandle spawn ile üretilen iş parçacığı tanıtıcısı.
+   * Belirtilen iş parçacığının veya asenkron görevin tamamlanmasını bekler (pthread_join / task join) ve kaynakları temizler.
+   * @param threadHandle spawn ile üretilen iş parçacığı veya async fonksiyondan dönen task handle'ı.
    */
-  function join(threadHandle: ThreadHandle): void;
-
-  /**
-   * OS seviyesinde bir iş parçacığı işaretçisini temsil eden opak tip.
-   */
-  type ThreadHandle = { readonly __brand: unique symbol };
+  function join(threadHandle: ThreadHandle | Promise<any> | pointer): void;
 
   // ==========================================
-  // 4. SİSTEM VE BELLEK TİPLERİ
+  // 5. ÇIPLAK VE ÖZEL BELLEK YÖNETİCİLERİ (ALLOCATORS & RAII)
   // ==========================================
 
   /**
-   * C-Style saf bellek paylaşımı (type-punning) sağlayan untagged union tanımlayıcısı.
-   * Tüm alanlar belleğin 0. ofsetini paylaşır.
+   * İşletim sisteminden belirtilen bayt kadar ham heap belleği ayırır (C malloc).
+   * @param sizeBytes Ayrılacak bellek boyutu (bayt).
+   * @returns Ham bellek işaretçisi.
    */
-  type Untagged<T> = T;
+  function malloc(sizeBytes: number): pointer;
 
   /**
-   * Belirtilen milisaniye kadar işletim sistemi seviyesinde uyur (usleep).
-   * @param ms Beklenecek süre (milisaniye).
+   * Daha önce malloc ile ayrılmış bir bellek bloğunu serbest bırakır (C free).
+   * @param ptr Serbest bırakılacak bellek işaretçisi.
    */
-  function sleep(ms: number): void;
-
-  // ==========================================
-  // 5. ÇIPLAK VE ÖZEL BELLEK YÖNETİCİLERİ
-  // ==========================================
-
-  /** İşletim sisteminden çıplak heap belleği ayırır (C malloc). */
-  function malloc(sizeBytes: number): any;
-
-  /** Daha önce malloc ile ayrılmış bir bellek bloğunu serbest bırakır (C free). */
-  function free(ptr: any): void;
-
-  /** Geçerli fonksiyonun stack çerçevesinde (stack frame) dinamik bayt ayırır. */
-  function alloca(sizeBytes: number): any;
+  function free(ptr: pointer): void;
 
   /**
-   * Zig tarzı bölgesel Bump Allocator.
-   * İşaretçi sadece ileri kayar; reset() ile sıfırlanır veya using ile toptan yok edilir.
+   * Geçerli fonksiyonun yığın çerçevesinde (stack frame) dinamik bayt ayırır.
+   * Fonksiyondan çıkıldığında otomatik olarak sıfır maliyetle geri kazanılır.
+   * @param sizeBytes Ayrılacak yığın boyutu (bayt).
+   */
+  function alloca(sizeBytes: number): pointer;
+
+  /**
+   * Zig/Rust tarzı bölgesel Bump Allocator.
+   * İşaretçi sadece ileri kayar; reset() ile sıfırlanır veya `using` ile toptan yok edilir (RAII).
    */
   class Arena {
+    /**
+     * Belirtilen bayt kapasitesinde Arena tahsis eder.
+     * @param capacityBytes Arena boyutu (Varsayılan: 1024).
+     */
     constructor(capacityBytes?: number);
-    alloc(sizeBytes: number): any;
+
+    /** Arena içinden belirtilen bayt kadar bellek dilimi ayırır. */
+    alloc(sizeBytes: number): pointer;
+
+    /** Arena işaretçisini en başa sararak belleği sıfır maliyetle yeniden kullanıma açar. */
     reset(): void;
+
+    /** Arena'yı serbest bırakır ve tüm tahsisatları geçersiz kılar. */
     dispose(): void;
+
+    /** TypeScript `using` anahtar sözcüğü ile RAII otomatik temizlik desteği. */
     [Symbol.dispose](): void;
   }
 
@@ -152,10 +233,23 @@ declare global {
    * Tekil blokları free() ile havuza geri kabul eder, sıfır bellek parçalanması sağlar.
    */
   class Pool {
+    /**
+     * Sabit boyutlu bloklardan oluşan bir havuz tahsis eder.
+     * @param chunkSizeBytes Her bir bloğun boyutu (bayt).
+     * @param chunkCount Havuzdaki toplam blok adedi (Varsayılan: 1024).
+     */
     constructor(chunkSizeBytes: number, chunkCount?: number);
-    alloc(): any;
-    free(ptr: any): void;
+
+    /** Havuzdan boşta duran tek bir blok ayırır. */
+    alloc(): pointer;
+
+    /** Daha önce havuzdan alınmış bir bloğu havuza geri iade eder. */
+    free(ptr: pointer): void;
+
+    /** Havuzu ve barındırdığı tüm bellek sayfalarını tamamen serbest bırakır. */
     dispose(): void;
+
+    /** TypeScript `using` anahtar sözcüğü ile RAII otomatik temizlik desteği. */
     [Symbol.dispose](): void;
   }
 
@@ -164,31 +258,98 @@ declare global {
    * Sabit kapasiteyi aşarsa trap/abort eder.
    */
   class FixedBuffer {
+    /**
+     * Belirtilen kapasitede sabit bir bellek tamponu tahsis eder.
+     * @param capacityBytes Tampon kapasitesi (bayt).
+     */
     constructor(capacityBytes: number);
-    alloc(sizeBytes: number): any;
+
+    /** Tampon içinden yer ayırır. */
+    alloc(sizeBytes: number): pointer;
+
+    /** Tampon ofsetini sıfırlar. */
     reset(): void;
+
+    /** Tamponu tamamen serbest bırakır. */
     dispose(): void;
+
+    /** TypeScript `using` anahtar sözcüğü ile RAII otomatik temizlik desteği. */
     [Symbol.dispose](): void;
   }
 
   // ==========================================
-  // 6. DERLEYİCİ DECORATOR'LARI (PRAGMAS)
+  // 6. SİSTEM VE ZAMAN YARDIMCILARI
   // ==========================================
 
-  /** Fonksiyon veya metot çağrısını satır içine (inline) kopyalayarak çağrı maliyetini sıfırlar (LLVM alwaysinline). */
-  function inline(...args: any[]): any;
+  /**
+   * Belirtilen milisaniye kadar işletim sistemi seviyesinde uyur (POSIX usleep / Windows Sleep).
+   * @param ms Beklenecek süre (milisaniye).
+   */
+  function sleep(ms: number): void;
 
-  /** Fonksiyon veya metodun satır içine gömülmesini kesinlikle engeller (LLVM noinline). */
-  function noinline(...args: any[]): any;
+  // ==========================================
+  // 7. DERLEYİCİ DEKORATÖRLERİ VE PRAGMALAR
+  // ==========================================
 
-  /** C-Style struct veya sınıfta alanlar arası 8-bayt hizalama dolgusunu (padding) kaldırarak bayt bayt sıkıştırır. */
-  function packed(...args: any[]): any;
+  type RypePragma = any;
 
-  /** Fonksiyonun dışarıya aktarılacak saf C sembol adını belirler (C-ABI export alias). */
-  function export_name(name: string): (...args: any[]) => any;
+  /**
+   * Fonksiyon veya metot çağrısını satır içine (inline) kopyalayarak çağrı maliyetini sıfırlar (LLVM alwaysinline).
+   */
+  function inline(...args: any[]): RypePragma;
 
-  /** Fonksiyonu doğrudan Node.js eklentisi (.node) olarak dışa aktaran N-API köprüsü üretir. */
-  function napi(...args: any[]): any;
+  /**
+   * Fonksiyon veya metodun satır içine gömülmesini kesinlikle engeller (LLVM noinline).
+   */
+  function noinline(...args: any[]): RypePragma;
+
+  /**
+   * C-Style struct, sınıf veya arayüzde alanlar arası hizalama dolgusunu (padding) kaldırarak bayt bayt sıkıştırır.
+   */
+  function packed(...args: any[]): RypePragma;
+
+  /**
+   * Fonksiyonun dışarıya aktarılacak saf C sembol adını belirler (C-ABI export alias).
+   * @param name Dışa aktarılacak saf C sembol adı (örn: `"rype_native_entry"`).
+   */
+  function export_name(name: string): (...args: any[]) => RypePragma;
+
+  /**
+   * Fonksiyonu doğrudan Node.js eklentisi (.node) olarak dışa aktaran N-API köprüsü üretir.
+   */
+  function napi(...args: any[]): RypePragma;
+
+  /**
+   * Benzersiz tek sahiplik (unique pointer) özniteliği.
+   */
+  function unique(...args: any[]): RypePragma;
 }
+
+// ==========================================
+// 8. C / NATIVE VE İKİLİ DOSYA MODÜL DEKLARASYONLARI
+// ==========================================
+
+/** C başlık dosyaları (.h) doğrudan içe aktarılabilir. */
+declare module "*.h";
+declare module "*libmath.h" {
+  export const rts_add: (a: number, b: number) => number;
+  export const rts_multiply: (a: number, b: number) => number;
+}
+
+/** Linux ELF dinamik kütüphaneleri (.so) doğrudan içe aktarılabilir. */
+declare module "*.so";
+declare module "*libmath.so";
+
+/** Windows dinamik kütüphaneleri (.dll) doğrudan içe aktarılabilir. */
+declare module "*.dll";
+
+/** macOS dinamik kütüphaneleri (.dylib) doğrudan içe aktarılabilir. */
+declare module "*.dylib";
+
+/** Node.js native eklentileri (.node) doğrudan içe aktarılabilir. */
+declare module "*.node";
+
+/** WebAssembly modülleri (.wasm) doğrudan içe aktarılabilir. */
+declare module "*.wasm";
 
 export {};
