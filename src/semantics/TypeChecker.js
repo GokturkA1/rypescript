@@ -866,7 +866,8 @@ export class TypeChecker {
 
           const actualArgs = expr.arguments || [];
           const expectedParams = methodMeta.params || [];
-          if (actualArgs.length !== expectedParams.length) {
+          const minArgs = methodMeta.minArgs !== undefined ? methodMeta.minArgs : expectedParams.length;
+          if (actualArgs.length < minArgs || actualArgs.length > expectedParams.length) {
             this.reporter.addError(
               this.currentFilePath,
               expr,

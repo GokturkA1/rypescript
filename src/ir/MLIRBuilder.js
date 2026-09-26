@@ -26,6 +26,7 @@ export class MLIRBuilder {
       sleep: false,
       exceptions: false,
       strings: false,
+      strcmp: false,
     };
 
     this.externalFunctions = new Map();
@@ -192,6 +193,18 @@ export class MLIRBuilder {
     let l = left;
     let r = right;
 
+    if (l.isString && r.isString) {
+      this.markFeature("strcmp");
+      const cmpRes = this.nextSSA();
+      this.emit(`${cmpRes} = llvm.call @strcmp(${l.ssa || l.ptr}, ${r.ssa || r.ptr}) : (!llvm.ptr, !llvm.ptr) -> i32`);
+      const zero = this.createConstant(0, "i32");
+      const ssa = this.nextSSA();
+      const predMap = { "<": "slt", "<=": "sle", ">": "sgt", ">=": "sge", "==": "eq", "===": "eq", "!=": "ne", "!==": "ne" };
+      const pred = predMap[op] || "eq";
+      this.emit(`${ssa} = arith.cmpi ${pred}, ${cmpRes}, ${zero.ssa} : i32`);
+      return { ssa, type: "i1" };
+    }
+
     if (l.type === "!llvm.ptr" || r.type === "!llvm.ptr") {
       // Eğer bir taraf pointer, diğer taraf integer 0 (null) ise tamsayıyı null pointer'a dönüştür
       if (l.type === "!llvm.ptr" && r.type !== "!llvm.ptr") {
@@ -250,16 +263,24 @@ export class MLIRBuilder {
   }
 
   createWhile(condEvaluator, bodyFn) {
-    this.block("scf.while : () -> ()", () => {
-      const cond = condEvaluator();
-      this.emit(`scf.condition(${cond.ssa})`);
-    });
-    this.block("do", () => {
-      this.emit("^bb0:");
-      this.hasTerminated = false;
-      bodyFn();
-      this.emit("scf.yield");
-    });
+    const condBlock = this.nextBlock("while_cond");
+    const bodyBlock = this.nextBlock("while_body");
+    const exitBlock = this.nextBlock("while_exit");
+
+    this.emitBranch(condBlock);
+    this.emitBlockLabel(condBlock);
+    this.hasTerminated = false;
+    const cond = condEvaluator();
+    this.emitBranchConditional(cond.ssa, bodyBlock, exitBlock);
+
+    this.emitBlockLabel(bodyBlock);
+    this.hasTerminated = false;
+    bodyFn();
+    if (!this.hasTerminated) {
+      this.emitBranch(condBlock);
+    }
+
+    this.emitBlockLabel(exitBlock);
     this.hasTerminated = false;
   }
 
@@ -476,6 +497,8 @@ export class MLIRBuilder {
       }
       if (this.usedFeatures.map) {
         header += `  llvm.func @calloc(i64, i64) -> !llvm.ptr\n`;
+      }
+      if (this.usedFeatures.map || this.usedFeatures.strcmp) {
         header += `  llvm.func @strcmp(!llvm.ptr, !llvm.ptr) -> i32\n`;
       }
     }

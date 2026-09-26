@@ -57,7 +57,7 @@ export class RuntimeEmitters {
     header += `    llvm.return %ptr : !llvm.ptr\n`;
     header += `  }\n\n`;
 
-    if (usedFeatures.map) {
+    if (usedFeatures.map || usedFeatures.strcmp) {
       header += `  llvm.func @strcmp(%s1: !llvm.ptr, %s2: !llvm.ptr) -> i32 {\n`;
       header += `    %c0 = llvm.mlir.constant(0 : i64) : i64\n`;
       header += `    %c1 = llvm.mlir.constant(1 : i64) : i64\n`;
@@ -165,6 +165,49 @@ export class RuntimeEmitters {
     header += `    %c0_i8 = llvm.mlir.constant(0 : i8) : i8\n`;
     header += `    %end_ptr = llvm.getelementptr %buf[%tot1] : (!llvm.ptr, i64) -> !llvm.ptr, i8\n`;
     header += `    llvm.store %c0_i8, %end_ptr : i8, !llvm.ptr\n`;
+    header += `    func.return %buf : !llvm.ptr\n`;
+    header += `  }\n\n`;
+
+    // 3. @rts_str_slice (C-Style sıfır sızıntılı alt metin / dilimleme)
+    header += `  func.func @rts_str_slice(%str: !llvm.ptr, %start: i64, %end: i64) -> !llvm.ptr {\n`;
+    header += `    %c0 = llvm.mlir.constant(0 : i64) : i64\n`;
+    header += `    %c1 = llvm.mlir.constant(1 : i64) : i64\n`;
+    header += `    %c0_i8 = llvm.mlir.constant(0 : i8) : i8\n`;
+    header += `    %c1_i32 = arith.constant 1 : i32\n`;
+    header += `    %str_len = func.call @rts_strlen(%str) : (!llvm.ptr) -> i64\n`;
+    header += `    %s_lt_0 = arith.cmpi slt, %start, %c0 : i64\n`;
+    header += `    %s_clamped = arith.select %s_lt_0, %c0, %start : i64\n`;
+    header += `    %s_gt_len = arith.cmpi sgt, %s_clamped, %str_len : i64\n`;
+    header += `    %real_start = arith.select %s_gt_len, %str_len, %s_clamped : i64\n`;
+    header += `    %e_lt_0 = arith.cmpi slt, %end, %c0 : i64\n`;
+    header += `    %e_gt_len = arith.cmpi sgt, %end, %str_len : i64\n`;
+    header += `    %e_invalid = arith.ori %e_lt_0, %e_gt_len : i1\n`;
+    header += `    %real_end = arith.select %e_invalid, %str_len, %end : i64\n`;
+    header += `    %raw_len = arith.subi %real_end, %real_start : i64\n`;
+    header += `    %len_lt_0 = arith.cmpi slt, %raw_len, %c0 : i64\n`;
+    header += `    %slice_len = arith.select %len_lt_0, %c0, %raw_len : i64\n`;
+    header += `    %tot = arith.addi %slice_len, %c1 : i64\n`;
+    header += `    %buf = llvm.call @malloc(%tot) : (i64) -> !llvm.ptr\n`;
+    header += `    %i_slot = llvm.alloca %c1_i32 x i64 : (i32) -> !llvm.ptr\n`;
+    header += `    llvm.store %c0, %i_slot : i64, !llvm.ptr\n`;
+    header += `    scf.while : () -> () {\n`;
+    header += `      %i = llvm.load %i_slot : !llvm.ptr -> i64\n`;
+    header += `      %cond = arith.cmpi slt, %i, %slice_len : i64\n`;
+    header += `      scf.condition(%cond)\n`;
+    header += `    } do {\n`;
+    header += `    ^bb0:\n`;
+    header += `      %i = llvm.load %i_slot : !llvm.ptr -> i64\n`;
+    header += `      %src_idx = arith.addi %real_start, %i : i64\n`;
+    header += `      %src_p = llvm.getelementptr %str[%src_idx] : (!llvm.ptr, i64) -> !llvm.ptr, i8\n`;
+    header += `      %dst_p = llvm.getelementptr %buf[%i] : (!llvm.ptr, i64) -> !llvm.ptr, i8\n`;
+    header += `      %ch = llvm.load %src_p : !llvm.ptr -> i8\n`;
+    header += `      llvm.store %ch, %dst_p : i8, !llvm.ptr\n`;
+    header += `      %next = arith.addi %i, %c1 : i64\n`;
+    header += `      llvm.store %next, %i_slot : i64, !llvm.ptr\n`;
+    header += `      scf.yield\n`;
+    header += `    }\n`;
+    header += `    %term_p = llvm.getelementptr %buf[%slice_len] : (!llvm.ptr, i64) -> !llvm.ptr, i8\n`;
+    header += `    llvm.store %c0_i8, %term_p : i8, !llvm.ptr\n`;
     header += `    func.return %buf : !llvm.ptr\n`;
     header += `  }\n\n`;
 

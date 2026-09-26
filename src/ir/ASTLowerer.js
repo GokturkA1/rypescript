@@ -519,6 +519,35 @@ export class ASTLowerer {
     return null;
   }
 
+  extractArrayTargetType(typeNode) {
+    const type = this.unwrapType(typeNode);
+    if (!type) return null;
+    if (type.type === "TSArrayType") {
+      const elRaw = this.unwrapType(type.elementType);
+      if (elRaw.type === "TSStringKeyword") {
+        return { elemType: "!llvm.ptr", isString: true, structName: null };
+      }
+      if (elRaw.type === "TSTypeReference") {
+        const tName = elRaw.typeName?.name || elRaw.typeName?.value;
+        if (["i32", "int32", "u32", "int"].includes(tName)) return { elemType: "i32", isString: false, structName: null };
+        if (["i64", "int64", "u64"].includes(tName)) return { elemType: "i64", isString: false, structName: null };
+        if (["bool", "boolean"].includes(tName)) return { elemType: "i1", isString: false, structName: null };
+        if (["f64", "double"].includes(tName)) return { elemType: "f64", isString: false, structName: null };
+        if (["f32", "float"].includes(tName)) return { elemType: "f32", isString: false, structName: null };
+        if (this.structRegistry.has(tName) || this.classList.some((c) => c.name === tName)) {
+          return { elemType: "!llvm.ptr", isString: false, structName: tName };
+        }
+      }
+      if (elRaw.type === "TSNumberKeyword") {
+        return { elemType: "f64", isString: false, structName: null };
+      }
+      if (elRaw.type === "TSBooleanKeyword") {
+        return { elemType: "i1", isString: false, structName: null };
+      }
+    }
+    return null;
+  }
+
   coerceType(val, targetType) {
     if (!val || val.type === targetType) return val;
 
@@ -1561,13 +1590,37 @@ export class ASTLowerer {
         const fnSig = isFn ? this.extractFunctionType(typeAnnot) : null;
         const isUnion = this.isUnionType(typeAnnot);
         const isArr = this.unwrapType(typeAnnot)?.type === "TSArrayType";
+        let arrElemType = "f64";
+        let isArrString = false;
+        let arrStruct = null;
+        if (isArr) {
+          const unwrappedArr = this.unwrapType(typeAnnot);
+          const elRaw = this.unwrapType(unwrappedArr.elementType);
+          if (elRaw.type === "TSStringKeyword") {
+            arrElemType = "!llvm.ptr";
+            isArrString = true;
+          } else if (elRaw.type === "TSTypeReference") {
+            const tName = elRaw.typeName?.name || elRaw.typeName?.value;
+            if (["i32", "int32", "u32", "int"].includes(tName)) arrElemType = "i32";
+            else if (["i64", "int64", "u64"].includes(tName)) arrElemType = "i64";
+            else if (["bool", "boolean"].includes(tName)) arrElemType = "i1";
+            else if (this.structRegistry.has(tName) || this.classList.some((c) => c.name === tName)) {
+              arrElemType = "!llvm.ptr";
+              arrStruct = tName;
+            }
+          } else if (elRaw.type === "TSNumberKeyword") {
+            arrElemType = "f64";
+          } else if (elRaw.type === "TSBooleanKeyword") {
+            arrElemType = "i1";
+          }
+        }
         const isStr = this.isStringType(typeAnnot);
         const pType = isFn ? fnSig.mlirType : (isUnion || isArr || isStr) ? "!llvm.ptr" : this.resolveType(typeAnnot);
         const structName = this.getStructName(typeAnnot);
         const ssaArg = `%arg_${pName}`;
 
         paramStrings.push(`${ssaArg}: ${pType}`);
-        params.push({ name: pName, ssa: ssaArg, type: pType, structName, isUnion, isArray: isArr, isFunction: isFn, fnSig, typeAnnot, isString: isStr });
+        params.push({ name: pName, ssa: ssaArg, type: pType, structName, isUnion, isArray: isArr, elemType: arrElemType, isString: isStr || isArrString, arrStruct, isFunction: isFn, fnSig, typeAnnot });
       });
 
       const retType = isConstructor ? "none" : this.resolveType(fnExpr.returnType);
@@ -1612,6 +1665,9 @@ export class ASTLowerer {
               ssa: p.ssa,
               type: "!llvm.ptr",
               isArray: true,
+              elemType: p.elemType || "f64",
+              isString: p.isString || false,
+              structName: p.arrStruct || p.structName || null,
               isRef: true,
             });
           } else if (p.structName) {
@@ -1673,6 +1729,30 @@ export class ASTLowerer {
         this.builder.markFeature("union");
       }
       const isArr = this.unwrapType(typeAnnot)?.type === "TSArrayType";
+      let arrElemType = "f64";
+      let isArrString = false;
+      let arrStruct = null;
+      if (isArr) {
+        const unwrappedArr = this.unwrapType(typeAnnot);
+        const elRaw = this.unwrapType(unwrappedArr.elementType);
+        if (elRaw.type === "TSStringKeyword") {
+          arrElemType = "!llvm.ptr";
+          isArrString = true;
+        } else if (elRaw.type === "TSTypeReference") {
+          const tName = elRaw.typeName?.name || elRaw.typeName?.value;
+          if (["i32", "int32", "u32", "int"].includes(tName)) arrElemType = "i32";
+          else if (["i64", "int64", "u64"].includes(tName)) arrElemType = "i64";
+          else if (["bool", "boolean"].includes(tName)) arrElemType = "i1";
+          else if (this.structRegistry.has(tName) || this.classList.some((c) => c.name === tName)) {
+            arrElemType = "!llvm.ptr";
+            arrStruct = tName;
+          }
+        } else if (elRaw.type === "TSNumberKeyword") {
+          arrElemType = "f64";
+        } else if (elRaw.type === "TSBooleanKeyword") {
+          arrElemType = "i1";
+        }
+      }
       const isChan = this.unwrapType(typeAnnot)?.typeName?.name === "Channel";
       const isStr = this.isStringType(typeAnnot);
       const pType = isFn ? fnSig.mlirType : (isUnion || isArr || isChan || isStr) ? "!llvm.ptr" : this.resolveType(typeAnnot);
@@ -1681,7 +1761,7 @@ export class ASTLowerer {
       const ssaArg = `%arg_${pName}`;
       paramStrings.push(`${ssaArg}: ${pType}`);
       paramTypes.push(pType);
-      params.push({ name: pName, ssa: ssaArg, type: pType, structName, isUnion, isArray: isArr, isFunction: isFn, fnSig, typeAnnot, isChannel: isChan, isString: isStr });
+      params.push({ name: pName, ssa: ssaArg, type: pType, structName, isUnion, isArray: isArr, elemType: arrElemType, isString: isStr || isArrString, arrStruct, isFunction: isFn, fnSig, typeAnnot, isChannel: isChan });
     });
 
     const innerRetType = fnMeta?.innerRetType || "f64";
@@ -1843,6 +1923,9 @@ export class ASTLowerer {
             ssa: p.ssa,
             type: "!llvm.ptr",
             isArray: true,
+            elemType: p.elemType || "f64",
+            isString: p.isString || false,
+            structName: p.arrStruct || p.structName || null,
             isRef: true,
           });
         } else if (p.isChannel) {
@@ -2052,6 +2135,9 @@ export class ASTLowerer {
                   isHeap: true,
                   isStack: false,
                 };
+              } else if (decl.init.type === "ArrayExpression") {
+                const arrTarget = this.extractArrayTargetType(decl.id.typeAnnotation);
+                val = this.instantiateArray(decl.init, arrTarget?.elemType, arrTarget?.isString, arrTarget?.structName);
               } else {
                 val = this.lowerExpression(decl.init);
               }
@@ -2063,7 +2149,13 @@ export class ASTLowerer {
 
               const finalStruct = explicitStruct || val.structName || g.structName;
               if (finalStruct) g.structName = finalStruct;
-              if (val.isArray || (decl.init && decl.init.type === "ArrayExpression")) g.isArray = true;
+              if (val.isArray || (decl.init && decl.init.type === "ArrayExpression")) {
+                const arrTarget = this.extractArrayTargetType(decl.id.typeAnnotation);
+                g.isArray = true;
+                g.elemType = arrTarget?.elemType || val.elemType || "f64";
+                g.isString = arrTarget?.isString || val.isString || false;
+                g.structName = arrTarget?.structName || val.structName || null;
+              }
               if (val.isMap) g.isMap = true;
               if (val.isSet) g.isSet = true;
               if (val.isString) {
@@ -2103,6 +2195,9 @@ export class ASTLowerer {
                 isHeap: !canStackAllocate,
                 isStack: canStackAllocate,
               };
+            } else if (decl.init.type === "ArrayExpression") {
+              const arrTarget = this.extractArrayTargetType(decl.id.typeAnnotation);
+              val = this.instantiateArray(decl.init, arrTarget?.elemType, arrTarget?.isString, arrTarget?.structName);
             } else {
               val = this.lowerExpression(decl.init);
             }
@@ -2160,13 +2255,20 @@ export class ASTLowerer {
                 fnSig: val.fnSig,
               });
             } else if (val.isArray || (decl.init && decl.init.type === "ArrayExpression")) {
+              const arrTarget = this.extractArrayTargetType(decl.id.typeAnnotation);
+              const explicitElemType = arrTarget?.elemType;
+              const isExplicitString = arrTarget?.isString;
+              const explicitStruct = arrTarget?.structName;
+
               this.symbolTable.set(varName, {
                 ptr: val.ptr || val.ssa,
                 ssa: val.ssa || val.ptr,
                 type: "!llvm.ptr",
                 isArray: true,
                 arrayLen: val.arrayLen || val.length,
-                elemType: val.elemType || "f64",
+                elemType: explicitElemType || val.elemType || "f64",
+                isString: isExplicitString || val.isString || false,
+                structName: explicitStruct || val.structName || null,
                 isRef: true,
               });
             } else if (decl.init.type === "NewExpression") {
@@ -2227,13 +2329,21 @@ export class ASTLowerer {
                   }
                 }
               } else {
-                const slot = this.builder.allocateStack(val.type);
-                this.builder.store(slot.ptr, val);
+                let targetType = val.type;
+                if (decl.id.typeAnnotation) {
+                  const resolved = this.resolveType(decl.id.typeAnnotation);
+                  if (resolved && resolved !== "none") {
+                    targetType = resolved;
+                  }
+                }
+                const coerced = this.coerceType(val, targetType);
+                const slot = this.builder.allocateStack(targetType);
+                this.builder.store(slot.ptr, coerced);
                 this.symbolTable.set(varName, {
                   ptr: slot.ptr,
-                  type: val.type,
+                  type: targetType,
                   isRef: true,
-                  isString: val.isString || this.isStringType(decl.id.typeAnnotation),
+                  isString: coerced.isString || this.isStringType(decl.id.typeAnnotation),
                 });
               }
             }
@@ -2727,29 +2837,79 @@ export class ASTLowerer {
     return slot.ptr;
   }
 
-  instantiateArray(arrExpr) {
+  instantiateArray(arrExpr, targetElemType = null, isTargetString = false, targetStructName = null) {
     const len = arrExpr.elements.length;
-    const byteSize = Math.max((len + 1) * 8, 16);
+    const loweredElements = arrExpr.elements.map((elem) => this.lowerExpression(elem));
+
+    let elemType = targetElemType;
+    let isStringElem = isTargetString;
+    let structNameElem = targetStructName;
+
+    if (!elemType && loweredElements.length > 0) {
+      const first = loweredElements[0];
+      if (first.isString) {
+        elemType = "!llvm.ptr";
+        isStringElem = true;
+      } else if (first.structName) {
+        elemType = "!llvm.ptr";
+        structNameElem = first.structName;
+      } else if (first.type === "!llvm.ptr") {
+        elemType = "!llvm.ptr";
+      } else if (first.type === "i32") {
+        elemType = "i32";
+      } else if (first.type === "i64") {
+        elemType = "i64";
+      } else if (first.type === "i1") {
+        elemType = "i1";
+      } else {
+        elemType = "f64";
+      }
+    }
+    if (!elemType) elemType = "f64";
+
+    const isI32 = elemType === "i32";
+    const byteSize = isI32 ? Math.max(8 + len * 4, 16) : Math.max((len + 1) * 8, 16);
     const heapSlot = this.builder.allocateHeap(byteSize);
 
     const lenConst = this.builder.nextSSA();
     this.builder.emit(`${lenConst} = llvm.mlir.constant(${len} : i64) : i64`);
     this.builder.emit(`llvm.store ${lenConst}, ${heapSlot.ptr} : i64, !llvm.ptr`);
 
-    arrExpr.elements.forEach((elem, index) => {
-      let val = this.lowerExpression(elem);
-      val = this.coerceType(val, "f64");
+    loweredElements.forEach((val, index) => {
+      let finalVal = val;
+      if (isStringElem) {
+        finalVal = this.coerceType(finalVal, "!llvm.ptr");
+      } else {
+        finalVal = this.coerceType(finalVal, elemType);
+      }
+
       const idxConst = this.builder.nextSSA();
       const elemPtr = this.builder.nextSSA();
 
-      this.builder.emit(`${idxConst} = llvm.mlir.constant(${index + 1} : i64) : i64`);
-      this.builder.emit(
-        `${elemPtr} = llvm.getelementptr ${heapSlot.ptr}[${idxConst}] : (!llvm.ptr, i64) -> !llvm.ptr, f64`
-      );
-      this.builder.store(elemPtr, val);
+      if (isI32) {
+        this.builder.emit(`${idxConst} = llvm.mlir.constant(${index + 2} : i64) : i64`);
+        this.builder.emit(
+          `${elemPtr} = llvm.getelementptr ${heapSlot.ptr}[${idxConst}] : (!llvm.ptr, i64) -> !llvm.ptr, i32`
+        );
+      } else {
+        this.builder.emit(`${idxConst} = llvm.mlir.constant(${index + 1} : i64) : i64`);
+        this.builder.emit(
+          `${elemPtr} = llvm.getelementptr ${heapSlot.ptr}[${idxConst}] : (!llvm.ptr, i64) -> !llvm.ptr, ${elemType}`
+        );
+      }
+      this.builder.store(elemPtr, finalVal);
     });
 
-    return { ptr: heapSlot.ptr, length: len, arrayLen: len, elemType: "f64", isHeap: true, isArray: true };
+    return {
+      ptr: heapSlot.ptr,
+      length: len,
+      arrayLen: len,
+      elemType,
+      isString: isStringElem,
+      structName: structNameElem,
+      isHeap: true,
+      isArray: true,
+    };
   }
 
   lowerExpression(expr) {
@@ -2801,6 +2961,8 @@ export class ASTLowerer {
         arrayLen: arrMeta.length,
         length: arrMeta.length,
         elemType: arrMeta.elemType,
+        isString: arrMeta.isString,
+        structName: arrMeta.structName,
         isHeap: true,
         isRef: true,
       };
@@ -2987,14 +3149,20 @@ export class ASTLowerer {
         if (expr.argument.computed) {
           let idxVal = this.lowerExpression(expr.argument.property);
           idxVal = this.coerceType(idxVal, "i64");
-          const oneIdx = this.builder.createConstant(1, "i64");
-          const realIdx = this.builder.createArithmetic("+", idxVal, oneIdx);
+
+          const elemType = base.elemType || "f64";
+          const isI32 = elemType === "i32";
+          const idxOffset = isI32 ? 2 : 1;
+          const offsetConst = this.builder.createConstant(idxOffset, "i64");
+          const realIdx = this.builder.createArithmetic("+", idxVal, offsetConst);
+
           const elemPtr = this.builder.nextSSA();
           this.builder.emit(
-            `${elemPtr} = llvm.getelementptr ${base.ptr || base.ssa}[${realIdx.ssa}] : (!llvm.ptr, i64) -> !llvm.ptr, f64`
+            `${elemPtr} = llvm.getelementptr ${base.ptr || base.ssa}[${realIdx.ssa}] : (!llvm.ptr, i64) -> !llvm.ptr, ${elemType}`
           );
-          const oldVal = this.builder.load(elemPtr, "f64");
-          const one = this.builder.createConstant(1.0, "f64");
+          const oldVal = this.builder.load(elemPtr, elemType);
+          const step = elemType === "i64" || elemType === "i32" ? 1 : 1.0;
+          const one = this.builder.createConstant(step, elemType);
           const newVal = this.builder.createArithmetic(op, oldVal, one);
           this.builder.store(elemPtr, newVal);
           return expr.prefix ? newVal : oldVal;
@@ -3054,6 +3222,8 @@ export class ASTLowerer {
               type: "!llvm.ptr",
               structName: sym.structName,
               isArray: sym.isArray,
+              elemType: sym.elemType || "f64",
+              isString: sym.isString || false,
               isMap: sym.isMap,
               isSet: sym.isSet,
               isPromise: sym.isPromise,
@@ -3073,6 +3243,8 @@ export class ASTLowerer {
             type: "!llvm.ptr",
             structName: sym.structName,
             isArray: sym.isArray,
+            elemType: sym.elemType || "f64",
+            isString: sym.isString || false,
             isMap: sym.isMap,
             isSet: sym.isSet,
             isPromise: sym.isPromise,
@@ -3104,6 +3276,8 @@ export class ASTLowerer {
         if (g.isArray) {
           loaded.isArray = true;
           loaded.ptr = loaded.ssa;
+          loaded.elemType = g.elemType || "f64";
+          loaded.isString = g.isString || false;
         }
         if (g.isMap) loaded.isMap = true;
         if (g.isSet) loaded.isSet = true;
@@ -3175,6 +3349,12 @@ export class ASTLowerer {
       }
 
       if (!expr.computed && (expr.property.name || expr.property.value) === "length") {
+        if (base.isString && !base.isArray) {
+          this.builder.markFeature("strings");
+          const ssa = this.builder.nextSSA();
+          this.builder.emit(`${ssa} = func.call @rts_strlen(${base.ptr || base.ssa}) : (!llvm.ptr) -> i64`);
+          return { ssa, type: "i64" };
+        }
         const ssa = this.builder.nextSSA();
         this.builder.emit(`${ssa} = llvm.load ${base.ptr || base.ssa} : !llvm.ptr -> i64`);
         return { ssa, type: "i64" };
@@ -3183,14 +3363,38 @@ export class ASTLowerer {
       if (expr.computed) {
         let idxVal = this.lowerExpression(expr.property);
         idxVal = this.coerceType(idxVal, "i64");
-        const one = this.builder.createConstant(1, "i64");
-        const realIdx = this.builder.createArithmetic("+", idxVal, one);
+
+        if (base.isString && !base.isArray) {
+          this.builder.markFeature("strings");
+          const charPtr = this.builder.nextSSA();
+          this.builder.emit(`${charPtr} = llvm.getelementptr ${base.ptr || base.ssa}[${idxVal.ssa}] : (!llvm.ptr, i64) -> !llvm.ptr, i8`);
+          const charByte = this.builder.load(charPtr, "i8");
+          const buf = this.builder.allocateHeap(2);
+          this.builder.store(buf.ptr, charByte);
+          const termPtr = this.builder.nextSSA();
+          this.builder.emit(`${termPtr} = llvm.getelementptr ${buf.ptr}[1] : (!llvm.ptr) -> !llvm.ptr, i8`);
+          const zeroByte = this.builder.createConstant(0, "i8");
+          this.builder.store(termPtr, zeroByte);
+          return { ssa: buf.ptr, ptr: buf.ptr, type: "!llvm.ptr", isString: true, isHeap: true };
+        }
+
+        const elemType = base.elemType || "f64";
+        const isI32 = elemType === "i32";
+        const offsetConst = this.builder.createConstant(isI32 ? 2 : 1, "i64");
+        const realIdx = this.builder.createArithmetic("+", idxVal, offsetConst);
 
         const elemPtr = this.builder.nextSSA();
         this.builder.emit(
-          `${elemPtr} = llvm.getelementptr ${base.ptr || base.ssa}[${realIdx.ssa}] : (!llvm.ptr, i64) -> !llvm.ptr, f64`
+          `${elemPtr} = llvm.getelementptr ${base.ptr || base.ssa}[${realIdx.ssa}] : (!llvm.ptr, i64) -> !llvm.ptr, ${elemType}`
         );
-        return this.builder.load(elemPtr, "f64");
+        const loaded = this.builder.load(elemPtr, elemType);
+        if (elemType === "!llvm.ptr" && base.isString) {
+          loaded.isString = true;
+        }
+        if (base.structName) {
+          loaded.structName = base.structName;
+        }
+        return loaded;
       }
 
       if (base.structName) {
@@ -3238,19 +3442,37 @@ export class ASTLowerer {
         if (expr.left.computed) {
           let idxVal = this.lowerExpression(expr.left.property);
           idxVal = this.coerceType(idxVal, "i64");
-          const one = this.builder.createConstant(1, "i64");
-          const realIdx = this.builder.createArithmetic("+", idxVal, one);
+          const elemType = base.elemType || "f64";
+          const isI32 = elemType === "i32";
+          const offsetConst = this.builder.createConstant(isI32 ? 2 : 1, "i64");
+          const realIdx = this.builder.createArithmetic("+", idxVal, offsetConst);
 
           const elemPtr = this.builder.nextSSA();
           this.builder.emit(
-            `${elemPtr} = llvm.getelementptr ${base.ptr || base.ssa}[${realIdx.ssa}] : (!llvm.ptr, i64) -> !llvm.ptr, f64`
+            `${elemPtr} = llvm.getelementptr ${base.ptr || base.ssa}[${realIdx.ssa}] : (!llvm.ptr, i64) -> !llvm.ptr, ${elemType}`
           );
           if (isCompound) {
-            const curVal = this.builder.load(elemPtr, "f64");
-            rhs = this.coerceType(rhs, "f64");
-            rhs = this.builder.createArithmetic(op, curVal, rhs);
+            let curVal = this.builder.load(elemPtr, elemType);
+            if (base.isString) curVal.isString = true;
+            if (op === "+" && (curVal.isString || rhs.isString)) {
+              const leftStr = this.builder.convertToString(curVal);
+              const rightStr = this.builder.convertToString(rhs);
+              rhs = this.builder.createStringConcat(leftStr, rightStr);
+            } else if (["|", "&", "^", "<<", ">>", ">>>"].includes(op)) {
+              const lInt = this.coerceType(curVal, "i64");
+              const rInt = this.coerceType(rhs, "i64");
+              rhs = this.builder.createArithmetic(op, lInt, rInt);
+              rhs = this.coerceType(rhs, elemType);
+            } else {
+              rhs = this.builder.createArithmetic(op, curVal, rhs);
+              rhs = this.coerceType(rhs, elemType);
+            }
           } else {
-            rhs = this.coerceType(rhs, "f64");
+            if (base.isString) {
+              rhs = this.coerceType(rhs, "!llvm.ptr");
+            } else {
+              rhs = this.coerceType(rhs, elemType);
+            }
           }
           this.builder.store(elemPtr, rhs);
           return rhs;
@@ -3749,6 +3971,26 @@ export class ASTLowerer {
       if (expr.callee.type === "MemberExpression") {
         const base = this.lowerExpression(expr.callee.object);
         const methodName = expr.callee.property.name || expr.callee.property.value;
+
+        if (base.isString && !base.isArray) {
+          if (methodName === "slice" || methodName === "substring") {
+            this.builder.markFeature("strings");
+            let startVal = expr.arguments?.[0] ? this.lowerExpression(expr.arguments[0]) : this.builder.createConstant(0, "i64");
+            startVal = this.coerceType(startVal, "i64");
+            let endVal;
+            if (expr.arguments && expr.arguments.length > 1) {
+              endVal = this.lowerExpression(expr.arguments[1]);
+              endVal = this.coerceType(endVal, "i64");
+            } else {
+              endVal = this.builder.createConstant(-1, "i64");
+            }
+            const ssa = this.builder.nextSSA();
+            this.builder.emit(
+              `${ssa} = func.call @rts_str_slice(${base.ptr || base.ssa}, ${startVal.ssa}, ${endVal.ssa}) : (!llvm.ptr, i64, i64) -> !llvm.ptr`
+            );
+            return { ssa, ptr: ssa, type: "!llvm.ptr", isString: true, isHeap: true };
+          }
+        }
 
         if (base.isArena) {
           this.builder.markFeature("allocators");

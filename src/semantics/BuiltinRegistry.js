@@ -123,5 +123,19 @@ export class BuiltinRegistry {
         ["pow", { params: ["number", "number"], returnType: "number" }],
       ]),
     });
+
+    // 9. String Metotları (C-Style sıfır maliyetli dilimleme)
+    const stringMethods = new Map([
+      ["slice", { params: ["number", "number"], minArgs: 1, returnType: "string" }],
+      ["substring", { params: ["number", "number"], minArgs: 1, returnType: "string" }],
+    ]);
+    this.structSignatures.set("string", {
+      fields: new Map([["length", { type: "number" }]]),
+      methods: stringMethods,
+    });
+    this.structSignatures.set("String", {
+      fields: new Map([["length", { type: "number" }]]),
+      methods: stringMethods,
+    });
   }
 }
