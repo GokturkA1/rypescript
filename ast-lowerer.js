@@ -1,4 +1,6 @@
 // ast-lowerer.js
+import fs from "node:fs";
+
 export class ASTLowering {
   constructor(builder) {
     this.builder = builder;
@@ -10,32 +12,248 @@ export class ASTLowering {
 
     this.typeAliasRegistry = new Map();
     this.enumRegistry = new Map();
+    this.exportedFunctionNames = new Set();
 
     // Generics Şablon Havuzları
     this.genericClassTemplates = new Map();
     this.genericFunctionTemplates = new Map();
+    this.genericTypeTemplates = new Map();
+    this.genericInterfaceTemplates = new Map();
     this.specializedClasses = new Set();
     this.specializedFunctions = new Set();
+    this.specializedTypes = new Set();
+    this.spawnRunners = new Map();
+    this.globals = new Map();
+
+    // Standart Kütüphane: Yerleşik Result<T, E = string> Şablonu
+    this.genericInterfaceTemplates.set("Result", {
+      type: "TSInterfaceDeclaration",
+      id: { type: "Identifier", name: "Result" },
+      typeParameters: {
+        params: [
+          { name: { name: "T" } },
+          { name: { name: "E" }, default: { type: "TSStringKeyword" } },
+        ],
+      },
+      body: {
+        type: "TSInterfaceBody",
+        body: [
+          {
+            type: "TSPropertySignature",
+            key: { name: "ok" },
+            typeAnnotation: { type: "TSTypeAnnotation", typeAnnotation: { type: "TSBooleanKeyword" } },
+          },
+          {
+            type: "TSPropertySignature",
+            key: { name: "value" },
+            typeAnnotation: { type: "TSTypeAnnotation", typeAnnotation: { type: "TSTypeReference", typeName: { name: "T" } } },
+          },
+          {
+            type: "TSPropertySignature",
+            key: { name: "error" },
+            typeAnnotation: { type: "TSTypeAnnotation", typeAnnotation: { type: "TSTypeReference", typeName: { name: "E" } } },
+          },
+        ],
+      },
+    });
 
     this.scopeStack = [];
     this.builder.onAllocate = (ptr) => this.trackHeap(ptr);
   }
 
-  enterScope(isFunction = false) {
+  getPragmas(node) {
+    const pragmas = {
+      inline: false,
+      noinline: false,
+      packed: false,
+      exportName: null,
+    };
+    if (!node) return pragmas;
+
+    // 1. AST Decorators (Sınıflar ve Metotlar üzerindeki yerleşik Decorator'lar)
+    const rawDecorators = node.decorators || node.declaration?.decorators || [];
+    for (const dec of rawDecorators) {
+      const expr = dec.expression;
+      if (!expr) continue;
+      if (expr.type === "Identifier") {
+        if (expr.name === "inline") pragmas.inline = true;
+        if (expr.name === "noinline") pragmas.noinline = true;
+        if (expr.name === "packed") pragmas.packed = true;
+      } else if (expr.type === "CallExpression") {
+        const fnName = expr.callee?.name;
+        if (fnName === "export_name") {
+          const arg = expr.arguments?.[0];
+          if (arg) pragmas.exportName = arg.value ?? null;
+        }
+      }
+    }
+
+    // 2. Sentetik Decorators (Fonksiyon ve Interface öncesi yakalananlar)
+    const nodeName = node.id?.name || node.declaration?.id?.name || node.key?.name;
+    if (this.currentSyntheticDecorators && nodeName && this.currentSyntheticDecorators.has(nodeName)) {
+      const decList = this.currentSyntheticDecorators.get(nodeName);
+      for (const dec of decList) {
+        if (dec.name === "inline") pragmas.inline = true;
+        if (dec.name === "noinline") pragmas.noinline = true;
+        if (dec.name === "packed") pragmas.packed = true;
+        if (dec.name === "export_name") pragmas.exportName = dec.arg;
+      }
+    }
+
+    // 3. Fallback: Yorum Satırı (Yalnızca geriye dönük uyumluluk için)
+    if (!pragmas.inline && !pragmas.noinline && !pragmas.packed && !pragmas.exportName && this.currentComments) {
+      const nodeStart = node.start ?? node.span?.start ?? 0;
+      for (const c of this.currentComments) {
+        if (c.end <= nodeStart && nodeStart - c.end < 60) {
+          const text = c.value || "";
+          if (/@inline\b/.test(text)) pragmas.inline = true;
+          if (/@noinline\b/.test(text)) pragmas.noinline = true;
+          if (/@packed\b/.test(text)) pragmas.packed = true;
+          const matchExport = text.match(/@export_name\s*\(\s*["']([^"']+)["']\s*\)/);
+          if (matchExport) pragmas.exportName = matchExport[1];
+        }
+      }
+    }
+
+    return pragmas;
+  }
+
+  enterScope(isFunction = false, retType = null, structRetName = null) {
     this.scopeStack.push({
       isFunction,
+      retType,
+      structRetName,
       heapAllocations: new Set(),
       transferred: new Set(),
+      disposables: [],
+      deferrals: [],
     });
+  }
+
+  getCurrentFunctionRetType() {
+    for (let i = this.scopeStack.length - 1; i >= 0; i--) {
+      if (this.scopeStack[i].isFunction) {
+        return this.scopeStack[i].retType;
+      }
+    }
+    return null;
+  }
+
+  getCurrentFunctionStructRetName() {
+    for (let i = this.scopeStack.length - 1; i >= 0; i--) {
+      if (this.scopeStack[i].isFunction) {
+        return this.scopeStack[i].structRetName;
+      }
+    }
+    return null;
+  }
+
+  // --- ESCAPE ANALYSIS (Kaçış Analizi) ---
+  checkEscape(varName, fnNode) {
+    if (!fnNode || !fnNode.body) return true; // Global alandaysa kaçabilir varsay
+    let escapes = false;
+
+    this.walkAST(fnNode.body, (n) => {
+      if (escapes) return;
+
+      // 1. Return ifadesinde varName doğrudan dönüyor mu? (u.i gibi skaler alan okumaları kaçış sayılmaz)
+      if (n.type === "ReturnStatement" && n.argument) {
+        if (n.argument.type === "Identifier" && n.argument.name === varName) {
+          escapes = true;
+        } else if (n.argument.type !== "MemberExpression") {
+          this.walkAST(n.argument, (sub) => {
+            if (sub.type === "Identifier" && sub.name === varName) escapes = true;
+          });
+        }
+      }
+
+      // 2. Bir nesne alanına atanıyor mu? (obj.field = varName)
+      if (n.type === "AssignmentExpression" && n.left.type === "MemberExpression") {
+        this.walkAST(n.right, (sub) => {
+          if (sub.type === "Identifier" && sub.name === varName) escapes = true;
+        });
+      }
+
+      // 3. Fonksiyon çağrısına argüman olarak kaçıyor mu?
+      if (n.type === "CallExpression") {
+        const isSelfMethodCall =
+          n.callee.type === "MemberExpression" &&
+          n.callee.object.type === "Identifier" &&
+          n.callee.object.name === varName;
+
+        for (const arg of n.arguments || []) {
+          this.walkAST(arg, (sub) => {
+            if (sub.type === "Identifier" && sub.name === varName) escapes = true;
+          });
+        }
+      }
+
+      // 4. Lambda veya iç fonksiyon tarafından yakalanıyor mu (closure)?
+      if ((n.type === "ArrowFunctionExpression" || n.type === "FunctionExpression") && n !== fnNode) {
+        this.walkAST(n.body, (sub) => {
+          if (sub.type === "Identifier" && sub.name === varName) escapes = true;
+        });
+      }
+    });
+
+    return escapes;
   }
 
   exitScope() {
     if (this.scopeStack.length === 0) return;
     const scope = this.scopeStack.pop();
-    for (const ptr of scope.heapAllocations) {
-      if (!scope.transferred.has(ptr)) {
-        this.builder.emitFree(ptr);
+
+    // Erken return ile blok zaten sonlandıysa tekrar kod üretme
+    if (!this.builder.hasTerminated) {
+      // 0. finally (defer) bloklarını ters sırada (LIFO) çalıştır
+      for (let i = (scope.deferrals || []).length - 1; i >= 0; i--) {
+        this.lowerStatement(scope.deferrals[i]);
       }
+
+      // 1. using ile tanımlanan kaynakları ters sırada (LIFO) dispose et
+      for (let i = scope.disposables.length - 1; i >= 0; i--) {
+        const d = scope.disposables[i];
+        this.emitDispose(d);
+      }
+      // 2. Kalan genel heap tahsislerini serbest bırak
+      for (const ptr of scope.heapAllocations) {
+        if (!scope.transferred.has(ptr)) {
+          this.builder.emitFree(ptr);
+        }
+      }
+    }
+  }
+
+  trackDisposable(ptr, structName, isStack = false, allocMeta = null) {
+    if (this.scopeStack.length > 0) {
+      const current = this.scopeStack[this.scopeStack.length - 1];
+      current.disposables.push({ ptr, structName, isStack, allocMeta });
+      current.heapAllocations.delete(ptr); // Çift free çağrısını önle
+    }
+  }
+
+  emitDispose(d) {
+    if (d.allocMeta?.isArena) {
+      this.builder.emit(`func.call @rts_arena_destroy(${d.ptr}) : (!llvm.ptr) -> ()`);
+      return;
+    }
+    if (d.allocMeta?.isPool) {
+      this.builder.emit(`func.call @rts_pool_destroy(${d.ptr}) : (!llvm.ptr) -> ()`);
+      return;
+    }
+    if (d.allocMeta?.isFixedBuffer) {
+      this.builder.emit(`func.call @rts_fixed_buffer_destroy(${d.ptr}) : (!llvm.ptr) -> ()`);
+      return;
+    }
+    if (d.structName) {
+      const meta = this.structRegistry.get(d.structName);
+      if (meta?.methods?.has("dispose")) {
+        this.builder.emit(`func.call @${d.structName}_dispose(${d.ptr}) : (!llvm.ptr) -> ()`);
+      }
+    }
+    // Stack'e tahsis edildiyse free çağrısı yapılmaz!
+    if (!d.isStack) {
+      this.builder.emitFree(d.ptr);
     }
   }
 
@@ -59,6 +277,19 @@ export class ASTLowering {
   cleanupFunctionScopes() {
     for (let i = this.scopeStack.length - 1; i >= 0; i--) {
       const scope = this.scopeStack[i];
+
+      // Erken return sırasında bekleyen tüm finally bloklarını çalıştır ve temizle
+      for (let j = (scope.deferrals || []).length - 1; j >= 0; j--) {
+        this.lowerStatement(scope.deferrals[j]);
+      }
+      scope.deferrals = [];
+
+      for (let j = scope.disposables.length - 1; j >= 0; j--) {
+        const d = scope.disposables[j];
+        if (!scope.transferred.has(d.ptr)) {
+          this.emitDispose(d);
+        }
+      }
       for (const ptr of scope.heapAllocations) {
         if (!scope.transferred.has(ptr)) {
           this.builder.emitFree(ptr);
@@ -78,7 +309,7 @@ export class ASTLowering {
   unwrapType(typeNode) {
     if (!typeNode) return null;
     let curr = typeNode;
-    while (curr && curr.typeAnnotation) {
+    while (curr && (curr.type === "TSTypeAnnotation" || curr.type === "TSType") && curr.typeAnnotation) {
       curr = curr.typeAnnotation;
     }
     return curr;
@@ -96,13 +327,17 @@ export class ASTLowering {
     }
 
     if (unwrapped.type === "TSFunctionType") {
-      const rawParams = unwrapped.parameters || unwrapped.params || [];
+      const rawParams =
+        unwrapped.parameters ||
+        unwrapped.params?.items ||
+        unwrapped.params ||
+        [];
       const paramTypes = rawParams.map((p) => {
-        const pAnnot = p.typeAnnotation;
+        const pAnnot = p.typeAnnotation || p.pattern?.typeAnnotation || p.id?.typeAnnotation;
         return this.resolveType(pAnnot);
       });
 
-      const retAnnot = unwrapped.returnType;
+      const retAnnot = unwrapped.returnType || unwrapped.typeAnnotation;
       let retType = this.resolveType(retAnnot);
       if (!retType) retType = "none";
 
@@ -164,6 +399,10 @@ export class ASTLowering {
         return "void";
       case "TSTypeReference": {
         const name = t.typeName?.name || t.typeName?.value;
+        if (["i64", "int64", "u64", "uint64"].includes(name)) return "i64";
+        if (["i32", "int32", "u32", "uint32", "int"].includes(name)) return "i32";
+        if (["f64", "double"].includes(name)) return "f64";
+        if (["f32", "float"].includes(name)) return "f32";
         if (this.enumRegistry.has(name)) {
           return this.enumRegistry.get(name).kind === "string" ? "str" : "i64";
         }
@@ -203,6 +442,12 @@ export class ASTLowering {
         return "!llvm.ptr";
       case "TSTypeReference": {
         const typeName = type.typeName?.name || type.typeName?.value;
+        if (typeName === "Channel" || typeName === "Arena" || typeName === "Pool" || typeName === "FixedBuffer") return "!llvm.ptr";
+        if (["i64", "int64", "u64", "uint64"].includes(typeName)) return "i64";
+        if (["i32", "int32", "u32", "uint32", "int"].includes(typeName)) return "i32";
+        if (["f64", "double"].includes(typeName)) return "f64";
+        if (["f32", "float"].includes(typeName)) return "f32";
+        if (["bool", "boolean"].includes(typeName)) return "i1";
         if (typeName === "Promise") {
           return "!llvm.ptr";
         }
@@ -249,6 +494,21 @@ export class ASTLowering {
     return null;
   }
 
+  getEnumName(typeNode) {
+    const type = this.unwrapType(typeNode);
+    if (!type) return null;
+    if (type.type === "TSTypeReference") {
+      const typeName = type.typeName?.name || type.typeName?.value || null;
+      if (typeName && this.enumRegistry.has(typeName)) {
+        return typeName;
+      }
+      if (typeName && this.typeAliasRegistry.has(typeName)) {
+        return this.getEnumName(this.typeAliasRegistry.get(typeName));
+      }
+    }
+    return null;
+  }
+
   coerceType(val, targetType) {
     if (!val || val.type === targetType) return val;
 
@@ -276,6 +536,7 @@ export class ASTLowering {
   }
 
   boxIntoUnion(slotPtr, val) {
+    this.builder.markFeature("union");
     if (val.isUnion) {
       const srcTagPtr = this.builder.nextSSA();
       this.builder.emit(`${srcTagPtr} = llvm.getelementptr ${val.ptr || val.ssa}[0, 0] : (!llvm.ptr) -> !llvm.ptr, !llvm.struct<(i32, i64)>`);
@@ -319,6 +580,7 @@ export class ASTLowering {
   }
 
   unboxUnion(uPtr, targetType) {
+    this.builder.markFeature("union");
     if (targetType === "string") {
       const ssa = this.builder.nextSSA();
       this.builder.emit(`${ssa} = func.call @rts_union_get_string(${uPtr}) : (!llvm.ptr) -> !llvm.ptr`);
@@ -499,9 +761,16 @@ export class ASTLowering {
       cloned[key] = this.deepCloneWithSubst(node[key], substMap, specializedName);
     }
 
-    if ((cloned.type === "ClassDeclaration" || cloned.type === "FunctionDeclaration") && specializedName) {
+    if (
+      (cloned.type === "ClassDeclaration" ||
+        cloned.type === "FunctionDeclaration" ||
+        cloned.type === "TSInterfaceDeclaration" ||
+        cloned.type === "TSTypeAliasDeclaration") &&
+      specializedName
+    ) {
       cloned.id = { type: "Identifier", name: specializedName };
       delete cloned.typeParameters;
+      delete cloned.exportAlias;
     }
 
     return cloned;
@@ -555,11 +824,83 @@ export class ASTLowering {
     return { specializedName, node: specializedFnNode };
   }
 
+  instantiateGenericStruct(baseName, typeArgs) {
+    const isInterface = this.genericInterfaceTemplates.has(baseName);
+    const templateNode = isInterface
+      ? this.genericInterfaceTemplates.get(baseName)
+      : this.genericTypeTemplates.get(baseName);
+
+    if (!templateNode) return baseName;
+
+    const rawParams = templateNode.typeParameters?.params || [];
+    const substMap = new Map();
+    const resolvedTypeArgs = [];
+
+    rawParams.forEach((param, i) => {
+      const pName = param.name?.name || param.name?.value || param.name || `T${i}`;
+      const defaultType = param.default || { type: "TSNumberKeyword" };
+      const concreteType = typeArgs[i] || defaultType;
+      substMap.set(pName, concreteType);
+      resolvedTypeArgs.push(concreteType);
+    });
+
+    const typeKeys = resolvedTypeArgs.map((t) => this.getTypeKey(t));
+    const specializedName = `${baseName}_${typeKeys.join("_")}`;
+
+    if (this.specializedTypes.has(specializedName)) {
+      return specializedName;
+    }
+    this.specializedTypes.add(specializedName);
+
+    const specializedNode = this.deepCloneWithSubst(templateNode, substMap, specializedName);
+    return { specializedName, node: specializedNode, isInterface };
+  }
+
   lower(program) {
     this.lowerModules([{ filePath: "main.ts", fileName: "main.ts", program, isEntry: true }]);
   }
 
   lowerModules(modules) {
+    this.globals = new Map();
+
+    // 0. Tüm modüllerdeki en üst düzey (global) değişken tanımlarını tespit et
+    for (const mod of modules) {
+      this.currentComments = mod.comments || [];
+      this.currentSyntheticDecorators = mod.syntheticDecorators || new Map();
+      for (const rawNode of mod.program.body) {
+        const node = this.unwrapExport(rawNode);
+        if (node.type === "VariableDeclaration") {
+          for (const decl of node.declarations) {
+            const varName = decl.id.name;
+            let type = "f64";
+            let isString = false;
+            let initVal = 0;
+            if (decl.id.typeAnnotation) {
+              type = this.resolveType(decl.id.typeAnnotation);
+              isString = this.isStringType(decl.id.typeAnnotation);
+            } else if (decl.init) {
+              if (decl.init.type === "BooleanLiteral" || (decl.init.type === "Literal" && typeof decl.init.value === "boolean")) {
+                type = "i1";
+                initVal = Boolean(decl.init.value);
+              } else if (decl.init.type === "NumericLiteral" || (decl.init.type === "Literal" && typeof decl.init.value === "number")) {
+                const raw = decl.init.raw || String(decl.init.value);
+                const isInt = !raw.includes(".") && Number.isInteger(decl.init.value);
+                type = isInt ? "i64" : "f64";
+                initVal = decl.init.value;
+              } else if (decl.init.type === "StringLiteral" || (decl.init.type === "Literal" && typeof decl.init.value === "string")) {
+                type = "!llvm.ptr";
+                isString = true;
+                initVal = decl.init.value;
+              }
+            }
+            const globalSym = `@g_${varName}`;
+            this.globals.set(varName, { name: varName, globalSym, type, isString, initVal });
+            this.builder.registerGlobal(globalSym, type, initVal);
+          }
+        }
+      }
+    }
+
     const allParsedNodes = [];
     const entryTopLevelStatements = [];
     const nonEntryTopLevelStatements = [];
@@ -568,16 +909,34 @@ export class ASTLowering {
       for (const rawNode of mod.program.body) {
         if (rawNode.type === "ImportDeclaration") continue;
 
+        const isExported =
+          rawNode.type === "ExportNamedDeclaration" ||
+          rawNode.type === "ExportDefaultDeclaration";
+
         const node = this.unwrapExport(rawNode);
 
         const hasTypeParams =
           Boolean(node.typeParameters?.params?.length > 0) ||
           Boolean(node.typeParameters && Array.isArray(node.typeParameters.params));
 
+        // Generic şablon fonksiyonlar doğrudan C sembolü olarak dışa aktarılmaz (monomorfize edilince aktarılır)
+        if (isExported && (node.type === "FunctionDeclaration" || node.type === "TSDeclareFunction") && !hasTypeParams) {
+          if (node.id?.name) {
+            const pragmas = this.getPragmas(rawNode);
+            const finalName = pragmas.exportName || node.id.name;
+            node.exportAlias = finalName;
+            this.exportedFunctionNames.add(finalName);
+          }
+        }
+
         if (node.type === "ClassDeclaration" && hasTypeParams) {
           this.genericClassTemplates.set(node.id.name, node);
         } else if (node.type === "FunctionDeclaration" && hasTypeParams) {
           this.genericFunctionTemplates.set(node.id.name, node);
+        } else if (node.type === "TSInterfaceDeclaration" && hasTypeParams) {
+          this.genericInterfaceTemplates.set(node.id.name, node);
+        } else if (node.type === "TSTypeAliasDeclaration" && hasTypeParams) {
+          this.genericTypeTemplates.set(node.id.name, node);
         } else {
           allParsedNodes.push(node);
           if (
@@ -585,7 +944,8 @@ export class ASTLowering {
             node.type !== "TSTypeAliasDeclaration" &&
             node.type !== "TSEnumDeclaration" &&
             node.type !== "ClassDeclaration" &&
-            node.type !== "FunctionDeclaration"
+            node.type !== "FunctionDeclaration" &&
+            node.type !== "TSDeclareFunction"
           ) {
             if (mod.isEntry) {
               entryTopLevelStatements.push(node);
@@ -610,14 +970,28 @@ export class ASTLowering {
         if (n.type === "TSTypeReference") {
           const typeName = n.typeName?.name || n.typeName?.value;
           const typeParams = n.typeParameters?.params || n.typeArguments?.params;
-          if (typeName && this.genericClassTemplates.has(typeName) && typeParams) {
-            const spec = this.instantiateGenericClass(typeName, typeParams);
-            if (spec && spec.node) {
-              synthesizedClasses.push(spec.node);
+          if (typeName && typeParams) {
+            if (this.genericClassTemplates.has(typeName)) {
+              const spec = this.instantiateGenericClass(typeName, typeParams);
+              if (spec && spec.node) {
+                synthesizedClasses.push(spec.node);
+              }
+              n.typeName.name = spec.specializedName || spec;
+              delete n.typeParameters;
+              delete n.typeArguments;
+            } else if (this.genericInterfaceTemplates.has(typeName) || this.genericTypeTemplates.has(typeName)) {
+              const spec = this.instantiateGenericStruct(typeName, typeParams);
+              if (spec && spec.node) {
+                if (spec.isInterface) {
+                  this.lowerInterface(spec.node);
+                } else {
+                  this.registerTypeAlias(spec.node);
+                }
+              }
+              n.typeName.name = spec.specializedName || spec;
+              delete n.typeParameters;
+              delete n.typeArguments;
             }
-            n.typeName.name = spec.specializedName || spec;
-            delete n.typeParameters;
-            delete n.typeArguments;
           }
         } else if (n.type === "NewExpression") {
           const calleeName = n.callee?.name;
@@ -660,17 +1034,24 @@ export class ASTLowering {
       allParsedNodes.push(fnNode);
     }
 
+    // 1. Enum'ları kaydet
     for (const node of allParsedNodes) {
       if (node.type === "TSEnumDeclaration") {
         this.registerEnum(node);
-      } else if (node.type === "TSInterfaceDeclaration") {
-        this.lowerInterface(node);
       }
     }
 
-    for (const node of allParsedNodes) {
-      if (node.type === "TSTypeAliasDeclaration") {
-        this.registerTypeAlias(node);
+    // 2. Type Alias ve Interfaceleri 2 geçişle kaydet (Kalıtım ve Kesişimleri tam bağlamak için)
+    const typeAndInterfaceNodes = allParsedNodes.filter(
+      (n) => n.type === "TSTypeAliasDeclaration" || n.type === "TSInterfaceDeclaration"
+    );
+    for (let pass = 0; pass < 2; pass++) {
+      for (const node of typeAndInterfaceNodes) {
+        if (node.type === "TSTypeAliasDeclaration") {
+          this.registerTypeAlias(node);
+        } else if (node.type === "TSInterfaceDeclaration") {
+          this.lowerInterface(node);
+        }
       }
     }
 
@@ -678,21 +1059,31 @@ export class ASTLowering {
     this.resolveClassHierarchy(rawClasses);
 
     for (const node of allParsedNodes) {
-      if (node.type === "FunctionDeclaration") {
+      if (node.type === "FunctionDeclaration" || node.type === "TSDeclareFunction") {
         const funcName = node.id.name;
         const isAsync = Boolean(node.async);
+        const isDeclare = Boolean(node.declare || node.type === "TSDeclareFunction" || !node.body);
 
         let innerRetType = "f64";
         const unwrappedRet = this.unwrapType(node.returnType);
         if (unwrappedRet && unwrappedRet.type === "TSTypeReference" && (unwrappedRet.typeName?.name === "Promise" || unwrappedRet.typeName?.value === "Promise")) {
           const innerParam = unwrappedRet.typeParameters?.params?.[0] || unwrappedRet.typeArguments?.params?.[0];
           innerRetType = innerParam ? this.resolveType(innerParam) : "none";
-        } else {
+        } else if (node.returnType) {
           innerRetType = this.resolveType(node.returnType);
+        } else {
+          let hasReturnVal = false;
+          if (node.body?.body) {
+            this.walkAST(node.body, (n) => {
+              if (n.type === "ReturnStatement" && n.argument) hasReturnVal = true;
+            });
+          }
+          innerRetType = hasReturnVal ? "f64" : "none";
         }
 
         const retType = isAsync ? "!llvm.ptr" : innerRetType;
         const structRetName = this.getStructName(node.returnType);
+        const enumRetName = this.getEnumName(node.returnType);
         const isRetString = this.isStringType(node.returnType);
 
         const rawParams = Array.isArray(node.params)
@@ -708,14 +1099,24 @@ export class ASTLowering {
           const isFn = this.isFunctionType(typeAnnot);
           const fnSig = isFn ? this.extractFunctionType(typeAnnot) : null;
           const isUnion = this.isUnionType(typeAnnot);
+          if (isUnion) {
+            this.builder.markFeature("union");
+          }
           const isArr = this.unwrapType(typeAnnot)?.type === "TSArrayType";
           const pType = isFn ? fnSig.mlirType : (isUnion || isArr) ? "!llvm.ptr" : this.resolveType(typeAnnot);
-          params.push({ name: param.name || `arg_${i}`, type: pType, isUnion, isArray: isArr, isFunction: isFn, fnSig });
+          const enumName = this.getEnumName(typeAnnot);
+          const isChan = this.unwrapType(typeAnnot)?.typeName?.name === "Channel";
+          params.push({ name: param.name || `arg_${i}`, type: pType, isUnion, isArray: isArr, isFunction: isFn, fnSig, enumName, isChannel: isChan });
           paramTypes.push(pType);
         });
 
+        const declSig = retType === "none" ? `(${paramTypes.join(", ")})` : `(${paramTypes.join(", ")}) -> ${retType}`;
         const mlirType = `(${paramTypes.join(", ")}) -> ${retType === "none" ? "()" : retType}`;
-        this.functionRegistry.set(funcName, { isAsync, innerRetType, retType, structRetName, isRetString, params, paramTypes, mlirType });
+        this.functionRegistry.set(funcName, { isAsync, isDeclare, innerRetType, retType, structRetName, enumRetName, isRetString, params, paramTypes, mlirType, declSig });
+
+        if (isDeclare) {
+          this.builder.declareExternalFunction(funcName, declSig);
+        }
       }
     }
 
@@ -727,12 +1128,16 @@ export class ASTLowering {
 
     for (const node of allParsedNodes) {
       if (node.type === "FunctionDeclaration") {
-        this.lowerFunction(node);
+        if (!node.declare && node.body) {
+          this.lowerFunction(node);
+        }
       }
     }
 
+    this.emitSpawnRunners();
+
     this.builder.block("func.func @main() -> i32", () => {
-      this.enterScope(true);
+      this.enterScope(true, "i32");
 
       for (const stmt of nonEntryTopLevelStatements) {
         this.lowerStatement(stmt);
@@ -747,9 +1152,71 @@ export class ASTLowering {
     });
   }
 
+  emitSpawnRunners() {
+    for (const [targetFnName, { runnerName, targetMeta }] of this.spawnRunners.entries()) {
+      this.builder.block(`func.func @${runnerName}(%arg_raw: !llvm.ptr) -> !llvm.ptr`, () => {
+        if (targetMeta && targetMeta.params && targetMeta.params.length > 0) {
+          const pType = targetMeta.params[0].type;
+          this.builder.emit(`func.call @${targetFnName}(%arg_raw) : (${pType}) -> ()`);
+        } else {
+          this.builder.emit(`func.call @${targetFnName}() : () -> ()`);
+        }
+        const nullRet = this.builder.nextSSA();
+        this.builder.emit(`${nullRet} = llvm.mlir.zero : !llvm.ptr`);
+        this.builder.emit(`func.return ${nullRet} : !llvm.ptr`);
+      });
+    }
+  }
+
+  evalConstExpr(expr, scope = new Map()) {
+    if (!expr) return 0;
+    if (
+      expr.type === "ParenthesizedExpression" ||
+      expr.type === "TSAsExpression" ||
+      expr.type === "NonNullExpression"
+    ) {
+      return this.evalConstExpr(expr.expression, scope);
+    }
+    if (expr.type === "MemberExpression") {
+      const propName = expr.property?.name ?? expr.property?.value;
+      if (scope.has(propName)) return scope.get(propName);
+    }
+    if (expr.type === "NumericLiteral" || (expr.type === "Literal" && typeof expr.value === "number")) {
+      return expr.value;
+    }
+    if (expr.type === "Identifier" && scope.has(expr.name)) {
+      return scope.get(expr.name);
+    }
+    if (expr.type === "BinaryExpression") {
+      const left = this.evalConstExpr(expr.left, scope);
+      const right = this.evalConstExpr(expr.right, scope);
+      switch (expr.operator) {
+        case "+": return left + right;
+        case "-": return left - right;
+        case "*": return left * right;
+        case "/": return Math.floor(left / right);
+        case "%": return left % right;
+        case "<<": return left << right;
+        case ">>": return left >> right;
+        case ">>>": return left >>> right;
+        case "|": return left | right;
+        case "&": return left & right;
+        case "^": return left ^ right;
+      }
+    }
+    if (expr.type === "UnaryExpression") {
+      const arg = this.evalConstExpr(expr.argument, scope);
+      if (expr.operator === "~") return ~arg;
+      if (expr.operator === "-") return -arg;
+      if (expr.operator === "+") return +arg;
+    }
+    return 0;
+  }
+
   registerEnum(node) {
     const enumName = node.id.name;
     const members = new Map();
+    const constScope = new Map();
     let currentVal = 0;
     let enumKind = "numeric";
 
@@ -773,21 +1240,21 @@ export class ASTLowering {
 
       if (init) {
         if (
-          init.type === "NumericLiteral" ||
-          (init.type === "Literal" && typeof init.value === "number")
-        ) {
-          currentVal = init.value;
-          members.set(memberName, { type: "i64", value: currentVal, isString: false });
-          members.set(String(currentVal), { type: "!llvm.ptr", value: memberName, isString: true });
-          currentVal++;
-        } else if (
           init.type === "StringLiteral" ||
           (init.type === "Literal" && typeof init.value === "string")
         ) {
           members.set(memberName, { type: "!llvm.ptr", value: init.value, isString: true });
           enumKind = "string";
+        } else {
+          // Sayısal veya Bitwise İfade (1 << 0, A | B vb.)
+          currentVal = this.evalConstExpr(init, constScope);
+          constScope.set(memberName, currentVal);
+          members.set(memberName, { type: "i64", value: currentVal, isString: false });
+          members.set(String(currentVal), { type: "!llvm.ptr", value: memberName, isString: true });
+          currentVal++;
         }
       } else {
+        constScope.set(memberName, currentVal);
         members.set(memberName, { type: "i64", value: currentVal, isString: false });
         members.set(String(currentVal), { type: "!llvm.ptr", value: memberName, isString: true });
         currentVal++;
@@ -799,7 +1266,20 @@ export class ASTLowering {
 
   registerTypeAlias(node) {
     const aliasName = node.id.name;
-    const innerType = this.unwrapType(node.typeAnnotation);
+    let innerType = this.unwrapType(node.typeAnnotation);
+    let isUntaggedUnion = false;
+
+    // Untagged<{ ... }> kontrolü
+    if (
+      innerType.type === "TSTypeReference" &&
+      (innerType.typeName?.name === "Untagged" || innerType.typeName?.value === "Untagged")
+    ) {
+      const typeArg = innerType.typeParameters?.params?.[0] || innerType.typeArguments?.params?.[0];
+      if (typeArg) {
+        innerType = this.unwrapType(typeArg);
+        isUntaggedUnion = true;
+      }
+    }
 
     if (innerType.type === "TSTypeLiteral") {
       const rawMembers =
@@ -814,15 +1294,43 @@ export class ASTLowering {
       rawMembers.forEach((member, index) => {
         const fieldName = member.key?.name || member.key?.value || member.name || member.id?.name;
         const typeAnnot = member.typeAnnotation;
-        const fieldType = this.resolveType(typeAnnot);
+        const isFn = this.isFunctionType(typeAnnot);
+        const fnSig = isFn ? this.extractFunctionType(typeAnnot) : null;
+        const fieldType = isFn ? "!llvm.ptr" : this.resolveType(typeAnnot);
         const structName = this.getStructName(typeAnnot);
+        const enumName = this.getEnumName(typeAnnot);
         const isString = this.isStringType(typeAnnot);
-        fields.push({ name: fieldName, type: fieldType, structName, isString, index });
+        const fieldIdx = isUntaggedUnion ? 0 : index;
+        fields.push({
+          name: fieldName,
+          type: fieldType,
+          structName,
+          enumName,
+          isString,
+          isFunction: isFn,
+          fnSig,
+          index: fieldIdx,
+        });
         types.push(fieldType);
       });
 
-      const mlirType = `!llvm.struct<(${types.join(", ")})>`;
-      this.structRegistry.set(aliasName, { name: aliasName, fields, mlirType, methods: new Map() });
+      const pragmas = this.getPragmas(node);
+      const isPacked = pragmas.packed;
+
+      // Untagged union bellek boyutu en büyük alan kadardır (LLVM seviyesinde !llvm.array<8 x i8>)
+      const mlirType = isUntaggedUnion
+        ? `!llvm.array<8 x i8>`
+        : (isPacked ? `!llvm.struct<packed (${types.join(", ")})>` : `!llvm.struct<(${types.join(", ")})>`);
+
+      this.structRegistry.set(aliasName, {
+        name: aliasName,
+        fields,
+        types,
+        mlirType,
+        methods: new Map(),
+        isUnion: isUntaggedUnion,
+        isPacked,
+      });
     } else if (innerType.type === "TSIntersectionType") {
       const mergedFields = [];
       const mergedTypes = [];
@@ -830,15 +1338,46 @@ export class ASTLowering {
 
       const typesList = innerType.types || [];
       for (const t of typesList) {
-        const sName = this.getStructName(t);
+        const unwrappedT = this.unwrapType(t);
+        const sName = this.getStructName(unwrappedT);
         if (sName && this.structRegistry.has(sName)) {
           const meta = this.structRegistry.get(sName);
           for (const f of meta.fields) {
-            if (f.name !== "__type_id") {
+            if (f.name !== "__type_id" && !mergedFields.some((mf) => mf.name === f.name)) {
               mergedFields.push({ ...f, index: idx++ });
               mergedTypes.push(f.type);
             }
           }
+        } else if (unwrappedT.type === "TSTypeLiteral") {
+          const rawMembers =
+            unwrappedT.members ||
+            unwrappedT.body?.body ||
+            unwrappedT.body?.members ||
+            (Array.isArray(unwrappedT.body) ? unwrappedT.body : []);
+
+          rawMembers.forEach((member) => {
+            const fieldName = member.key?.name || member.key?.value || member.name || member.id?.name;
+            const typeAnnot = member.typeAnnotation;
+            const isFn = this.isFunctionType(typeAnnot);
+            const fnSig = isFn ? this.extractFunctionType(typeAnnot) : null;
+            const fieldType = isFn ? "!llvm.ptr" : this.resolveType(typeAnnot);
+            const sNameSub = this.getStructName(typeAnnot);
+            const enumName = this.getEnumName(typeAnnot);
+            const isString = this.isStringType(typeAnnot);
+            if (!mergedFields.some((mf) => mf.name === fieldName)) {
+              mergedFields.push({
+                name: fieldName,
+                type: fieldType,
+                structName: sNameSub,
+                enumName,
+                isString,
+                isFunction: isFn,
+                fnSig,
+                index: idx++,
+              });
+              mergedTypes.push(fieldType);
+            }
+          });
         }
       }
       const mlirType = `!llvm.struct<(${mergedTypes.join(", ")})>`;
@@ -853,25 +1392,73 @@ export class ASTLowering {
     const fields = [];
     const types = [];
 
+    // 1. Interface Kalıtımı (interface EntityHeader extends Base, Identifiable)
+    const extendsList = node.extends || node.heritage || [];
+    const heritageClauses = Array.isArray(extendsList) ? extendsList : [extendsList];
+    for (const h of heritageClauses) {
+      const parentName = h.expression?.name || h.expression?.value || h.id?.name || h.name;
+      if (parentName && this.structRegistry.has(parentName)) {
+        const parentMeta = this.structRegistry.get(parentName);
+        for (const f of parentMeta.fields) {
+          if (f.name !== "__type_id" && !fields.some((existing) => existing.name === f.name)) {
+            fields.push({ ...f, index: fields.length });
+            types.push(f.type);
+          }
+        }
+      }
+    }
+
+    // 2. Kendi Alanları (Own members)
     const members =
       node.members ||
       node.body?.body ||
       node.body?.members ||
       (Array.isArray(node.body) ? node.body : []);
 
-    members.forEach((member, index) => {
+    members.forEach((member) => {
       if (member.type === "TSPropertySignature" || member.key) {
         const fieldName = member.key?.name || member.key?.value || member.name;
-        const fieldType = this.resolveType(member.typeAnnotation);
-        const structName = this.getStructName(member.typeAnnotation);
-        const isString = this.isStringType(member.typeAnnotation);
-        fields.push({ name: fieldName, type: fieldType, structName, isString, index });
-        types.push(fieldType);
+        const existingIdx = fields.findIndex((f) => f.name === fieldName);
+        const typeAnnot = member.typeAnnotation;
+        const isFn = this.isFunctionType(typeAnnot);
+        const fnSig = isFn ? this.extractFunctionType(typeAnnot) : null;
+        const fieldType = isFn ? "!llvm.ptr" : this.resolveType(typeAnnot);
+        const sName = this.getStructName(typeAnnot);
+        const enumName = this.getEnumName(typeAnnot);
+        const isString = this.isStringType(typeAnnot);
+
+        if (existingIdx !== -1) {
+          fields[existingIdx] = {
+            name: fieldName,
+            type: fieldType,
+            structName: sName,
+            enumName,
+            isString,
+            isFunction: isFn,
+            fnSig,
+            index: existingIdx,
+          };
+          types[existingIdx] = fieldType;
+        } else {
+          fields.push({
+            name: fieldName,
+            type: fieldType,
+            structName: sName,
+            enumName,
+            isString,
+            isFunction: isFn,
+            fnSig,
+            index: fields.length,
+          });
+          types.push(fieldType);
+        }
       }
     });
 
-    const mlirType = `!llvm.struct<(${types.join(", ")})>`;
-    this.structRegistry.set(structName, { name: structName, fields, mlirType, methods: new Map() });
+    const pragmas = this.getPragmas(node);
+    const isPacked = pragmas.packed;
+    const mlirType = isPacked ? `!llvm.struct<packed (${types.join(", ")})>` : `!llvm.struct<(${types.join(", ")})>`;
+    this.structRegistry.set(structName, { name: structName, fields, mlirType, methods: new Map(), isPacked });
   }
 
   resolveClassHierarchy(rawClasses) {
@@ -1117,7 +1704,8 @@ export class ASTLowering {
       const sig = retType === "none" ? "" : ` -> ${retType}`;
 
       this.builder.block(`func.func @${fnName}(${paramStrings.join(", ")})${sig}`, () => {
-        this.enterScope(true);
+        this.currentFunctionNode = elem.value;
+        this.enterScope(true, retType);
 
         const prevSyms = new Map(this.symbolTable);
         this.symbolTable.clear();
@@ -1211,28 +1799,34 @@ export class ASTLowering {
       const isFn = this.isFunctionType(typeAnnot);
       const fnSig = isFn ? this.extractFunctionType(typeAnnot) : null;
       const isUnion = this.isUnionType(typeAnnot);
+      if (isUnion) {
+        this.builder.markFeature("union");
+      }
       const isArr = this.unwrapType(typeAnnot)?.type === "TSArrayType";
-      const pType = isFn ? fnSig.mlirType : (isUnion || isArr) ? "!llvm.ptr" : this.resolveType(typeAnnot);
+      const isChan = this.unwrapType(typeAnnot)?.typeName?.name === "Channel";
+      const pType = isFn ? fnSig.mlirType : (isUnion || isArr || isChan) ? "!llvm.ptr" : this.resolveType(typeAnnot);
       const structName = this.getStructName(typeAnnot);
 
       const ssaArg = `%arg_${pName}`;
       paramStrings.push(`${ssaArg}: ${pType}`);
       paramTypes.push(pType);
-      params.push({ name: pName, ssa: ssaArg, type: pType, structName, isUnion, isArray: isArr, isFunction: isFn, fnSig, typeAnnot });
+      params.push({ name: pName, ssa: ssaArg, type: pType, structName, isUnion, isArray: isArr, isFunction: isFn, fnSig, typeAnnot, isChannel: isChan });
     });
 
     const innerRetType = fnMeta?.innerRetType || "f64";
     const retType = isAsync ? "!llvm.ptr" : innerRetType;
+    const structRetName = fnMeta?.structRetName || this.getStructName(node.returnType);
 
     // A. ASYNC FUNCTION: Arka plan thread'ine lifting
     if (isAsync) {
+      this.builder.markFeature("threads");
       const innerName = `__async_inner_${funcName}`;
       const runnerName = `__async_runner_${funcName}`;
       const innerSig = innerRetType === "none" ? "" : ` -> ${innerRetType}`;
 
       // 1. İç mantık fonksiyonu (@__async_inner_*)
       this.builder.block(`func.func @${innerName}(${paramStrings.join(", ")})${innerSig}`, () => {
-        this.enterScope(true);
+        this.enterScope(true, innerRetType);
         const prevSyms = new Map(this.symbolTable);
 
         for (const p of params) {
@@ -1335,9 +1929,24 @@ export class ASTLowering {
     }
 
     // B. STANDART SENKRON FONKSİYON
+    const pragmas = this.getPragmas(node);
+    // Generic somutlamaları (örn. mirror_f64) her zaman kendi funcName adıyla basılmalıdır
+    const effectiveFnName = (funcName.includes("_") && !node.exportAlias)
+      ? funcName
+      : (node.exportAlias || pragmas.exportName || funcName);
+
+    let attrStr = "";
+    if (pragmas.inline) {
+      attrStr = ` attributes {passthrough = ["alwaysinline"]}`;
+    } else if (pragmas.noinline) {
+      attrStr = ` attributes {passthrough = ["noinline"]}`;
+    }
+
     const sig = retType === "none" ? "" : ` -> ${retType}`;
-    this.builder.block(`func.func @${funcName}(${paramStrings.join(", ")})${sig}`, () => {
-      this.enterScope(true);
+    this.builder.block(`func.func @${effectiveFnName}(${paramStrings.join(", ")})${sig}${attrStr}`, () => {
+      this.currentFunctionNode = node;
+      this.builder.hasTerminated = false;
+      this.enterScope(true, retType, structRetName);
       const prevSyms = new Map(this.symbolTable);
 
       for (const p of params) {
@@ -1365,6 +1974,22 @@ export class ASTLowering {
             isArray: true,
             isRef: true,
           });
+        } else if (p.isChannel) {
+          this.symbolTable.set(p.name, {
+            ptr: p.ssa,
+            ssa: p.ssa,
+            type: "!llvm.ptr",
+            isChannel: true,
+            isRef: true,
+          });
+        } else if (p.isChannel) {
+          this.symbolTable.set(p.name, {
+            ptr: p.ssa,
+            ssa: p.ssa,
+            type: "!llvm.ptr",
+            isChannel: true,
+            isRef: true,
+          });
         } else if (p.structName) {
           this.symbolTable.set(p.name, {
             ptr: p.ssa,
@@ -1386,9 +2011,15 @@ export class ASTLowering {
         }
       }
 
-      if (retType === "none") {
-        this.exitScope();
-        this.builder.createReturn();
+      if (!this.builder.hasTerminated) {
+        if (retType === "none") {
+          this.exitScope();
+          this.builder.createReturn();
+        } else {
+          const defVal = this.builder.createConstant(0, retType);
+          this.exitScope();
+          this.builder.createReturn(defVal);
+        }
       } else if (this.scopeStack.length > 0 && this.scopeStack[this.scopeStack.length - 1].isFunction) {
         this.scopeStack.pop();
       }
@@ -1400,6 +2031,17 @@ export class ASTLowering {
   lowerStatement(stmt) {
     switch (stmt.type) {
       case "TryStatement": {
+        // Eğer sadece try {} finally {} ise setjmp/longjmp ek yüküne girmeden doğrudan defer çalıştır!
+        if (!stmt.handler && stmt.finalizer) {
+          this.enterScope(false);
+          const currentScope = this.scopeStack[this.scopeStack.length - 1];
+          currentScope.deferrals.push(stmt.finalizer);
+          this.lowerStatement(stmt.block);
+          this.exitScope();
+          break;
+        }
+
+        this.builder.markFeature("exceptions");
         const localJmpBuf = this.builder.allocateStack("!llvm.array<200 x i8>");
         const gJmpBufAddr = this.builder.nextSSA();
         this.builder.emit(`${gJmpBufAddr} = llvm.mlir.addressof @rts_current_jmpbuf : !llvm.ptr`);
@@ -1411,6 +2053,12 @@ export class ASTLowering {
 
         const zero = this.builder.createConstant(0, "i32");
         const cmp = this.builder.createComparison("==", { ssa: setjmpRes, type: "i32" }, zero);
+
+        this.enterScope(false);
+        if (stmt.finalizer) {
+          const currentScope = this.scopeStack[this.scopeStack.length - 1];
+          currentScope.deferrals.push(stmt.finalizer);
+        }
 
         this.builder.createIf(
           cmp,
@@ -1449,9 +2097,7 @@ export class ASTLowering {
             : null
         );
 
-        if (stmt.finalizer) {
-          this.lowerStatement(stmt.finalizer);
-        }
+        this.exitScope();
         break;
       }
 
@@ -1486,10 +2132,44 @@ export class ASTLowering {
       }
 
       case "VariableDeclaration": {
+        const isUsing = stmt.kind === "using";
         for (const decl of stmt.declarations) {
           const varName = decl.id.name;
+
+          // Modül seviyesinde küresel bir değişkense:
+          if (this.globals && this.globals.has(varName) && this.scopeStack.length === 1) {
+            const g = this.globals.get(varName);
+            if (decl.init) {
+              const val = this.lowerExpression(decl.init);
+              const addr = this.builder.nextSSA();
+              this.builder.emit(`${addr} = llvm.mlir.addressof ${g.globalSym} : !llvm.ptr`);
+              const coerced = this.coerceType(val, g.type);
+              this.builder.store(addr, coerced);
+            }
+            continue;
+          }
+
           const isUnion = this.isUnionType(decl.id.typeAnnotation);
           const explicitStruct = this.getStructName(decl.id.typeAnnotation);
+
+          // ESCAPE KONTROLÜ: Nesne fonksiyon dışına sızmıyorsa stack'e yükselt
+          let canStackAllocate = false;
+          if (decl.init) {
+            if (decl.init.type === "NewExpression") {
+              const cls = decl.init.callee.name;
+              if (cls !== "Map" && cls !== "Set") {
+                const escapes = this.checkEscape(varName, this.currentFunctionNode);
+                if (!escapes) {
+                  canStackAllocate = true;
+                }
+              }
+            } else if (decl.init.type === "ObjectExpression") {
+              const escapes = this.checkEscape(varName, this.currentFunctionNode);
+              if (!escapes) {
+                canStackAllocate = true;
+              }
+            }
+          }
 
           if (isUnion) {
             const slot = this.builder.allocateStack("!llvm.struct<(i32, i64)>");
@@ -1505,9 +2185,51 @@ export class ASTLowering {
               unionNode: decl.id.typeAnnotation,
             });
           } else if (decl.init) {
-            const val = this.lowerExpression(decl.init);
+            let val;
+            if (decl.init.type === "NewExpression" && canStackAllocate) {
+              val = this.lowerNewExpression(decl.init, true);
+            } else if (decl.init.type === "ObjectExpression") {
+              const sName = this.inferStructName(decl.init, explicitStruct);
+              const ptr = this.instantiateStruct(decl.init, sName, canStackAllocate);
+              val = {
+                ssa: ptr,
+                ptr: ptr,
+                type: "!llvm.ptr",
+                structName: sName,
+                isRef: true,
+                isHeap: !canStackAllocate,
+                isStack: canStackAllocate,
+              };
+            } else {
+              val = this.lowerExpression(decl.init);
+            }
 
-            if (val.isMap || val.isSet) {
+            if (val.isArena || val.isPool || val.isFixedBuffer) {
+              this.symbolTable.set(varName, {
+                ptr: val.ssa || val.ptr,
+                ssa: val.ssa || val.ptr,
+                type: "!llvm.ptr",
+                isArena: val.isArena,
+                isPool: val.isPool,
+                isFixedBuffer: val.isFixedBuffer,
+                isRef: true,
+              });
+            } else if (val.isChannel) {
+              this.symbolTable.set(varName, {
+                ptr: val.ssa || val.ptr,
+                ssa: val.ssa || val.ptr,
+                type: "!llvm.ptr",
+                isChannel: true,
+                isRef: true,
+              });
+              if (decl.init.type === "Identifier" && !val.isBorrowed) {
+                const srcSym = this.symbolTable.get(decl.init.name);
+                if (srcSym) {
+                  srcSym.isMoved = true;
+                  this.markTransferred(srcSym.ptr || srcSym.ssa);
+                }
+              }
+            } else if (val.isMap || val.isSet) {
               this.symbolTable.set(varName, {
                 ptr: val.ssa || val.ptr,
                 ssa: val.ssa || val.ptr,
@@ -1560,7 +2282,19 @@ export class ASTLowering {
                   type: "!llvm.ptr",
                   structName: finalStruct,
                   isRef: true,
+                  isHeap: val.isHeap,
+                  isStack: val.isStack,
                 });
+
+                // Move Semantiği: Sağdaki ifade doğrudan bir Identifier ise sahipliği taşı
+                if (decl.init.type === "Identifier" && !val.isBorrowed) {
+                  const srcSym = this.symbolTable.get(decl.init.name);
+                  if (srcSym && (srcSym.isHeap || srcSym.structName || srcSym.isChannel)) {
+                    srcSym.isMoved = true;
+                    // Taşıma yapıldığı için önceki sahibinin çift free yapmasını önle
+                    this.markTransferred(srcSym.ptr || srcSym.ssa);
+                  }
+                }
               } else {
                 const slot = this.builder.allocateStack(val.type);
                 this.builder.store(slot.ptr, val);
@@ -1569,6 +2303,19 @@ export class ASTLowering {
                   type: val.type,
                   isRef: true,
                   isString: val.isString || this.isStringType(decl.id.typeAnnotation),
+                });
+              }
+            }
+
+            if (isUsing) {
+              const sym = this.symbolTable.get(varName);
+              const targetPtr = val.ptr || val.ssa || sym?.ptr;
+              const isAlloc = Boolean(sym?.isArena || val.isArena || sym?.isPool || val.isPool || sym?.isFixedBuffer || val.isFixedBuffer);
+              if (targetPtr && (val.isHeap || val.isStack || sym?.structName || sym?.isMap || sym?.isSet || val.isArray || isAlloc)) {
+                this.trackDisposable(targetPtr, sym?.structName || val.structName, Boolean(val.isStack), {
+                  isArena: Boolean(sym?.isArena || val.isArena),
+                  isPool: Boolean(sym?.isPool || val.isPool),
+                  isFixedBuffer: Boolean(sym?.isFixedBuffer || val.isFixedBuffer),
                 });
               }
             }
@@ -1668,51 +2415,78 @@ export class ASTLowering {
         }
 
         const cond = this.lowerExpression(stmt.test);
-        this.builder.createIf(
-          cond,
-          () => {
-            this.enterScope(false);
-            if (narrowedVarName) {
-              const unboxed = this.unboxUnion(originalSym.ptr || originalSym.ssa, typeofCheck.targetType);
+        const thenBlock = this.builder.nextBlock("then");
+        const elseBlock = stmt.alternate ? this.builder.nextBlock("else") : null;
+        const mergeBlock = this.builder.nextBlock("merge");
+
+        const falseTarget = elseBlock || mergeBlock;
+        this.builder.emitBranchConditional(cond.ssa, thenBlock, falseTarget);
+
+        // --- THEN BLOĞU ---
+        this.builder.emitBlockLabel(thenBlock);
+        this.builder.hasTerminated = false;
+        this.enterScope(false);
+        if (narrowedVarName) {
+          const unboxed = this.unboxUnion(originalSym.ptr || originalSym.ssa, typeofCheck.targetType);
+          if (unboxed) {
+            this.symbolTable.set(narrowedVarName, unboxed);
+          }
+        }
+        this.lowerStatement(stmt.consequent);
+        if (narrowedVarName) {
+          this.symbolTable.set(narrowedVarName, originalSym);
+        }
+        this.exitScope();
+
+        const thenTerminated = this.builder.hasTerminated;
+        if (!thenTerminated) {
+          this.builder.emitBranch(mergeBlock);
+        }
+
+        // --- ELSE BLOĞU ---
+        let elseTerminated = false;
+        if (elseBlock) {
+          this.builder.emitBlockLabel(elseBlock);
+          this.builder.hasTerminated = false;
+          this.enterScope(false);
+          if (narrowedVarName) {
+            let otherType = null;
+            if (typeofCheck.targetType === "string") otherType = "number";
+            else if (typeofCheck.targetType === "number") otherType = "string";
+
+            if (otherType) {
+              const unboxed = this.unboxUnion(originalSym.ptr || originalSym.ssa, otherType);
               if (unboxed) {
                 this.symbolTable.set(narrowedVarName, unboxed);
               }
             }
-            this.lowerStatement(stmt.consequent);
-            if (narrowedVarName) {
-              this.symbolTable.set(narrowedVarName, originalSym);
-            }
-            this.exitScope();
-          },
-          stmt.alternate
-            ? () => {
-                this.enterScope(false);
-                if (narrowedVarName) {
-                  let otherType = null;
-                  if (typeofCheck.targetType === "string") otherType = "number";
-                  else if (typeofCheck.targetType === "number") otherType = "string";
+          }
+          this.lowerStatement(stmt.alternate);
+          if (narrowedVarName) {
+            this.symbolTable.set(narrowedVarName, originalSym);
+          }
+          this.exitScope();
 
-                  if (otherType) {
-                    const unboxed = this.unboxUnion(originalSym.ptr || originalSym.ssa, otherType);
-                    if (unboxed) {
-                      this.symbolTable.set(narrowedVarName, unboxed);
-                    }
-                  }
-                }
-                this.lowerStatement(stmt.alternate);
-                if (narrowedVarName) {
-                  this.symbolTable.set(narrowedVarName, originalSym);
-                }
-                this.exitScope();
-              }
-            : null
-        );
+          elseTerminated = this.builder.hasTerminated;
+          if (!elseTerminated) {
+            this.builder.emitBranch(mergeBlock);
+          }
+        }
+
+        // --- MERGE BLOĞU ---
+        if (!thenTerminated || (elseBlock && !elseTerminated) || !elseBlock) {
+          this.builder.emitBlockLabel(mergeBlock);
+          this.builder.hasTerminated = false;
+        } else {
+          this.builder.hasTerminated = true;
+        }
         break;
       }
 
       case "BlockStatement": {
         this.enterScope(false);
         for (const s of stmt.body) {
+          if (this.builder.hasTerminated) break;
           this.lowerStatement(s);
         }
         this.exitScope();
@@ -1720,8 +2494,12 @@ export class ASTLowering {
       }
 
       case "ReturnStatement": {
+        const expectedRet = this.getCurrentFunctionRetType();
         if (stmt.argument) {
-          const val = this.lowerExpression(stmt.argument);
+          let val = this.lowerExpression(stmt.argument);
+          if (expectedRet && expectedRet !== "none") {
+            val = this.coerceType(val, expectedRet);
+          }
           if (val.type === "!llvm.ptr" || val.isHeap) {
             this.markTransferred(val.ssa || val.ptr);
           }
@@ -1736,10 +2514,101 @@ export class ASTLowering {
     }
   }
 
-  lowerNewExpression(expr) {
+  lowerNewExpression(expr, canStackAllocate = false) {
     const className = expr.callee.name;
 
+    if (className === "Channel") {
+      this.builder.markFeature("channels");
+      this.builder.markFeature("threads");
+      let capVal = { ssa: "", type: "i64" };
+      if (expr.arguments && expr.arguments.length > 0) {
+        capVal = this.coerceType(this.lowerExpression(expr.arguments[0]), "i64");
+      } else {
+        capVal = this.builder.createConstant(1, "i64");
+      }
+      const ptr = this.builder.nextSSA();
+      this.builder.emit(`${ptr} = func.call @rts_chan_new(${capVal.ssa}) : (i64) -> !llvm.ptr`);
+      return {
+        ssa: ptr,
+        ptr: ptr,
+        type: "!llvm.ptr",
+        isChannel: true,
+        isRef: true,
+        isHeap: true,
+      };
+    }
+
+    if (className === "Arena") {
+      this.builder.markFeature("allocators");
+      this.builder.markFeature("heap");
+      this.builder.markFeature("exceptions");
+      let capVal = { ssa: "", type: "i64" };
+      if (expr.arguments && expr.arguments.length > 0) {
+        capVal = this.coerceType(this.lowerExpression(expr.arguments[0]), "i64");
+      } else {
+        capVal = this.builder.createConstant(64 * 1024, "i64");
+      }
+      const ptr = this.builder.nextSSA();
+      this.builder.emit(`${ptr} = func.call @rts_arena_new(${capVal.ssa}) : (i64) -> !llvm.ptr`);
+      return {
+        ssa: ptr,
+        ptr: ptr,
+        type: "!llvm.ptr",
+        isArena: true,
+        isRef: true,
+        isHeap: true,
+      };
+    }
+
+    if (className === "Pool") {
+      this.builder.markFeature("allocators");
+      this.builder.markFeature("heap");
+      this.builder.markFeature("exceptions");
+      let chunkSz = { ssa: "", type: "i64" };
+      let chunkCnt = { ssa: "", type: "i64" };
+      if (expr.arguments && expr.arguments.length >= 2) {
+        chunkSz = this.coerceType(this.lowerExpression(expr.arguments[0]), "i64");
+        chunkCnt = this.coerceType(this.lowerExpression(expr.arguments[1]), "i64");
+      } else {
+        chunkSz = this.builder.createConstant(64, "i64");
+        chunkCnt = this.builder.createConstant(16, "i64");
+      }
+      const ptr = this.builder.nextSSA();
+      this.builder.emit(`${ptr} = func.call @rts_pool_new(${chunkSz.ssa}, ${chunkCnt.ssa}) : (i64, i64) -> !llvm.ptr`);
+      return {
+        ssa: ptr,
+        ptr: ptr,
+        type: "!llvm.ptr",
+        isPool: true,
+        isRef: true,
+        isHeap: true,
+      };
+    }
+
+    if (className === "FixedBuffer") {
+      this.builder.markFeature("allocators");
+      this.builder.markFeature("heap");
+      this.builder.markFeature("exceptions");
+      let capVal = { ssa: "", type: "i64" };
+      if (expr.arguments && expr.arguments.length > 0) {
+        capVal = this.coerceType(this.lowerExpression(expr.arguments[0]), "i64");
+      } else {
+        capVal = this.builder.createConstant(1024, "i64");
+      }
+      const ptr = this.builder.nextSSA();
+      this.builder.emit(`${ptr} = func.call @rts_fixed_buffer_new(${capVal.ssa}) : (i64) -> !llvm.ptr`);
+      return {
+        ssa: ptr,
+        ptr: ptr,
+        type: "!llvm.ptr",
+        isFixedBuffer: true,
+        isRef: true,
+        isHeap: true,
+      };
+    }
+
     if (className === "Map" || className === "Set") {
+      this.builder.markFeature("map");
       const isMap = className === "Map";
       const typeParams = expr.typeParameters?.params || expr.typeArguments?.params;
       let valType = "f64";
@@ -1767,12 +2636,18 @@ export class ASTLowering {
       throw new Error(`[Lowering] Tanımsız sınıf: ${className}`);
     }
 
-    const byteSize = Math.max(classMeta.fields.length * 8, 8);
-    const heapSlot = this.builder.allocateHeap(byteSize);
+    // Escape etmiyorsa heap yerine doğrudan stack (alloca) kullan!
+    let slot;
+    if (canStackAllocate) {
+      slot = this.builder.allocateStack(classMeta.mlirType);
+    } else {
+      const byteSize = Math.max(classMeta.fields.length * 8, 8);
+      slot = this.builder.allocateHeap(byteSize);
+    }
 
     const typeIdConst = this.builder.nextSSA();
     this.builder.emit(`${typeIdConst} = arith.constant ${classMeta.typeId} : i32`);
-    this.builder.emit(`llvm.store ${typeIdConst}, ${heapSlot.ptr} : i32, !llvm.ptr`);
+    this.builder.emit(`llvm.store ${typeIdConst}, ${slot.ptr} : i32, !llvm.ptr`);
 
     if (classMeta.methods.has("constructor")) {
       const ctorMeta = classMeta.methods.get("constructor");
@@ -1792,7 +2667,7 @@ export class ASTLowering {
         }
         return val;
       }) : [];
-      const allArgsSSA = [heapSlot.ptr, ...args.map((a) => a.ssa || a.ptr)];
+      const allArgsSSA = [slot.ptr, ...args.map((a) => a.ssa || a.ptr)];
       const allArgsType = ["!llvm.ptr", ...args.map((a) => a.type)];
 
       this.builder.emit(
@@ -1801,35 +2676,65 @@ export class ASTLowering {
     }
 
     return {
-      ssa: heapSlot.ptr,
-      ptr: heapSlot.ptr,
+      ssa: slot.ptr,
+      ptr: slot.ptr,
       type: "!llvm.ptr",
       structName: className,
       isRef: true,
-      isHeap: true,
+      isHeap: !canStackAllocate,
+      isStack: canStackAllocate,
     };
   }
 
-  inferStructName(objExpr) {
+  inferStructName(objExpr, hintStructName = null) {
+    if (hintStructName && this.structRegistry.has(hintStructName)) {
+      return hintStructName;
+    }
     const propNames = objExpr.properties.map((p) => p.key?.name || p.key?.value);
     for (const [sName, sMeta] of this.structRegistry.entries()) {
       const metaFields = sMeta.fields.filter((f) => f.name !== "__type_id").map((f) => f.name);
-      if (propNames.length === metaFields.length && propNames.every((p) => metaFields.includes(p))) {
-        return sName;
+      if (sMeta.isUnion) {
+        if (propNames.length > 0 && propNames.every((p) => metaFields.includes(p))) {
+          return sName;
+        }
+      } else {
+        if (propNames.length === metaFields.length && propNames.every((p) => metaFields.includes(p))) {
+          return sName;
+        }
       }
     }
     throw new Error(`[Lowering] Nesne alanlarıyla (${propNames.join(", ")}) eşleşen bir interface/class bulunamadı!`);
   }
 
-  instantiateStruct(objExpr, structName) {
+  instantiateStruct(objExpr, structName, canStackAllocate = false) {
     const structMeta = this.structRegistry.get(structName);
-    const byteSize = Math.max(structMeta.fields.length * 8, 8);
-    const heapSlot = this.builder.allocateHeap(byteSize);
+    let slot;
+    if (canStackAllocate) {
+      slot = this.builder.allocateStack(structMeta.mlirType);
+    } else {
+      const byteSize = structMeta.isUnion ? 8 : Math.max(structMeta.fields.length * 8, 8);
+      slot = this.builder.allocateHeap(byteSize);
+    }
 
     if (structMeta.isClass && structMeta.typeId) {
       const typeIdConst = this.builder.nextSSA();
       this.builder.emit(`${typeIdConst} = arith.constant ${structMeta.typeId} : i32`);
-      this.builder.emit(`llvm.store ${typeIdConst}, ${heapSlot.ptr} : i32, !llvm.ptr`);
+      this.builder.emit(`llvm.store ${typeIdConst}, ${slot.ptr} : i32, !llvm.ptr`);
+    }
+
+    if (structMeta.isUnion) {
+      if (objExpr.properties.length > 0) {
+        // C union standardı: İlk alan başlangıç değerini (active variant) belirler
+        const prop = objExpr.properties[0];
+        const fieldName = prop.key.name || prop.key.value;
+        const fieldMeta = structMeta.fields.find((f) => f.name === fieldName);
+        if (fieldMeta) {
+          let val = this.lowerExpression(prop.value);
+          val = this.coerceType(val, fieldMeta.type);
+          this.builder.store(slot.ptr, val);
+        }
+      }
+      return slot.ptr;
     }
 
     for (const prop of objExpr.properties) {
@@ -1839,16 +2744,25 @@ export class ASTLowering {
         throw new Error(`[Lowering] '${structName}' üzerinde '${fieldName}' alanı bulunamadı!`);
       }
       let val = this.lowerExpression(prop.value);
-      val = this.coerceType(val, fieldMeta.type);
+
+      if (fieldMeta.isFunction && (val.isFunction || val.type !== "!llvm.ptr")) {
+        const castSSA = this.builder.nextSSA();
+        this.builder.emit(
+          `${castSSA} = builtin.unrealized_conversion_cast ${val.ssa || val.ptr} : ${val.type} to !llvm.ptr`
+        );
+        val = { ssa: castSSA, ptr: castSSA, type: "!llvm.ptr" };
+      } else {
+        val = this.coerceType(val, fieldMeta.type);
+      }
 
       const fieldPtr = this.builder.nextSSA();
       this.builder.emit(
-        `${fieldPtr} = llvm.getelementptr ${heapSlot.ptr}[0, ${fieldMeta.index}] : (!llvm.ptr) -> !llvm.ptr, ${structMeta.mlirType}`
+        `${fieldPtr} = llvm.getelementptr ${slot.ptr}[0, ${fieldMeta.index}] : (!llvm.ptr) -> !llvm.ptr, ${structMeta.mlirType}`
       );
       this.builder.store(fieldPtr, val);
     }
 
-    return heapSlot.ptr;
+    return slot.ptr;
   }
 
   instantiateArray(arrExpr) {
@@ -1878,6 +2792,15 @@ export class ASTLowering {
 
   lowerExpression(expr) {
     if (!expr) return { ssa: "", type: "none" };
+
+    if (
+      expr.type === "ParenthesizedExpression" ||
+      expr.type === "TSAsExpression" ||
+      expr.type === "NonNullExpression" ||
+      expr.type === "TSSatisfiesExpression"
+    ) {
+      return this.lowerExpression(expr.expression);
+    }
 
     // --- ADIM 7: AWAIT İFADESİ (pthread_join) ---
     if (expr.type === "AwaitExpression") {
@@ -1942,29 +2865,33 @@ export class ASTLowering {
     }
 
     if (expr.type === "TemplateLiteral") {
-      let fmtStr = "";
-      const args = [];
+      let result = null;
 
       for (let i = 0; i < expr.quasis.length; i++) {
-        const quasi = expr.quasis[i];
-        fmtStr += quasi.value?.raw ?? quasi.value?.cooked ?? "";
+        const text = expr.quasis[i].value?.raw ?? expr.quasis[i].value?.cooked ?? "";
+        if (text.length > 0) {
+          const sym = this.builder.getOrRegisterString(text);
+          const ssa = this.builder.nextSSA();
+          this.builder.emit(`${ssa} = llvm.mlir.addressof ${sym} : !llvm.ptr`);
+          const textVal = { ssa, ptr: ssa, type: "!llvm.ptr", isString: true, isHeap: false };
+          result = result ? this.builder.createStringConcat(result, textVal) : textVal;
+        }
+
         if (i < expr.expressions.length) {
-          let arg = this.lowerExpression(expr.expressions[i]);
-          if (arg.isUnion) {
-            const ssa = this.builder.nextSSA();
-            this.builder.emit(`${ssa} = func.call @rts_union_to_string(${arg.ssa || arg.ptr}) : (!llvm.ptr) -> !llvm.ptr`);
-            arg = { ssa, ptr: ssa, type: "!llvm.ptr", isString: true, isHeap: true };
-          }
-          args.push(arg);
-          if (arg.isString) fmtStr += "%s";
-          else if (arg.type === "i64") fmtStr += "%ld";
-          else if (arg.type === "i32") fmtStr += "%d";
-          else if (arg.type === "i1") fmtStr += "%s";
-          else fmtStr += "%f";
+          let exprVal = this.lowerExpression(expr.expressions[i]);
+          exprVal = this.builder.convertToString(exprVal);
+          result = result ? this.builder.createStringConcat(result, exprVal) : exprVal;
         }
       }
 
-      return this.builder.createSprintf(fmtStr, args);
+      if (!result) {
+        const sym = this.builder.getOrRegisterString("");
+        const ssa = this.builder.nextSSA();
+        this.builder.emit(`${ssa} = llvm.mlir.addressof ${sym} : !llvm.ptr`);
+        return { ssa, ptr: ssa, type: "!llvm.ptr", isString: true, isHeap: false };
+      }
+
+      return result;
     }
 
     if (expr.type === "NumericLiteral" || (expr.type === "Literal" && typeof expr.value === "number")) {
@@ -1998,11 +2925,32 @@ export class ASTLowering {
       return this.lowerNewExpression(expr);
     }
 
+    if (expr.type === "UnaryExpression" && expr.operator === "!") {
+      let val = this.lowerExpression(expr.argument);
+      if (val.type === "!llvm.ptr") {
+        const nullPtr = this.builder.nextSSA();
+        this.builder.emit(`${nullPtr} = llvm.mlir.zero : !llvm.ptr`);
+        return this.builder.createComparison("==", val, { ssa: nullPtr, type: "!llvm.ptr" });
+      }
+      val = this.coerceType(val, "i1");
+      const trueConst = this.builder.createConstant(1, "i1");
+      const ssa = this.builder.nextSSA();
+      this.builder.emit(`${ssa} = arith.xori ${val.ssa}, ${trueConst.ssa} : i1`);
+      return { ssa, type: "i1" };
+    }
+
+    if (expr.type === "UnaryExpression" && expr.operator === "~") {
+      let val = this.lowerExpression(expr.argument);
+      val = this.coerceType(val, "i64");
+      return this.builder.createBitwiseNot(val);
+    }
+
     if (expr.type === "UnaryExpression" && expr.operator === "typeof") {
       const arg = expr.argument;
       if (arg.type === "Identifier") {
         const sym = this.symbolTable.get(arg.name);
         if (sym && sym.isUnion) {
+          this.builder.markFeature("union");
           const ssa = this.builder.nextSSA();
           this.builder.emit(`${ssa} = func.call @rts_union_typeof(${sym.ptr || sym.ssa}) : (!llvm.ptr) -> !llvm.ptr`);
           return { ssa, ptr: ssa, type: "!llvm.ptr", isString: true, isHeap: false };
@@ -2026,19 +2974,41 @@ export class ASTLowering {
       const op = isInc ? "+" : "-";
 
       if (expr.argument.type === "Identifier") {
-        const sym = this.symbolTable.get(expr.argument.name);
-        const oldVal = this.builder.load(sym.ptr, sym.type);
-        const step = oldVal.type === "i64" || oldVal.type === "i32" ? 1 : 1.0;
-        const one = this.builder.createConstant(step, oldVal.type);
-        const newVal = this.builder.createArithmetic(op, oldVal, one);
-        this.builder.store(sym.ptr, newVal);
-        return expr.prefix ? newVal : oldVal;
+        let ptr = null;
+        let type = null;
+        if (this.symbolTable.has(expr.argument.name)) {
+          const sym = this.symbolTable.get(expr.argument.name);
+          ptr = sym.ptr;
+          type = sym.type;
+        } else if (this.globals && this.globals.has(expr.argument.name)) {
+          const g = this.globals.get(expr.argument.name);
+          const addr = this.builder.nextSSA();
+          this.builder.emit(`${addr} = llvm.mlir.addressof ${g.globalSym} : !llvm.ptr`);
+          ptr = addr;
+          type = g.type;
+        }
+        if (ptr && type) {
+          const oldVal = this.builder.load(ptr, type);
+          const step = type === "i64" || type === "i32" ? 1 : 1.0;
+          const one = this.builder.createConstant(step, type);
+          const newVal = this.builder.createArithmetic(op, oldVal, one);
+          this.builder.store(ptr, newVal);
+          return expr.prefix ? newVal : oldVal;
+        }
       }
     }
 
     if (expr.type === "Identifier") {
       if (this.symbolTable.has(expr.name)) {
         const sym = this.symbolTable.get(expr.name);
+
+        // BORROW CHECKER: Taşınmış değer kullanımını derleme zamanında engelle
+        if (sym.isMoved) {
+          throw new Error(
+            `[BorrowChecker] Taşınmış değer kullanılamaz: '${expr.name}'! Sahiplik daha önce başka bir değişkene veya fonksiyona devredilmiş.`
+          );
+        }
+
         if (sym.isFunction) {
           return {
             ssa: sym.ssa,
@@ -2057,7 +3027,7 @@ export class ASTLowering {
             unionNode: sym.unionNode,
           };
         }
-        if (sym.structName || sym.isArray || sym.isMap || sym.isSet || sym.isPromise) {
+        if (sym.structName || sym.isArray || sym.isMap || sym.isSet || sym.isPromise || sym.isChannel || sym.isArena || sym.isPool || sym.isFixedBuffer) {
           return {
             ssa: sym.ptr,
             ptr: sym.ptr,
@@ -2067,6 +3037,10 @@ export class ASTLowering {
             isMap: sym.isMap,
             isSet: sym.isSet,
             isPromise: sym.isPromise,
+            isChannel: sym.isChannel,
+            isArena: sym.isArena,
+            isPool: sym.isPool,
+            isFixedBuffer: sym.isFixedBuffer,
             innerRetType: sym.innerRetType,
             valType: sym.valType,
             arrayLen: sym.arrayLen,
@@ -2075,6 +3049,15 @@ export class ASTLowering {
         }
         const loaded = this.builder.load(sym.ptr, sym.type);
         if (sym.isString) loaded.isString = true;
+        return loaded;
+      }
+
+      if (this.globals && this.globals.has(expr.name)) {
+        const g = this.globals.get(expr.name);
+        const addr = this.builder.nextSSA();
+        this.builder.emit(`${addr} = llvm.mlir.addressof ${g.globalSym} : !llvm.ptr`);
+        const loaded = this.builder.load(addr, g.type);
+        if (g.isString) loaded.isString = true;
         return loaded;
       }
 
@@ -2170,6 +3153,14 @@ export class ASTLowering {
           return { base, methodName: fieldName, isMethodRef: true, structName: base.structName };
         }
 
+        // Untagged Union: Tüm alanlar aynı bellek adresini (offset 0) paylaşır
+        if (structMeta.isUnion) {
+          const res = this.builder.load(base.ptr || base.ssa, fieldMeta.type);
+          if (fieldMeta.isString) res.isString = true;
+          if (fieldMeta.structName) res.structName = fieldMeta.structName;
+          return res;
+        }
+
         const fieldPtr = this.builder.nextSSA();
         this.builder.emit(
           `${fieldPtr} = llvm.getelementptr ${base.ptr || base.ssa}[0, ${fieldMeta.index}] : (!llvm.ptr) -> !llvm.ptr, ${structMeta.mlirType}`
@@ -2224,15 +3215,25 @@ export class ASTLowering {
           return rhs;
         }
       } else if (expr.left.type === "Identifier") {
-        const sym = this.symbolTable.get(expr.left.name);
-        if (sym.isUnion) {
-          this.boxIntoUnion(sym.ptr, rhs);
-          return { ssa: sym.ptr, ptr: sym.ptr, type: "!llvm.ptr", isUnion: true };
+        if (this.symbolTable.has(expr.left.name)) {
+          const sym = this.symbolTable.get(expr.left.name);
+          if (sym.isUnion) {
+            this.boxIntoUnion(sym.ptr, rhs);
+            return { ssa: sym.ptr, ptr: sym.ptr, type: "!llvm.ptr", isUnion: true };
+          }
+          rhs = this.coerceType(rhs, sym.type);
+          this.builder.store(sym.ptr, rhs);
+          if (rhs.isString) sym.isString = true;
+          return rhs;
+        } else if (this.globals && this.globals.has(expr.left.name)) {
+          const g = this.globals.get(expr.left.name);
+          const addr = this.builder.nextSSA();
+          this.builder.emit(`${addr} = llvm.mlir.addressof ${g.globalSym} : !llvm.ptr`);
+          rhs = this.coerceType(rhs, g.type);
+          this.builder.store(addr, rhs);
+          return rhs;
         }
-        rhs = this.coerceType(rhs, sym.type);
-        this.builder.store(sym.ptr, rhs);
-        if (rhs.isString) sym.isString = true;
-        return rhs;
+        throw new Error(`[Lowering] Atama yapılan tanımsız değişken: '${expr.left.name}'`);
       }
     }
 
@@ -2247,12 +3248,18 @@ export class ASTLowering {
       const rhs = this.lowerExpression(expr.right);
 
       if (expr.operator === "+" && (lhs.isString || rhs.isString)) {
-        const fmtL = lhs.isString ? "%s" : lhs.type === "i64" ? "%ld" : lhs.type === "i32" ? "%d" : "%f";
-        const fmtR = rhs.isString ? "%s" : rhs.type === "i64" ? "%ld" : rhs.type === "i32" ? "%d" : "%f";
-        return this.builder.createSprintf(`${fmtL}${fmtR}`, [lhs, rhs]);
+        const leftStr = this.builder.convertToString(lhs);
+        const rightStr = this.builder.convertToString(rhs);
+        return this.builder.createStringConcat(leftStr, rightStr);
       }
 
-      if (["+", "-", "*", "/", "%"].includes(expr.operator)) {
+      if (["+", "-", "*", "/", "%", "|", "&", "^", "<<", ">>", ">>>"].includes(expr.operator)) {
+        // Bitwise işlemleri tamsayı gerektirir (i64)
+        if (["|", "&", "^", "<<", ">>", ">>>"].includes(expr.operator)) {
+          const lInt = this.coerceType(lhs, "i64");
+          const rInt = this.coerceType(rhs, "i64");
+          return this.builder.createArithmetic(expr.operator, lInt, rInt);
+        }
         return this.builder.createArithmetic(expr.operator, lhs, rhs);
       }
       if (["<", "<=", ">", ">=", "==", "===", "!=", "!=="].includes(expr.operator)) {
@@ -2261,7 +3268,270 @@ export class ASTLowering {
     }
 
     if (expr.type === "CallExpression") {
+
+      // 0. Çıplak C Seviyesi malloc(bytes)
+      if (expr.callee.type === "Identifier" && expr.callee.name === "malloc") {
+        this.builder.markFeature("heap");
+        let szVal = this.lowerExpression(expr.arguments[0]);
+        szVal = this.coerceType(szVal, "i64");
+        const ssa = this.builder.nextSSA();
+        this.builder.emit(`${ssa} = llvm.call @malloc(${szVal.ssa}) : (i64) -> !llvm.ptr`);
+        return { ssa, ptr: ssa, type: "!llvm.ptr", isRef: true, isHeap: true };
+      }
+
+      // 0. Çıplak C Seviyesi free(ptr)
+      if (expr.callee.type === "Identifier" && expr.callee.name === "free") {
+        this.builder.markFeature("heap");
+        const ptrVal = this.lowerExpression(expr.arguments[0]);
+        this.builder.emit(`llvm.call @free(${ptrVal.ssa || ptrVal.ptr}) : (!llvm.ptr) -> ()`);
+        return { ssa: "", type: "none" };
+      }
+
+      // 0. Çıplak Stack Tahsisi alloca(bytes)
+      if (expr.callee.type === "Identifier" && expr.callee.name === "alloca") {
+        let szVal = this.lowerExpression(expr.arguments[0]);
+        szVal = this.coerceType(szVal, "i32");
+        const ssa = this.builder.nextSSA();
+        this.builder.emit(`${ssa} = llvm.alloca ${szVal.ssa} x i8 : (i32) -> !llvm.ptr`);
+        return { ssa, ptr: ssa, type: "!llvm.ptr", isRef: true, isStack: true };
+      }
+
+      // Yerleşik borrow(x) ifadesi
+      if (expr.callee.type === "Identifier" && expr.callee.name === "borrow") {
+        const val = this.lowerExpression(expr.arguments[0]);
+        val.isBorrowed = true;
+        return val;
+      }
+
+      // 1. Yerleşik panic(msg)
+      if (expr.callee.type === "Identifier" && expr.callee.name === "panic") {
+        this.builder.markFeature("exceptions");
+        const msgArg = expr.arguments?.[0];
+        const prefixSym = this.builder.getOrRegisterString("[PANIC] ");
+        const prefixSSA = this.builder.nextSSA();
+        this.builder.emit(`${prefixSSA} = llvm.mlir.addressof ${prefixSym} : !llvm.ptr`);
+        this.builder.printString(prefixSSA);
+
+        if (msgArg) {
+          const msgVal = this.lowerExpression(msgArg);
+          this.builder.printString(msgVal.ssa || msgVal.ptr);
+        }
+        this.builder.printNewline();
+        this.builder.emit(`llvm.call @abort() : () -> ()`);
+        return { ssa: "", type: "none" };
+      }
+
+      // 0. Yerleşik spawn(workerFn, arg?)
+      if (expr.callee.type === "Identifier" && expr.callee.name === "spawn") {
+        this.builder.markFeature("threads");
+        const fnArg = expr.arguments[0];
+        const targetFnName = fnArg.name;
+        const targetMeta = this.functionRegistry.get(targetFnName);
+        const runnerName = `__spawn_runner_${targetFnName}`;
+
+        this.spawnRunners.set(targetFnName, {
+          targetFnName,
+          runnerName,
+          targetMeta,
+        });
+
+        const c8 = this.builder.nextSSA();
+        this.builder.emit(`${c8} = llvm.mlir.constant(8 : i64) : i64`);
+        const thSlot = this.builder.nextSSA();
+        this.builder.emit(`${thSlot} = llvm.call @malloc(${c8}) : (i64) -> !llvm.ptr`);
+
+        const nullAttr = this.builder.nextSSA();
+        this.builder.emit(`${nullAttr} = llvm.mlir.zero : !llvm.ptr`);
+
+        let argSSA = nullAttr;
+        if (expr.arguments[1]) {
+          const customArg = this.lowerExpression(expr.arguments[1]);
+          argSSA = customArg.ssa || customArg.ptr;
+        }
+
+        const runnerAddr = this.builder.nextSSA();
+        this.builder.emit(`${runnerAddr} = func.constant @${runnerName} : (!llvm.ptr) -> !llvm.ptr`);
+
+        const createRes = this.builder.nextSSA();
+        this.builder.emit(
+          `${createRes} = func.call @pthread_create(${thSlot}, ${nullAttr}, ${runnerAddr}, ${argSSA}) : (!llvm.ptr, !llvm.ptr, (!llvm.ptr) -> !llvm.ptr, !llvm.ptr) -> i32`
+        );
+
+        return { ssa: thSlot, ptr: thSlot, type: "!llvm.ptr", isThread: true, isHeap: true };
+      }
+
+      // 0.1 Yerleşik join(threadHandle)
+      if (expr.callee.type === "Identifier" && expr.callee.name === "join") {
+        this.builder.markFeature("threads");
+        const thVal = this.lowerExpression(expr.arguments[0]);
+        const thId = this.builder.load(thVal.ptr || thVal.ssa, "i64");
+        const nullPtr = this.builder.nextSSA();
+        this.builder.emit(`${nullPtr} = llvm.mlir.zero : !llvm.ptr`);
+        const joinRes = this.builder.nextSSA();
+        this.builder.emit(
+          `${joinRes} = llvm.call @pthread_join(${thId.ssa}, ${nullPtr}) : (i64, !llvm.ptr) -> i32`
+        );
+        this.builder.emitFree(thVal.ptr || thVal.ssa);
+        return { ssa: "", type: "none" };
+      }
+
+      // 2. Yerleşik assert(condition, message)
+      if (expr.callee.type === "Identifier" && expr.callee.name === "assert") {
+        this.builder.markFeature("exceptions");
+        const condVal = this.coerceType(this.lowerExpression(expr.arguments[0]), "i1");
+        const passBlock = this.builder.nextBlock("assert_pass");
+        const failBlock = this.builder.nextBlock("assert_fail");
+
+        this.builder.emitBranchConditional(condVal.ssa, passBlock, failBlock);
+
+        this.builder.emitBlockLabel(failBlock);
+        const prefixSym = this.builder.getOrRegisterString("[ASSERTION FAILED] ");
+        const prefixSSA = this.builder.nextSSA();
+        this.builder.emit(`${prefixSSA} = llvm.mlir.addressof ${prefixSym} : !llvm.ptr`);
+        this.builder.printString(prefixSSA);
+
+        if (expr.arguments[1]) {
+          const msgVal = this.lowerExpression(expr.arguments[1]);
+          this.builder.printString(msgVal.ssa || msgVal.ptr);
+        }
+        this.builder.printNewline();
+        this.builder.emit(`llvm.call @abort() : () -> ()`);
+        this.builder.emitBranch(passBlock);
+
+        this.builder.emitBlockLabel(passBlock);
+        return { ssa: "", type: "none" };
+      }
+
+      // 3. Yerleşik Ok(value) Constructor'ı
+      if (expr.callee.type === "Identifier" && expr.callee.name === "Ok") {
+        const val = this.lowerExpression(expr.arguments[0]);
+        let sName = this.getCurrentFunctionStructRetName();
+        if (!sName || !sName.startsWith("Result_")) {
+          const valKey = val.isString ? "str" : val.type;
+          sName = `Result_${valKey}_str`;
+        }
+
+        const structMeta = this.structRegistry.get(sName);
+        if (!structMeta) {
+          throw new Error(`[Result] '${sName}' tipi bulunamadı!`);
+        }
+
+        const byteSize = Math.max(structMeta.fields.length * 8, 8);
+        const slot = this.builder.allocateHeap(byteSize);
+        // ok = true
+        const okConst = this.builder.createConstant(1, "i1");
+        const okPtr = this.builder.nextSSA();
+        this.builder.emit(`${okPtr} = llvm.getelementptr ${slot.ptr}[0, 0] : (!llvm.ptr) -> !llvm.ptr, ${structMeta.mlirType}`);
+        this.builder.store(okPtr, okConst);
+
+        // value = val
+        const valPtr = this.builder.nextSSA();
+        this.builder.emit(`${valPtr} = llvm.getelementptr ${slot.ptr}[0, 1] : (!llvm.ptr) -> !llvm.ptr, ${structMeta.mlirType}`);
+        const coercedVal = this.coerceType(val, structMeta.fields[1].type);
+        this.builder.store(valPtr, coercedVal);
+
+        // error = ""
+        const emptySym = this.builder.getOrRegisterString("");
+        const emptySSA = this.builder.nextSSA();
+        this.builder.emit(`${emptySSA} = llvm.mlir.addressof ${emptySym} : !llvm.ptr`);
+        const errPtr = this.builder.nextSSA();
+        this.builder.emit(`${errPtr} = llvm.getelementptr ${slot.ptr}[0, 2] : (!llvm.ptr) -> !llvm.ptr, ${structMeta.mlirType}`);
+        this.builder.store(errPtr, { ssa: emptySSA, type: "!llvm.ptr" });
+
+        return { ssa: slot.ptr, ptr: slot.ptr, type: "!llvm.ptr", structName: sName, isRef: true, isHeap: true };
+      }
+
+      // 4. Yerleşik Err(error) Constructor'ı
+      if (expr.callee.type === "Identifier" && expr.callee.name === "Err") {
+        const errVal = this.lowerExpression(expr.arguments[0]);
+        let sName = this.getCurrentFunctionStructRetName();
+        if (!sName || !sName.startsWith("Result_")) {
+          sName = `Result_f64_str`;
+        }
+
+        const structMeta = this.structRegistry.get(sName);
+        if (!structMeta) {
+          throw new Error(`[Result] '${sName}' tipi bulunamadı!`);
+        }
+
+        const byteSize = Math.max(structMeta.fields.length * 8, 8);
+        const slot = this.builder.allocateHeap(byteSize);
+        // ok = false
+        const okConst = this.builder.createConstant(0, "i1");
+        const okPtr = this.builder.nextSSA();
+        this.builder.emit(`${okPtr} = llvm.getelementptr ${slot.ptr}[0, 0] : (!llvm.ptr) -> !llvm.ptr, ${structMeta.mlirType}`);
+        this.builder.store(okPtr, okConst);
+
+        // value = 0
+        const zeroVal = this.builder.createConstant(0, structMeta.fields[1].type);
+        const valPtr = this.builder.nextSSA();
+        this.builder.emit(`${valPtr} = llvm.getelementptr ${slot.ptr}[0, 1] : (!llvm.ptr) -> !llvm.ptr, ${structMeta.mlirType}`);
+        this.builder.store(valPtr, zeroVal);
+
+        // error = errVal
+        const errPtr = this.builder.nextSSA();
+        this.builder.emit(`${errPtr} = llvm.getelementptr ${slot.ptr}[0, 2] : (!llvm.ptr) -> !llvm.ptr, ${structMeta.mlirType}`);
+        const coercedErr = this.coerceType(errVal, structMeta.fields[2].type);
+        this.builder.store(errPtr, coercedErr);
+
+        return { ssa: slot.ptr, ptr: slot.ptr, type: "!llvm.ptr", structName: sName, isRef: true, isHeap: true };
+      }
+
+      // 5. Yerleşik unwrap(result) İfadesi
+      if (expr.callee.type === "Identifier" && expr.callee.name === "unwrap") {
+        this.builder.markFeature("exceptions");
+        const resObj = this.lowerExpression(expr.arguments[0]);
+        const structMeta = this.structRegistry.get(resObj.structName);
+        if (!structMeta || structMeta.fields.length < 3) {
+          throw new Error(`[Result] unwrap() sadece Result struct'ları üzerinde çalışabilir!`);
+        }
+
+        const valType = structMeta.fields[1].type;
+        const valSlot = this.builder.allocateStack(valType);
+
+        // ok alanını oku
+        const okPtr = this.builder.nextSSA();
+        this.builder.emit(`${okPtr} = llvm.getelementptr ${resObj.ptr || resObj.ssa}[0, 0] : (!llvm.ptr) -> !llvm.ptr, ${structMeta.mlirType}`);
+        const okVal = this.builder.load(okPtr, "i1");
+
+        const okBlock = this.builder.nextBlock("unwrap_ok");
+        const errBlock = this.builder.nextBlock("unwrap_err");
+        const contBlock = this.builder.nextBlock("unwrap_cont");
+
+        this.builder.emitBranchConditional(okVal.ssa, okBlock, errBlock);
+
+        // --- HATA DURUMU: Panic ve Abort ---
+        this.builder.emitBlockLabel(errBlock);
+        const errPrefixSym = this.builder.getOrRegisterString("[PANIC] unwrap failed: ");
+        const errPrefixSSA = this.builder.nextSSA();
+        this.builder.emit(`${errPrefixSSA} = llvm.mlir.addressof ${errPrefixSym} : !llvm.ptr`);
+        this.builder.printString(errPrefixSSA);
+
+        const errPtr = this.builder.nextSSA();
+        this.builder.emit(`${errPtr} = llvm.getelementptr ${resObj.ptr || resObj.ssa}[0, 2] : (!llvm.ptr) -> !llvm.ptr, ${structMeta.mlirType}`);
+        const errLoaded = this.builder.load(errPtr, "!llvm.ptr");
+        this.builder.printString(errLoaded.ssa);
+        this.builder.printNewline();
+        this.builder.emit(`llvm.call @abort() : () -> ()`);
+        this.builder.emitBranch(contBlock);
+
+        // --- BAŞARI DURUMU: Değeri al ---
+        this.builder.emitBlockLabel(okBlock);
+        const valPtr = this.builder.nextSSA();
+        this.builder.emit(`${valPtr} = llvm.getelementptr ${resObj.ptr || resObj.ssa}[0, 1] : (!llvm.ptr) -> !llvm.ptr, ${structMeta.mlirType}`);
+        const loadedVal = this.builder.load(valPtr, valType);
+        this.builder.store(valSlot.ptr, loadedVal);
+        this.builder.emitBranch(contBlock);
+
+        // --- DEVAM BLOĞU ---
+        this.builder.emitBlockLabel(contBlock);
+        const finalVal = this.builder.load(valSlot.ptr, valType);
+        if (structMeta.fields[1].isString) finalVal.isString = true;
+        return finalVal;
+      }
+
       if (expr.callee.type === "Identifier" && expr.callee.name === "sleep") {
+        this.builder.markFeature("sleep");
         const msVal = this.lowerExpression(expr.arguments[0]);
         const msI32 = this.coerceType(msVal, "i32");
         const c1000 = this.builder.createConstant(1000, "i32");
@@ -2349,6 +3619,92 @@ export class ASTLowering {
         const base = this.lowerExpression(expr.callee.object);
         const methodName = expr.callee.property.name || expr.callee.property.value;
 
+        if (base.isArena) {
+          this.builder.markFeature("allocators");
+          if (methodName === "alloc") {
+            let szVal = this.lowerExpression(expr.arguments[0]);
+            szVal = this.coerceType(szVal, "i64");
+            const ssa = this.builder.nextSSA();
+            this.builder.emit(
+              `${ssa} = func.call @rts_arena_alloc(${base.ptr || base.ssa}, ${szVal.ssa}) : (!llvm.ptr, i64) -> !llvm.ptr`
+            );
+            return { ssa, ptr: ssa, type: "!llvm.ptr", isRef: true };
+          } else if (methodName === "reset") {
+            this.builder.emit(
+              `func.call @rts_arena_reset(${base.ptr || base.ssa}) : (!llvm.ptr) -> ()`
+            );
+            return { ssa: "", type: "none" };
+          } else if (methodName === "dispose" || methodName === "destroy") {
+            this.builder.emit(
+              `func.call @rts_arena_destroy(${base.ptr || base.ssa}) : (!llvm.ptr) -> ()`
+            );
+            return { ssa: "", type: "none" };
+          }
+        }
+
+        if (base.isPool) {
+          this.builder.markFeature("allocators");
+          if (methodName === "alloc") {
+            const ssa = this.builder.nextSSA();
+            this.builder.emit(
+              `${ssa} = func.call @rts_pool_alloc(${base.ptr || base.ssa}) : (!llvm.ptr) -> !llvm.ptr`
+            );
+            return { ssa, ptr: ssa, type: "!llvm.ptr", isRef: true };
+          } else if (methodName === "free") {
+            const chunkVal = this.lowerExpression(expr.arguments[0]);
+            this.builder.emit(
+              `func.call @rts_pool_free(${base.ptr || base.ssa}, ${chunkVal.ssa || chunkVal.ptr}) : (!llvm.ptr, !llvm.ptr) -> ()`
+            );
+            return { ssa: "", type: "none" };
+          } else if (methodName === "dispose" || methodName === "destroy") {
+            this.builder.emit(
+              `func.call @rts_pool_destroy(${base.ptr || base.ssa}) : (!llvm.ptr) -> ()`
+            );
+            return { ssa: "", type: "none" };
+          }
+        }
+
+        if (base.isFixedBuffer) {
+          this.builder.markFeature("allocators");
+          if (methodName === "alloc") {
+            let szVal = this.lowerExpression(expr.arguments[0]);
+            szVal = this.coerceType(szVal, "i64");
+            const ssa = this.builder.nextSSA();
+            this.builder.emit(
+              `${ssa} = func.call @rts_fixed_buffer_alloc(${base.ptr || base.ssa}, ${szVal.ssa}) : (!llvm.ptr, i64) -> !llvm.ptr`
+            );
+            return { ssa, ptr: ssa, type: "!llvm.ptr", isRef: true };
+          } else if (methodName === "reset") {
+            this.builder.emit(
+              `func.call @rts_fixed_buffer_reset(${base.ptr || base.ssa}) : (!llvm.ptr) -> ()`
+            );
+            return { ssa: "", type: "none" };
+          } else if (methodName === "dispose" || methodName === "destroy") {
+            this.builder.emit(
+              `func.call @rts_fixed_buffer_destroy(${base.ptr || base.ssa}) : (!llvm.ptr) -> ()`
+            );
+            return { ssa: "", type: "none" };
+          }
+        }
+
+        if (base.isChannel) {
+          this.builder.markFeature("channels");
+          if (methodName === "send") {
+            let val = this.lowerExpression(expr.arguments[0]);
+            val = this.coerceType(val, "f64");
+            this.builder.emit(
+              `func.call @rts_chan_send_f64(${base.ptr || base.ssa}, ${val.ssa}) : (!llvm.ptr, f64) -> ()`
+            );
+            return { ssa: "", type: "none" };
+          } else if (methodName === "recv") {
+            const ssa = this.builder.nextSSA();
+            this.builder.emit(
+              `${ssa} = func.call @rts_chan_recv_f64(${base.ptr || base.ssa}) : (!llvm.ptr) -> f64`
+            );
+            return { ssa, type: "f64" };
+          }
+        }
+
         if (base.isMap) {
           if (methodName === "set") {
             const key = this.lowerExpression(expr.arguments[0]);
@@ -2393,7 +3749,42 @@ export class ASTLowering {
         }
 
         if (base.structName) {
-          let curr = this.structRegistry.get(base.structName);
+          const structMeta = this.structRegistry.get(base.structName);
+          const fieldMeta = structMeta?.fields.find((f) => f.name === methodName);
+
+          // 1. Durum: Struct içinde saklanan bir Fonksiyon Göstericisi (Function Pointer)
+          if (fieldMeta && fieldMeta.isFunction && fieldMeta.fnSig) {
+            const fnSig = fieldMeta.fnSig;
+            const fieldPtr = this.builder.nextSSA();
+            this.builder.emit(
+              `${fieldPtr} = llvm.getelementptr ${base.ptr || base.ssa}[0, ${fieldMeta.index}] : (!llvm.ptr) -> !llvm.ptr, ${structMeta.mlirType}`
+            );
+            const loadedPtr = this.builder.load(fieldPtr, "!llvm.ptr");
+            const fnValSSA = this.builder.nextSSA();
+            this.builder.emit(
+              `${fnValSSA} = builtin.unrealized_conversion_cast ${loadedPtr.ssa} : !llvm.ptr to ${fnSig.mlirType}`
+            );
+
+            const args = expr.arguments ? expr.arguments.map((a, i) => {
+              let val = this.lowerExpression(a);
+              const targetPType = fnSig.paramTypes?.[i];
+              if (targetPType) val = this.coerceType(val, targetPType);
+              return val;
+            }) : [];
+
+            const argSSAs = args.map((a) => a.ssa || a.ptr).join(", ");
+            if (fnSig.retType === "none") {
+              this.builder.emit(`func.call_indirect ${fnValSSA}(${argSSAs}) : ${fnSig.mlirType}`);
+              return { ssa: "", ptr: "", type: "none" };
+            } else {
+              const ssa = this.builder.nextSSA();
+              this.builder.emit(`${ssa} = func.call_indirect ${fnValSSA}(${argSSAs}) : ${fnSig.mlirType}`);
+              return { ssa, ptr: ssa, type: fnSig.retType };
+            }
+          }
+
+          // 2. Durum: Standart Sınıf Metodu (Method Call)
+          let curr = structMeta;
           let methodMeta = null;
           let declaringClass = base.structName;
 
@@ -2411,7 +3802,7 @@ export class ASTLowering {
           }
 
           if (!methodMeta) {
-            throw new Error(`[Lowering] '${base.structName}' sınıfında '${methodName}' metodu bulunamadı!`);
+            throw new Error(`[Lowering] '${base.structName}' üzerinde '${methodName}' metodu veya fonksiyon alanı bulunamadı!`);
           }
 
           const vcallName = `${declaringClass}_vcall_${methodName}`;
@@ -2489,7 +3880,14 @@ export class ASTLowering {
       const fnMeta = this.functionRegistry.get(funcName);
 
       const args = expr.arguments ? expr.arguments.map((a, i) => {
-        let val = this.lowerExpression(a);
+        const isBorrowCall = a.type === "CallExpression" && a.callee?.name === "borrow";
+        const actualArgNode = isBorrowCall ? a.arguments[0] : a;
+
+        let val = this.lowerExpression(actualArgNode);
+        if (isBorrowCall) {
+          val.isBorrowed = true;
+        }
+
         const paramMeta = fnMeta?.params?.[i];
         if (paramMeta?.isUnion && !val.isUnion) {
           const uSlot = this.builder.allocateStack("!llvm.struct<(i32, i64)>");
@@ -2502,6 +3900,16 @@ export class ASTLowering {
         if (paramMeta && !val.isFunction) {
           val = this.coerceType(val, paramMeta.type);
         }
+
+        // MOVE SEMANTICS: Fonksiyona değer olarak aktarılan heap nesnesi taşınır
+        if (!isBorrowCall && actualArgNode.type === "Identifier") {
+          const sym = this.symbolTable.get(actualArgNode.name);
+          if (sym && (sym.isHeap || sym.structName || sym.isChannel)) {
+            sym.isMoved = true;
+            this.markTransferred(sym.ptr || sym.ssa);
+          }
+        }
+
         return val;
       }) : [];
 
@@ -2509,12 +3917,15 @@ export class ASTLowering {
       const typeStr = args.map((a) => a.type).join(", ");
       const retType = fnMeta?.retType || "f64";
 
+      const targetMeta = this.functionRegistry.get(funcName);
+      const callSymbol = targetMeta?.exportAlias || funcName;
+
       if (retType === "none") {
-        this.builder.emit(`func.call @${funcName}(${argStr}) : (${typeStr}) -> ()`);
+        this.builder.emit(`func.call @${callSymbol}(${argStr}) : (${typeStr}) -> ()`);
         return { ssa: "", ptr: "", type: "none" };
       } else {
         const ssa = this.builder.nextSSA();
-        this.builder.emit(`${ssa} = func.call @${funcName}(${argStr}) : (${typeStr}) -> ${retType}`);
+        this.builder.emit(`${ssa} = func.call @${callSymbol}(${argStr}) : (${typeStr}) -> ${retType}`);
         return {
           ssa,
           ptr: ssa,
@@ -2529,5 +3940,220 @@ export class ASTLowering {
     }
 
     throw new Error(`[Lowering] Desteklenmeyen ifade: ${expr.type}`);
+  }
+
+  mlirTypeToCType(mlirType, isString = false) {
+    if (isString) return "const char*";
+    if (mlirType === "f64") return "double";
+    if (mlirType === "f32") return "float";
+    if (mlirType === "i64") return "int64_t";
+    if (mlirType === "i32") return "int32_t";
+    if (mlirType === "i1") return "bool";
+    if (mlirType === "!llvm.ptr") return "void*";
+    if (mlirType === "none" || !mlirType) return "void";
+    return "void*";
+  }
+
+  generateCHeader(headerGuard = "RYPESCRIPT_H") {
+    const lines = [
+      `#ifndef ${headerGuard}`,
+      `#define ${headerGuard}`,
+      "",
+      "#include <stdint.h>",
+      "#include <stdbool.h>",
+      "",
+      "#ifdef __cplusplus",
+      'extern "C" {',
+      "#endif",
+      "",
+    ];
+
+    // 1. Tagged Union Kullanıldıysa C Tanımı
+    if (this.builder.usedFeatures.union) {
+      lines.push(
+        "typedef struct {",
+        "    int32_t tag;",
+        "    union {",
+        "        int64_t i64_val;",
+        "        double f64_val;",
+        "        const char* str_val;",
+        "        bool bool_val;",
+        "    } payload;",
+        "} RtsTaggedUnion;",
+        ""
+      );
+    }
+
+    // 2. C-Style Struct & Untagged Union Tanımları
+    for (const [name, meta] of this.structRegistry.entries()) {
+      const keyword = meta.isUnion ? "union" : "struct";
+      const packPrefix = meta.isPacked ? "__attribute__((packed)) " : "";
+      lines.push(`typedef ${packPrefix}${keyword} {`);
+      for (const f of meta.fields) {
+        if (f.name === "__type_id") continue;
+        if (f.isFunction && f.fnSig) {
+          const fnRet = this.mlirTypeToCType(f.fnSig.retType);
+          const fnArgs = f.fnSig.paramTypes.map((t) => this.mlirTypeToCType(t)).join(", ") || "void";
+          lines.push(`    ${fnRet} (*${f.name})(${fnArgs});`);
+        } else {
+          const cType = f.enumName || this.mlirTypeToCType(f.type, f.isString);
+          lines.push(`    ${cType} ${f.name};`);
+        }
+      }
+      lines.push(`} ${name};`, "");
+    }
+
+    // 3. C-Style Enum & Bitflags Tanımları
+    for (const [name, meta] of this.enumRegistry.entries()) {
+      if (meta.kind === "numeric") {
+        lines.push(`typedef enum {`);
+        const entries = [];
+        for (const [mName, mVal] of meta.members.entries()) {
+          if (!mVal.isString) {
+            entries.push(`    ${name}_${mName} = ${mVal.value}`);
+          }
+        }
+        lines.push(entries.join(",\n"));
+        lines.push(`} ${name};`, "");
+      }
+    }
+
+    for (const fnName of this.exportedFunctionNames) {
+      // Doğrudan veya exportName takma adıyla eşleşen fonksiyon meta-verisini bul
+      let meta = this.functionRegistry.get(fnName);
+      if (!meta) {
+        for (const [origName, m] of this.functionRegistry.entries()) {
+          if (m.exportAlias === fnName) {
+            meta = m;
+            break;
+          }
+        }
+      }
+      if (!meta) continue;
+
+      const cRet = meta.enumRetName || meta.structRetName || this.mlirTypeToCType(meta.retType, meta.isRetString);
+      const cParams = (meta.params || []).map((p) => {
+        if (p.isFunction && p.fnSig) {
+          const fnRet = this.mlirTypeToCType(p.fnSig.retType);
+          const fnArgs = p.fnSig.paramTypes.map((t) => this.mlirTypeToCType(t)).join(", ") || "void";
+          return `${fnRet} (*${p.name})(${fnArgs})`;
+        }
+        const cType = p.enumName || p.structName || this.mlirTypeToCType(p.type, p.isString);
+        return `${cType} ${p.name}`;
+      });
+
+      const paramStr = cParams.length > 0 ? cParams.join(", ") : "void";
+      lines.push(`${cRet} ${fnName}(${paramStr});`);
+    }
+
+    lines.push(
+      "",
+      "#ifdef __cplusplus",
+      "}",
+      "#endif",
+      "",
+      `#endif // ${headerGuard}`,
+      ""
+    );
+
+    return lines.join("\n");
+  }
+
+  // --- C HEADER PARSER (C Başlık Dosyası Ayrıştırıcı) ---
+  cTypeToMlir(cType) {
+    const clean = cType.replace(/\s+/g, " ").trim();
+    if (clean.includes("*")) return "!llvm.ptr";
+    switch (clean) {
+      case "double": return "f64";
+      case "float": return "f32";
+      case "int":
+      case "int32_t":
+      case "uint32_t":
+      case "short":
+        return "i32";
+      case "int64_t":
+      case "uint64_t":
+      case "long":
+      case "long long":
+      case "size_t":
+        return "i64";
+      case "bool":
+      case "_Bool":
+        return "i1";
+      case "void":
+        return "none";
+      default:
+        return "f64";
+    }
+  }
+
+  loadCHeader(headerFilePath) {
+    if (!fs.existsSync(headerFilePath)) {
+      throw new Error(`[CHeaderParser] Başlık dosyası bulunamadı: ${headerFilePath}`);
+    }
+
+    let content = fs.readFileSync(headerFilePath, "utf8");
+
+    // Yorum satırlarını temizle (// ve /* ... */)
+    content = content.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*/g, "");
+    // Preprocessor (#include, #ifndef vb.) ve extern "C" satırlarını temizle
+    content = content
+      .split("\n")
+      .filter((line) => !line.trim().startsWith("#"))
+      .join("\n")
+      .replace(/extern\s+"C"\s*\{?/g, "")
+      .replace(/\}/g, "");
+
+    // C Fonksiyon Prototiplerini Yakala: return_type func_name(param1, param2, ...);
+    const protoRegex = /([a-zA-Z0-9_*]+(?:\s+[a-zA-Z0-9_*]+)*)\s+([a-zA-Z0-9_]+)\s*\(([^)]*)\)\s*;/g;
+    let match;
+
+    while ((match = protoRegex.exec(content)) !== null) {
+      const rawRet = match[1].trim();
+      const funcName = match[2].trim();
+      const rawParamsStr = match[3].trim();
+
+      if (["typedef", "return", "if", "while"].includes(rawRet)) continue;
+
+      const retType = this.cTypeToMlir(rawRet);
+      const isRetString = rawRet.includes("char*");
+
+      const params = [];
+      const paramTypes = [];
+
+      if (rawParamsStr && rawParamsStr !== "void") {
+        const rawParamList = rawParamsStr.split(",");
+        rawParamList.forEach((p, idx) => {
+          const trimmed = p.trim();
+          if (!trimmed) return;
+          const parts = trimmed.split(/\s+/);
+          const pName = parts[parts.length - 1].replace(/^\*+/, "") || `arg_${idx}`;
+          const pTypeStr = trimmed.slice(0, trimmed.lastIndexOf(pName)).trim() || parts[0];
+          const mlirType = this.cTypeToMlir(pTypeStr);
+          const isString = pTypeStr.includes("char*");
+
+          params.push({ name: pName, type: mlirType, isString });
+          paramTypes.push(mlirType);
+        });
+      }
+
+      const mlirType = `(${paramTypes.join(", ")}) -> ${retType === "none" ? "()" : retType}`;
+      const declSig = retType === "none" ? `(${paramTypes.join(", ")})` : `(${paramTypes.join(", ")}) -> ${retType}`;
+
+      this.functionRegistry.set(funcName, {
+        isAsync: false,
+        isDeclare: true,
+        innerRetType: retType,
+        retType,
+        structRetName: null,
+        isRetString,
+        params,
+        paramTypes,
+        mlirType,
+        declSig,
+      });
+
+      this.builder.declareExternalFunction(funcName, declSig);
+    }
   }
 }

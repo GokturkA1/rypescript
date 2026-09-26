@@ -1,6 +1,7 @@
 // compiler-engine.js
 import { dlopen, getRawPointer, suffix } from "node:ffi";
 import { existsSync, unlinkSync, readFileSync } from "node:fs";
+import path from "node:path";
 
 const libMLIR = existsSync("/usr/local/lib/libMLIR-C.so")
   ? "/usr/local/lib/libMLIR-C.so"
@@ -239,9 +240,15 @@ export class CompilerEngine {
 
     const emptyBuf = Buffer.from("\0", "utf8");
     const cpuBuf = Buffer.from("generic\0", "utf8");
-    const tm = llvm.LLVMCreateTargetMachine(target, tripleBuf, cpuBuf, emptyBuf, 3, 2, 0);
+    // RelocMode: 2 (LLVMRelocPIC) - Paylaşımlı kütüphaneler (.so) ve PIE için zorunludur
+    const relocMode = (format === "elf" || format === "so") ? 2 : 0;
+    const tm = llvm.LLVMCreateTargetMachine(target, tripleBuf, cpuBuf, emptyBuf, 2, 2, 0);
 
-    const objFile = `.temp_${Date.now()}.o`;
+    // Tipik derleyici davranışı: .o dosyası çıktı adına göre belirlenir ve kalıcıdır
+    const outExt = path.extname(outputFile);
+    const objFile = outExt && outExt !== ".o"
+      ? outputFile.slice(0, -outExt.length) + ".o"
+      : (outExt === ".o" ? outputFile : `${outputFile}.o`);
     const objFileBuf = Buffer.from(objFile + "\0", "utf8");
 
     // LLVMCodeGenFileType: 1 = LLVMObjectFile (.o)
@@ -261,17 +268,46 @@ export class CompilerEngine {
         const crti = `${crtDir}/crti.o`;
         const crtn = `${crtDir}/crtn.o`;
 
+        const nativeArgs = [];
+        if (options.nativeLibs && options.nativeLibs.length > 0) {
+          for (const libPath of options.nativeLibs) {
+            const libDir = path.dirname(libPath);
+            nativeArgs.push(`-L${libDir}`);
+            nativeArgs.push(`-rpath=${libDir}`);
+            nativeArgs.push(libPath);
+          }
+        }
+
         linkerArgs = [
           "-pie",
           "-dynamic-linker", "/lib64/ld-linux-x86-64.so.2",
           crt1,
           crti,
           objFile,
+          ...nativeArgs,
           `-L${crtDir}`,
           "-lc",
           "-lm",
           "-lpthread",
           crtn,
+          "-o", outputFile,
+        ];
+      } else if (format === "so") {
+        const searchDirs = [
+          "/usr/lib",
+          "/usr/lib64",
+          "/usr/lib/x86_64-linux-gnu",
+          "/lib/x86_64-linux-gnu",
+          "/lib64",
+          "/lib",
+        ].filter((d) => existsSync(d));
+
+        linkerArgs = [
+          "-shared",
+          objFile,
+          ...searchDirs.map((d) => `-L${d}`),
+          "-lc",
+          "-lm",
           "-o", outputFile,
         ];
       } else if (format === "coff") {
@@ -284,8 +320,7 @@ export class CompilerEngine {
           "-o", outputFile,
           "--no-entry",
           "--export-all",
-          "--allow-undefined",
-          "--import-memory"
+          "--allow-undefined"
         ];
       } else if (format === "mingw") {
         linkerArgs = ["-o", outputFile, objFile, "-lkernel32", "-lmsvcrt"];
@@ -303,7 +338,7 @@ export class CompilerEngine {
       }
 
       let linkOk = false;
-      if (format === "elf") linkOk = bridge.link_elf(linkerArgs.length, argvBuf);
+      if (format === "elf" || format === "so") linkOk = bridge.link_elf(linkerArgs.length, argvBuf);
       else if (format === "coff") linkOk = bridge.link_coff(linkerArgs.length, argvBuf);
       else if (format === "macho") linkOk = bridge.link_macho(linkerArgs.length, argvBuf);
       else if (format === "wasm") linkOk = bridge.link_wasm(linkerArgs.length, argvBuf);
@@ -312,10 +347,8 @@ export class CompilerEngine {
       if (!linkOk) {
         throw new Error(`[Engine] In-Process LLD (${format}) linkleme hatası!`);
       }
+      console.log(`  -> [Nesne Dosyası] ${objFile} saklandı.`);
     } finally {
-      if (existsSync(objFile)) {
-        unlinkSync(objFile);
-      }
       llvm.LLVMDisposeTargetMachine(tm);
       llvm.LLVMDisposeModule(llvmMod);
       llvm.LLVMContextDispose(llvmCtx);
