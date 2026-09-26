@@ -6,23 +6,60 @@ import { SemanticAnalyzer } from "./src/semantics/SemanticAnalyzer.js";
 import { MLIRBuilder } from "./src/ir/MLIRBuilder.js";
 import { ASTLowering } from "./src/ir/ASTLowerer.js";
 import { CompilerEngine } from "./src/engine/CompilerEngine.js";
+import { TargetManager } from "./src/engine/TargetManager.js";
 import { DiagnosticReporter } from "./diagnostics.js";
 
 const args = process.argv.slice(2);
-const inputFile = args.find((a) => !a.startsWith("-"));
+
+let inputFile = null;
+let outputFile = "app_native";
+let rawTarget = null;
+let rawFormat = null;
+let dumpMLIR = false;
+let dumpLLVM = false;
+let isJIT = false;
+let explicitHeaderFile = null;
+let genHeader = false;
+
+for (let i = 0; i < args.length; i++) {
+  const arg = args[i];
+  if (arg === "-o" && i + 1 < args.length) {
+    outputFile = args[++i];
+  } else if ((arg === "--target" || arg === "-t") && i + 1 < args.length) {
+    rawTarget = args[++i];
+  } else if ((arg === "--format" || arg === "-f") && i + 1 < args.length) {
+    rawFormat = args[++i];
+  } else if (arg === "--dump-mlir") {
+    dumpMLIR = true;
+  } else if (arg === "--dump-llvm") {
+    dumpLLVM = true;
+  } else if (arg === "--jit") {
+    isJIT = true;
+  } else if (arg === "--header") {
+    genHeader = true;
+    if (i + 1 < args.length && !args[i + 1].startsWith("-")) {
+      explicitHeaderFile = args[++i];
+    }
+  } else if (!arg.startsWith("-") && !inputFile) {
+    inputFile = arg;
+  }
+}
+
 if (!inputFile || !fs.existsSync(inputFile)) {
-  console.log("Kullanım: node index.js <giris_dosyasi.ts> [-o <cikti>] [--dump-mlir] [--dump-llvm]");
+  console.log("Kullanım: node index.js <giris_dosyasi.ts> [-o <cikti>] [--target <triple>] [--format <format>] [--dump-mlir] [--dump-llvm] [--jit] [--header]");
   process.exit(1);
 }
 
-const outputFile = args.includes("-o") ? args[args.indexOf("-o") + 1] : "app_native";
-const dumpMLIR = args.includes("--dump-mlir");
-const dumpLLVM = args.includes("--dump-llvm");
-const isJIT = args.includes("--jit");
-const formatIdx = args.indexOf("--format");
-const targetFormat = formatIdx !== -1 ? args[formatIdx + 1] : "elf";
+// Target ve Cross-Compilation Bilgisini Çöz
+const targetInfo = TargetManager.resolve({
+  target: rawTarget,
+  format: rawFormat,
+  outputFile,
+  jit: isJIT,
+});
 
 console.log(`[RTS] Giriş noktası: ${inputFile}`);
+console.log(`[RTS] Hedef Triplet: ${targetInfo.triple} [Format: ${targetInfo.format}, Linker: ${targetInfo.linkerFlavor}]`);
 
 // 1. Modül Bağımlılık Grafı Çözücü (DFS / Topological Sort)
 const { modules, nativeLibs, headerFiles } = ModuleResolver.resolve(inputFile);
@@ -46,7 +83,7 @@ if (reporter.hasErrors()) {
 }
 
 // 2. Lowering: C Başlıkları + Çoklu AST -> Tek MLIR Modülü
-const builder = new MLIRBuilder();
+const builder = new MLIRBuilder(targetInfo);
 const lowerer = new ASTLowering(builder);
 
 // C Header'larını yükle
@@ -55,25 +92,22 @@ for (const h of headerFiles) {
 }
 
 lowerer.lowerModules(modules);
-const mlirModule = builder.buildFullModule({ format: targetFormat });
+const mlirModule = builder.buildFullModule({ targetInfo });
 
 if (dumpMLIR) {
   console.log("\n=== Üretilen MLIR ===\n" + mlirModule);
 }
 
-// 3. Backend Motoru: MLIR -> LLVM -> Native Executable / JIT
-CompilerEngine.compile(mlirModule, outputFile, { dumpLLVM, jit: isJIT, format: targetFormat, nativeLibs });
+// 3. Backend Motoru: MLIR -> LLVM -> Native Executable / Cross Binary / JIT
+CompilerEngine.compile(mlirModule, outputFile, { dumpLLVM, jit: isJIT, targetInfo, nativeLibs });
 if (!isJIT) {
-  console.log(`✓ Başarılı: ./${outputFile} [Format: ${targetFormat}]`);
+  console.log(`✓ Başarılı: ./${outputFile} [Format: ${targetInfo.format}, Hedef: ${targetInfo.triple}]`);
 
-  // C Header Üretimi (--header bayrağı verildiğinde veya hedef .so olduğunda)
-  const headerIdx = args.indexOf("--header");
-  const shouldGenHeader = headerIdx !== -1 || targetFormat === "so";
+  // C Header Üretimi (--header bayrağı verildiğinde veya hedef .so/.dll olduğunda)
+  const shouldGenHeader = genHeader || targetInfo.isShared;
   if (shouldGenHeader) {
-    let headerFile;
-    if (headerIdx !== -1 && args[headerIdx + 1] && !args[headerIdx + 1].startsWith("-")) {
-      headerFile = args[headerIdx + 1];
-    } else {
+    let headerFile = explicitHeaderFile;
+    if (!headerFile) {
       const outExt = path.extname(outputFile);
       const base = outExt ? outputFile.slice(0, -outExt.length) : outputFile;
       headerFile = `${base}.h`;

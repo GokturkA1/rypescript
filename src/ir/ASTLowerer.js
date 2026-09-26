@@ -3656,13 +3656,9 @@ export class ASTLowerer {
       }
 
       if (expr.callee.type === "Identifier" && expr.callee.name === "sleep") {
-        this.builder.markFeature("sleep");
         const msVal = this.lowerExpression(expr.arguments[0]);
         const msI32 = this.coerceType(msVal, "i32");
-        const c1000 = this.builder.createConstant(1000, "i32");
-        const usec = this.builder.createArithmetic("*", msI32, c1000);
-        const sleepRes = this.builder.nextSSA();
-        this.builder.emit(`${sleepRes} = llvm.call @usleep(${usec.ssa}) : (i32) -> i32`);
+        this.builder.emitSleep(msI32);
         return { ssa: "", type: "none" };
       }
 

@@ -4,6 +4,8 @@ import { existsSync, unlinkSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { TargetManager } from "./TargetManager.js";
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, "../../");
 
@@ -50,15 +52,26 @@ const { functions: llvm } = dlopen(libLLVM, {
   LLVMPrintModuleToFile: { arguments: ["pointer", "pointer", "pointer"], return: "int32" },
   LLVMDisposeModule: { arguments: ["pointer"], return: "void" },
 
-  // Target & TargetMachine API (X86 + WebAssembly)
+  // Target & TargetMachine API (X86 + WebAssembly + AArch64 + ARM + RISCV)
   LLVMInitializeX86TargetInfo: { arguments: [], return: "void" },
   LLVMInitializeX86Target: { arguments: [], return: "void" },
   LLVMInitializeX86TargetMC: { arguments: [], return: "void" },
   LLVMInitializeX86AsmPrinter: { arguments: [], return: "void" },
+
   LLVMInitializeWebAssemblyTargetInfo: { arguments: [], return: "void" },
   LLVMInitializeWebAssemblyTarget: { arguments: [], return: "void" },
   LLVMInitializeWebAssemblyTargetMC: { arguments: [], return: "void" },
   LLVMInitializeWebAssemblyAsmPrinter: { arguments: [], return: "void" },
+
+  LLVMInitializeAArch64TargetInfo: { arguments: [], return: "void" },
+  LLVMInitializeAArch64Target: { arguments: [], return: "void" },
+  LLVMInitializeAArch64TargetMC: { arguments: [], return: "void" },
+  LLVMInitializeAArch64AsmPrinter: { arguments: [], return: "void" },
+
+  LLVMInitializeARMTargetInfo: { arguments: [], return: "void" },
+  LLVMInitializeARMTarget: { arguments: [], return: "void" },
+  LLVMInitializeARMTargetMC: { arguments: [], return: "void" },
+  LLVMInitializeARMAsmPrinter: { arguments: [], return: "void" },
   LLVMGetDefaultTargetTriple: { arguments: [], return: "pointer" },
   LLVMGetTargetFromTriple: { arguments: ["pointer", "pointer", "pointer"], return: "int32" },
   LLVMCreateTargetMachine: {
@@ -179,17 +192,44 @@ export class CompilerEngine {
       throw new Error("[Engine] LLVM IR çevirisi başarısız!");
     }
 
-    const format = options.format || "elf";
-
-    // Target alt sistemlerini başlat
+    // Target alt sistemlerini başlat (X86, WebAssembly, AArch64, ARM, RISCV)
     llvm.LLVMInitializeX86TargetInfo();
     llvm.LLVMInitializeX86Target();
     llvm.LLVMInitializeX86TargetMC();
     llvm.LLVMInitializeX86AsmPrinter();
+
     llvm.LLVMInitializeWebAssemblyTargetInfo();
     llvm.LLVMInitializeWebAssemblyTarget();
     llvm.LLVMInitializeWebAssemblyTargetMC();
     llvm.LLVMInitializeWebAssemblyAsmPrinter();
+
+    llvm.LLVMInitializeAArch64TargetInfo();
+    llvm.LLVMInitializeAArch64Target();
+    llvm.LLVMInitializeAArch64TargetMC();
+    llvm.LLVMInitializeAArch64AsmPrinter();
+
+    llvm.LLVMInitializeARMTargetInfo();
+    llvm.LLVMInitializeARMTarget();
+    llvm.LLVMInitializeARMTargetMC();
+    llvm.LLVMInitializeARMAsmPrinter();
+
+    const targetInfo = options.targetInfo || TargetManager.resolve({
+      target: options.target,
+      format: options.format,
+      outputFile,
+      jit: options.jit,
+    });
+
+    if (options.dumpLLVM) {
+      console.log("\n=== LLVM IR ===");
+      const dumpPath = outputFile ? `${outputFile}.ll` : "dump.ll";
+      const dumpPathBuf = Buffer.from(dumpPath + "\0", "utf8");
+      const errOut = Buffer.alloc(8);
+      llvm.LLVMPrintModuleToFile(llvmMod, dumpPathBuf, errOut);
+      if (existsSync(dumpPath)) {
+        console.log(readFileSync(dumpPath, "utf8"));
+      }
+    }
 
     // 1. JIT ÇALIŞTIRMA MODU (Sıfır Dosya, Doğrudan Bellekte Yürütme)
     if (options.jit) {
@@ -233,112 +273,50 @@ export class CompilerEngine {
       return;
     }
 
-    // 2. AOT DERLEME MODU (Doğrudan RAM'den .o Nesne Dosyasına)
-    console.log(`  -> [5/6] [AOT] LLVM TargetMachine ile doğrudan .o dosyası üretiliyor (${format})...`);
-    const tripleStr = format === "wasm" ? "wasm32-unknown-unknown\0" : "x86_64-pc-linux-gnu\0";
-    const tripleBuf = Buffer.from(tripleStr, "utf8");
+    // 2. AOT DERLEME MODU (Doğrudan RAM'den Nesne Dosyasına)
+    console.log(`  -> [5/6] [AOT] LLVM TargetMachine ile doğrudan nesne dosyası üretiliyor (Hedef: ${targetInfo.triple}, Format: ${targetInfo.format})...`);
+    const tripleBuf = Buffer.from(targetInfo.tripleWithNull, "utf8");
     const targetOut = Buffer.alloc(8);
     const errOut = Buffer.alloc(8);
 
     const getTargetStatus = llvm.LLVMGetTargetFromTriple(tripleBuf, targetOut, errOut);
     if (getTargetStatus !== 0) {
       throw new Error(
-        `[Engine] LLVM kütüphaneniz bu hedef mimariyi desteklemiyor (${tripleStr.trim()}). ` +
-        `LLVM kurulurken hedef mimari olarak yalnızca X86 etkinleştirilmiş olabilir.`
+        `[Engine] LLVM kütüphaneniz bu hedef mimariyi desteklemiyor (${targetInfo.triple}). ` +
+        `LLVM kurulurken hedef mimari etkinleştirilmemiş olabilir.`
       );
     }
     const target = targetOut.readBigUInt64LE(0);
 
     const emptyBuf = Buffer.from("\0", "utf8");
     const cpuBuf = Buffer.from("generic\0", "utf8");
-    // RelocMode: 2 (LLVMRelocPIC) - Paylaşımlı kütüphaneler (.so, .node) ve PIE için zorunludur
-    const relocMode = (format === "elf" || format === "so" || format === "node") ? 2 : 0;
-    const tm = llvm.LLVMCreateTargetMachine(target, tripleBuf, cpuBuf, emptyBuf, 2, relocMode, 0);
+    const tm = llvm.LLVMCreateTargetMachine(
+      target,
+      tripleBuf,
+      cpuBuf,
+      emptyBuf,
+      2, // LLVMCodeGenLevelDefault
+      targetInfo.relocMode,
+      0  // LLVMCodeModelDefault
+    );
 
-    // Tipik derleyici davranışı: .o dosyası çıktı adına göre belirlenir ve kalıcıdır
+    // Tipik derleyici davranışı: .o/.obj dosyası çıktı adına göre belirlenir ve kalıcıdır
     const outExt = path.extname(outputFile);
-    const objFile = outExt && outExt !== ".o"
-      ? outputFile.slice(0, -outExt.length) + ".o"
-      : (outExt === ".o" ? outputFile : `${outputFile}.o`);
+    const objExt = targetInfo.isWindows && targetInfo.linkerFlavor === "link_coff" ? ".obj" : ".o";
+    const objFile = outExt && outExt !== objExt
+      ? outputFile.slice(0, -outExt.length) + objExt
+      : (outExt === objExt ? outputFile : `${outputFile}${objExt}`);
     const objFileBuf = Buffer.from(objFile + "\0", "utf8");
 
-    // LLVMCodeGenFileType: 1 = LLVMObjectFile (.o)
+    // LLVMCodeGenFileType: 1 = LLVMObjectFile (.o / .obj)
     const emitStatus = llvm.LLVMTargetMachineEmitToFile(tm, llvmMod, objFileBuf, 1, errOut);
     if (emitStatus !== 0) {
-      throw new Error("[Engine] LLVM doğrudan .o dosyasına derleyemedi!");
+      throw new Error(`[Engine] LLVM doğrudan ${objExt} dosyasına derleyemedi!`);
     }
 
-    console.log(`  -> [6/6] [In-Process LLD] libbridge.so ile bağlanıyor (Format: ${format})...`);
+    console.log(`  -> [6/6] [In-Process LLD] ${targetInfo.linkerFlavor} ile bağlanıyor (Format: ${targetInfo.format})...`);
     try {
-      let linkerArgs = [];
-
-      if (format === "elf") {
-        const crtDirs = ["/usr/lib", "/usr/lib64", "/usr/lib/x86_64-linux-gnu"];
-        const crtDir = crtDirs.find((d) => existsSync(`${d}/crt1.o`) || existsSync(`${d}/Scrt1.o`)) || "/usr/lib";
-        const crt1 = existsSync(`${crtDir}/Scrt1.o`) ? `${crtDir}/Scrt1.o` : `${crtDir}/crt1.o`;
-        const crti = `${crtDir}/crti.o`;
-        const crtn = `${crtDir}/crtn.o`;
-
-        const nativeArgs = [];
-        if (options.nativeLibs && options.nativeLibs.length > 0) {
-          for (const libPath of options.nativeLibs) {
-            const libDir = path.dirname(libPath);
-            nativeArgs.push(`-L${libDir}`);
-            nativeArgs.push(`-rpath=${libDir}`);
-            nativeArgs.push(libPath);
-          }
-        }
-
-        linkerArgs = [
-          "-pie",
-          "-dynamic-linker", "/lib64/ld-linux-x86-64.so.2",
-          crt1,
-          crti,
-          objFile,
-          ...nativeArgs,
-          `-L${crtDir}`,
-          "-lc",
-          "-lm",
-          "-lpthread",
-          crtn,
-          "-o", outputFile,
-        ];
-      } else if (format === "so" || format === "node") {
-        const searchDirs = [
-          "/usr/lib",
-          "/usr/lib64",
-          "/usr/lib/x86_64-linux-gnu",
-          "/lib/x86_64-linux-gnu",
-          "/lib64",
-          "/lib",
-        ].filter((d) => existsSync(d));
-
-        linkerArgs = [
-          "-shared",
-          objFile,
-          ...searchDirs.map((d) => `-L${d}`),
-          "-lc",
-          "-lm",
-          "-lpthread",
-          "-o", outputFile,
-        ];
-      } else if (format === "coff") {
-        linkerArgs = [objFile, `/out:${outputFile}`, "/entry:main", "/subsystem:console"];
-      } else if (format === "macho") {
-        linkerArgs = ["-o", outputFile, objFile, "-lSystem"];
-      } else if (format === "wasm") {
-        linkerArgs = [
-          objFile,
-          "-o", outputFile,
-          "--no-entry",
-          "--export-all",
-          "--allow-undefined"
-        ];
-      } else if (format === "mingw") {
-        linkerArgs = ["-o", outputFile, objFile, "-lkernel32", "-lmsvcrt"];
-      } else {
-        throw new Error(`[Engine] Desteklenmeyen format: ${format}`);
-      }
+      const linkerArgs = TargetManager.getLinkerArgs(targetInfo, objFile, outputFile, options);
 
       // const char** argv pointer dizisini bellekte inşa et
       const argBuffers = linkerArgs.map((arg) => Buffer.from(arg + "\0", "utf8"));
@@ -349,15 +327,14 @@ export class CompilerEngine {
         argvBuf.writeBigUInt64LE(ptr, i * 8);
       }
 
-      let linkOk = false;
-      if (format === "elf" || format === "so" || format === "node") linkOk = bridge.link_elf(linkerArgs.length, argvBuf);
-      else if (format === "coff") linkOk = bridge.link_coff(linkerArgs.length, argvBuf);
-      else if (format === "macho") linkOk = bridge.link_macho(linkerArgs.length, argvBuf);
-      else if (format === "wasm") linkOk = bridge.link_wasm(linkerArgs.length, argvBuf);
-      else if (format === "mingw") linkOk = bridge.link_mingw(linkerArgs.length, argvBuf);
+      const linkFn = bridge[targetInfo.linkerFlavor];
+      if (typeof linkFn !== "function") {
+        throw new Error(`[Engine] Desteklenmeyen linker fonksiyonu: ${targetInfo.linkerFlavor}`);
+      }
 
+      const linkOk = linkFn(linkerArgs.length, argvBuf);
       if (!linkOk) {
-        throw new Error(`[Engine] In-Process LLD (${format}) linkleme hatası!`);
+        throw new Error(`[Engine] In-Process LLD (${targetInfo.linkerFlavor} / ${targetInfo.format}) linkleme hatası!`);
       }
       console.log(`  -> [Nesne Dosyası] ${objFile} saklandı.`);
     } finally {

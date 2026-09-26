@@ -1,8 +1,10 @@
 // src/ir/MLIRBuilder.js
 import { RuntimeEmitters } from "../runtime/RuntimeEmitters.js";
+import { TargetManager } from "../engine/TargetManager.js";
 
 export class MLIRBuilder {
-  constructor() {
+  constructor(targetInfo = null) {
+    this.targetInfo = targetInfo;
     this.ssaCount = 0;
     this.strCount = 0;
     this.indent = 2;
@@ -35,6 +37,24 @@ export class MLIRBuilder {
     this.symObject = this.getOrRegisterString("object");
     this.symTrue = this.getOrRegisterString("true");
     this.symFalse = this.getOrRegisterString("false");
+  }
+
+  setTargetInfo(targetInfo) {
+    this.targetInfo = targetInfo;
+  }
+
+  emitSleep(msI32) {
+    this.markFeature("sleep");
+    if (this.targetInfo?.isWindows) {
+      this.emit(`llvm.call @Sleep(${msI32.ssa}) : (i32) -> ()`);
+    } else if (this.targetInfo?.isWasm) {
+      // Freestanding WebAssembly: sleep yok, no-op
+    } else {
+      const c1000 = this.createConstant(1000, "i32");
+      const usec = this.createArithmetic("*", msI32, c1000);
+      const sleepRes = this.nextSSA();
+      this.emit(`${sleepRes} = llvm.call @usleep(${usec.ssa}) : (i32) -> i32`);
+    }
   }
 
   markFeature(feat) {
@@ -417,9 +437,11 @@ export class MLIRBuilder {
   }
 
   buildFullModule(options = {}) {
-    const isWasm = (options.format || "elf") === "wasm";
-    const triple = isWasm ? "wasm32-unknown-unknown" : "x86_64-pc-linux-gnu";
-    let header = `module attributes {llvm.data_layout = "", llvm.target_triple = "${triple}"} {\n`;
+    const targetInfo = options.targetInfo || this.targetInfo || TargetManager.resolve(options);
+    const isWasm = targetInfo.isWasm;
+    const triple = targetInfo.triple;
+    const dataLayout = targetInfo.dataLayout || "";
+    let header = `module attributes {llvm.data_layout = "${dataLayout}", llvm.target_triple = "${triple}"} {\n`;
 
     const needsHeap =
       this.usedFeatures.heap ||
@@ -471,22 +493,28 @@ export class MLIRBuilder {
       }
     }
 
-    if (this.usedFeatures.threads || this.usedFeatures.channels) {
-      header += `  func.func private @pthread_create(!llvm.ptr, !llvm.ptr, (!llvm.ptr) -> !llvm.ptr, !llvm.ptr) -> i32\n`;
-      header += `  llvm.func @pthread_join(i64, !llvm.ptr) -> i32\n`;
-    }
+    if (!isWasm) {
+      if (this.usedFeatures.threads || this.usedFeatures.channels) {
+        header += `  func.func private @pthread_create(!llvm.ptr, !llvm.ptr, (!llvm.ptr) -> !llvm.ptr, !llvm.ptr) -> i32\n`;
+        header += `  llvm.func @pthread_join(i64, !llvm.ptr) -> i32\n`;
+      }
 
-    if (this.usedFeatures.channels) {
-      header += `  llvm.func @pthread_mutex_init(!llvm.ptr, !llvm.ptr) -> i32\n`;
-      header += `  llvm.func @pthread_mutex_lock(!llvm.ptr) -> i32\n`;
-      header += `  llvm.func @pthread_mutex_unlock(!llvm.ptr) -> i32\n`;
-      header += `  llvm.func @pthread_cond_init(!llvm.ptr, !llvm.ptr) -> i32\n`;
-      header += `  llvm.func @pthread_cond_wait(!llvm.ptr, !llvm.ptr) -> i32\n`;
-      header += `  llvm.func @pthread_cond_signal(!llvm.ptr) -> i32\n`;
+      if (this.usedFeatures.channels) {
+        header += `  llvm.func @pthread_mutex_init(!llvm.ptr, !llvm.ptr) -> i32\n`;
+        header += `  llvm.func @pthread_mutex_lock(!llvm.ptr) -> i32\n`;
+        header += `  llvm.func @pthread_mutex_unlock(!llvm.ptr) -> i32\n`;
+        header += `  llvm.func @pthread_cond_init(!llvm.ptr, !llvm.ptr) -> i32\n`;
+        header += `  llvm.func @pthread_cond_wait(!llvm.ptr, !llvm.ptr) -> i32\n`;
+        header += `  llvm.func @pthread_cond_signal(!llvm.ptr) -> i32\n`;
+      }
     }
 
     if (this.usedFeatures.sleep) {
-      header += `  llvm.func @usleep(i32) -> i32\n`;
+      if (targetInfo.isWindows) {
+        header += `  llvm.func @Sleep(i32) -> ()\n`;
+      } else if (!isWasm) {
+        header += `  llvm.func @usleep(i32) -> i32\n`;
+      }
     }
     header += `\n`;
 
@@ -508,14 +536,20 @@ export class MLIRBuilder {
 
     if (this.usedFeatures.exceptions) {
       header += `  llvm.mlir.global internal constant @fmt_uncaught_err("Uncaught Exception: %s\\0A\\00")\n\n`;
-      header += `  llvm.mlir.global internal thread_local @rts_current_jmpbuf() : !llvm.ptr {\n`;
+      const threadLocalAttr = isWasm ? "" : "thread_local ";
+      header += `  llvm.mlir.global internal ${threadLocalAttr}@rts_current_jmpbuf() : !llvm.ptr {\n`;
       header += `    %0 = llvm.mlir.zero : !llvm.ptr\n`;
       header += `    llvm.return %0 : !llvm.ptr\n`;
       header += `  }\n\n`;
-      header += `  llvm.mlir.global internal thread_local @rts_current_exception() : !llvm.ptr {\n`;
+      header += `  llvm.mlir.global internal ${threadLocalAttr}@rts_current_exception() : !llvm.ptr {\n`;
       header += `    %0 = llvm.mlir.zero : !llvm.ptr\n`;
       header += `    llvm.return %0 : !llvm.ptr\n`;
       header += `  }\n\n`;
+    }
+
+    // Windows MSVC Floating-Point ABI uyumluluğu (_fltused sembolü)
+    if (targetInfo.isWindows) {
+      header += `  llvm.mlir.global external @_fltused(1 : i32) : i32\n\n`;
     }
 
     // Modül Seviyesindeki Global Değişkenler
