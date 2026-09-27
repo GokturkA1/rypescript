@@ -78,6 +78,7 @@ export class ASTLowerer {
       packed: false,
       napi: false,
       exportName: null,
+      noentry: false,
     };
     if (!node) return pragmas;
 
@@ -91,30 +92,50 @@ export class ASTLowerer {
         if (expr.name === "noinline") pragmas.noinline = true;
         if (expr.name === "packed") pragmas.packed = true;
         if (expr.name === "napi") pragmas.napi = true;
+        if (expr.name === "noentry" || expr.name === "standalone") pragmas.noentry = true;
       } else if (expr.type === "CallExpression") {
         const fnName = expr.callee?.name;
         if (fnName === "export_name") {
           const arg = expr.arguments?.[0];
           if (arg) pragmas.exportName = arg.value ?? null;
+        } else if (fnName === "noentry" || fnName === "standalone") {
+          pragmas.noentry = true;
+        } else if (fnName === "entry") {
+          const arg = expr.arguments?.[0];
+          if (arg && (arg.value === false || arg.name === "false")) {
+            pragmas.noentry = true;
+          }
         }
       }
     }
 
     // 2. Sentetik Decorators (Fonksiyon ve Interface öncesi yakalananlar)
     const nodeName = node.id?.name || node.declaration?.id?.name || node.key?.name;
-    if (this.currentSyntheticDecorators && nodeName && this.currentSyntheticDecorators.has(nodeName)) {
-      const decList = this.currentSyntheticDecorators.get(nodeName);
+    const decList =
+      (this.syntheticDecorators && nodeName && this.syntheticDecorators.get(nodeName)) ||
+      (this.currentSyntheticDecorators && nodeName && this.currentSyntheticDecorators.get(nodeName));
+    if (decList) {
       for (const dec of decList) {
         if (dec.name === "inline") pragmas.inline = true;
         if (dec.name === "noinline") pragmas.noinline = true;
         if (dec.name === "packed") pragmas.packed = true;
         if (dec.name === "napi") pragmas.napi = true;
         if (dec.name === "export_name") pragmas.exportName = dec.arg;
+        if (dec.name === "noentry" || dec.name === "standalone") pragmas.noentry = true;
+        if (dec.name === "entry" && (dec.arg === "false" || dec.arg === false)) pragmas.noentry = true;
       }
     }
 
     // 3. Fallback: Yorum Satırı (Yalnızca geriye dönük uyumluluk için)
-    if (!pragmas.inline && !pragmas.noinline && !pragmas.packed && !pragmas.napi && !pragmas.exportName && this.currentComments) {
+    if (
+      !pragmas.inline &&
+      !pragmas.noinline &&
+      !pragmas.packed &&
+      !pragmas.napi &&
+      !pragmas.noentry &&
+      !pragmas.exportName &&
+      this.currentComments
+    ) {
       const nodeStart = node.start ?? node.span?.start ?? 0;
       for (const c of this.currentComments) {
         if (c.end <= nodeStart && nodeStart - c.end < 60) {
@@ -123,6 +144,7 @@ export class ASTLowerer {
           if (/@noinline\b/.test(text)) pragmas.noinline = true;
           if (/@packed\b/.test(text)) pragmas.packed = true;
           if (/@napi\b/.test(text)) pragmas.napi = true;
+          if (/@noentry\b/.test(text) || /@standalone\b/.test(text)) pragmas.noentry = true;
           const matchExport = text.match(/@export_name\s*\(\s*["']([^"']+)["']\s*\)/);
           if (matchExport) pragmas.exportName = matchExport[1];
         }
@@ -641,6 +663,16 @@ export class ASTLowerer {
       this.builder.emit(`${ssa} = arith.extsi ${val.ssa} : i32 to i64`);
       return { ssa, type: "i64" };
     }
+    if (targetType === "i32" && (val.type === "f64" || val.type === "f32")) {
+      const ssa = this.builder.nextSSA();
+      this.builder.emit(`${ssa} = arith.fptosi ${val.ssa} : ${val.type} to i32`);
+      return { ssa, type: "i32" };
+    }
+    if (targetType === "i32" && val.type === "i1") {
+      const ssa = this.builder.nextSSA();
+      this.builder.emit(`${ssa} = arith.extui ${val.ssa} : i1 to i32`);
+      return { ssa, type: "i32" };
+    }
     if (targetType === "i32" && val.type === "i64") {
       const ssa = this.builder.nextSSA();
       this.builder.emit(`${ssa} = arith.trunci ${val.ssa} : i64 to i32`);
@@ -870,6 +902,22 @@ export class ASTLowerer {
     return { specializedName, node: specializedNode, isInterface };
   }
 
+  isDirectMainCallStatement(stmt) {
+    if (!stmt || stmt.type !== "ExpressionStatement") return false;
+    let expr = stmt.expression;
+    if (expr && expr.type === "AwaitExpression") {
+      expr = expr.argument;
+    } else if (expr && expr.type === "UnaryExpression" && expr.operator === "void") {
+      expr = expr.argument;
+    }
+    if (expr && expr.type === "CallExpression") {
+      if (expr.callee?.name === "main") {
+        return true;
+      }
+    }
+    return false;
+  }
+
   lower(program) {
     this.lowerModules([{ filePath: "main.ts", fileName: "main.ts", program, isEntry: true }]);
   }
@@ -877,6 +925,14 @@ export class ASTLowerer {
   lowerModules(modules) {
     this.globals = new Map();
     this.requiredItables = new Map();
+    this.syntheticDecorators = new Map();
+    for (const mod of modules) {
+      if (mod.syntheticDecorators) {
+        for (const [k, v] of mod.syntheticDecorators) {
+          this.syntheticDecorators.set(k, v);
+        }
+      }
+    }
 
     // 0. Tüm modüllerdeki en üst düzey (global) değişken tanımlarını tespit et
     for (const mod of modules) {
@@ -936,7 +992,13 @@ export class ASTLowerer {
     const entryTopLevelStatements = [];
     const nonEntryTopLevelStatements = [];
 
+    let userMainNode = null;
+    let isUserMainNoEntry = false;
+    let userMainMeta = null;
+
     for (const mod of modules) {
+      this.currentComments = mod.comments || [];
+      this.currentSyntheticDecorators = mod.syntheticDecorators || new Map();
       for (const rawNode of mod.program.body) {
         if (rawNode.type === "ImportDeclaration") continue;
 
@@ -954,7 +1016,14 @@ export class ASTLowerer {
         if (isExported && (node.type === "FunctionDeclaration" || node.type === "TSDeclareFunction") && !hasTypeParams) {
           if (node.id?.name) {
             const pragmas = this.getPragmas(rawNode);
-            const finalName = pragmas.exportName || node.id.name;
+            let finalName = pragmas.exportName || node.id.name;
+            if (node.id.name === "main") {
+              if (mod.isEntry && !pragmas.noentry) {
+                finalName = "user_main_entry";
+              } else {
+                finalName = "rts_fn_main";
+              }
+            }
             node.exportAlias = finalName;
             this.exportedFunctionNames.add(finalName);
             if (pragmas.napi) {
@@ -965,6 +1034,21 @@ export class ASTLowerer {
                 node,
               });
             }
+          }
+        } else if ((node.type === "FunctionDeclaration" || node.type === "TSDeclareFunction") && node.id?.name === "main") {
+          const pragmas = this.getPragmas(rawNode);
+          if (mod.isEntry && !pragmas.noentry) {
+            node.exportAlias = "user_main_entry";
+          } else {
+            node.exportAlias = "rts_fn_main";
+          }
+        }
+
+        if (mod.isEntry && (node.type === "FunctionDeclaration" || node.type === "TSDeclareFunction") && node.id?.name === "main") {
+          userMainNode = node;
+          const pragmas = this.getPragmas(rawNode);
+          if (pragmas.noentry) {
+            isUserMainNoEntry = true;
           }
         }
 
@@ -1198,7 +1282,11 @@ export class ASTLowerer {
 
         const declSig = retType === "none" ? `(${paramTypes.join(", ")})` : `(${paramTypes.join(", ")}) -> ${retType}`;
         const mlirType = `(${paramTypes.join(", ")}) -> ${retType === "none" ? "()" : retType}`;
-        this.functionRegistry.set(funcName, { isAsync, isDeclare, innerRetType, retType, structRetName, enumRetName, isRetString, isRetFn, retFnSig, params, paramTypes, mlirType, declSig, isClosure: Boolean(node.isClosure), taskContextMeta });
+        const fnMeta = { isAsync, isDeclare, innerRetType, retType, structRetName, enumRetName, isRetString, isRetFn, retFnSig, params, paramTypes, mlirType, declSig, isClosure: Boolean(node.isClosure), taskContextMeta, exportAlias: node.exportAlias || null };
+        this.functionRegistry.set(funcName, fnMeta);
+        if (node === userMainNode) {
+          userMainMeta = fnMeta;
+        }
 
         if (isDeclare) {
           this.builder.declareExternalFunction(funcName, declSig);
@@ -1230,20 +1318,74 @@ export class ASTLowerer {
       for (const stmt of nonEntryTopLevelStatements) {
         this.lowerStatement(stmt);
       }
+
+      const shouldCallUserMain = Boolean(userMainNode && !isUserMainNoEntry);
+
       for (const stmt of entryTopLevelStatements) {
+        if (shouldCallUserMain && this.isDirectMainCallStatement(stmt)) {
+          // Kullanıcı main'i override ettiğinde script içindeki doğrudan main() çağrısını atla
+          continue;
+        }
         this.lowerStatement(stmt);
+      }
+
+      let exitCodeSSA;
+      if (shouldCallUserMain) {
+        const callArgs = [];
+        if (userMainMeta?.params) {
+          for (const p of userMainMeta.params) {
+            if (p.type === "i32" || p.type === "i64" || p.type === "f64") {
+              callArgs.push({ type: "NumericLiteral", value: 0 });
+            } else {
+              callArgs.push({ type: "NullLiteral" });
+            }
+          }
+        }
+
+        let res;
+        if (userMainMeta?.isAsync) {
+          const awaitExpr = {
+            type: "AwaitExpression",
+            argument: {
+              type: "CallExpression",
+              callee: { type: "Identifier", name: "main" },
+              arguments: callArgs,
+            },
+          };
+          res = this.lowerExpression(awaitExpr);
+        } else {
+          const callExpr = {
+            type: "CallExpression",
+            callee: { type: "Identifier", name: "main" },
+            arguments: callArgs,
+          };
+          res = this.lowerExpression(callExpr);
+        }
+
+        if (res && res.type !== "none" && res.ssa) {
+          const coerced = this.coerceType(res, "i32");
+          exitCodeSSA = coerced.ssa;
+        } else {
+          const zero = this.builder.createConstant(0, "i32");
+          exitCodeSSA = zero.ssa;
+        }
+      } else {
+        const zero = this.builder.createConstant(0, "i32");
+        exitCodeSSA = zero.ssa;
       }
 
       this.exitScope();
 
-      if (!this.builder.targetInfo?.isWasm && (this.builder.usedFeatures.threads || this.builder.usedFeatures.channels)) {
-        const nullPtr = this.builder.nextSSA();
-        this.builder.emit(`${nullPtr} = llvm.mlir.zero : !llvm.ptr`);
-        this.builder.emit(`llvm.call @pthread_exit(${nullPtr}) : (!llvm.ptr) -> ()`);
+      if (!this.builder.hasTerminated) {
+        if (!shouldCallUserMain || userMainMeta?.innerRetType === "none") {
+          if (!this.builder.targetInfo?.isWasm && (this.builder.usedFeatures.threads || this.builder.usedFeatures.channels)) {
+            const nullPtr = this.builder.nextSSA();
+            this.builder.emit(`${nullPtr} = llvm.mlir.zero : !llvm.ptr`);
+            this.builder.emit(`llvm.call @pthread_exit(${nullPtr}) : (!llvm.ptr) -> ()`);
+          }
+        }
+        this.builder.createReturn({ ssa: exitCodeSSA, type: "i32" });
       }
-
-      const zero = this.builder.createConstant(0, "i32");
-      this.builder.createReturn(zero);
     });
 
     this.emitItables();
@@ -2024,6 +2166,7 @@ export class ASTLowerer {
     const funcName = node.id.name;
     const isAsync = Boolean(node.async);
     const fnMeta = this.functionRegistry.get(funcName);
+    const pragmas = this.getPragmas(node);
 
     const params = [];
     const paramStrings = [];
@@ -2163,7 +2306,10 @@ export class ASTLowerer {
       });
 
       // 3. Çağrıcı fonksiyon (@funcName)
-      this.builder.block(`func.func @${funcName}(${paramStrings.join(", ")}) -> !llvm.ptr`, () => {
+      const effectiveCallerName = (funcName.includes("_") && !node.exportAlias)
+        ? funcName
+        : (node.exportAlias || pragmas.exportName || funcName);
+      this.builder.block(`func.func @${effectiveCallerName}(${paramStrings.join(", ")}) -> !llvm.ptr`, () => {
         const ctxSz = this.builder.nextSSA();
         this.builder.emit(`${ctxSz} = llvm.mlir.constant(${ctxMeta.byteSize} : i64) : i64`);
         const taskPtr = this.builder.nextSSA();
@@ -2200,7 +2346,6 @@ export class ASTLowerer {
     }
 
     // B. STANDART SENKRON FONKSİYON
-    const pragmas = this.getPragmas(node);
     // Generic somutlamaları (örn. mirror_f64) her zaman kendi funcName adıyla basılmalıdır
     const effectiveFnName = (funcName.includes("_") && !node.exportAlias)
       ? funcName

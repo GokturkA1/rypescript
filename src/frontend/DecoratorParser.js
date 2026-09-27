@@ -8,17 +8,17 @@ export class DecoratorParser {
   static parseTopLevelDecorators(rawSource) {
     const syntheticDecoratorsMap = new Map();
     const topLevelDecBlockRegex =
-      /((?:@(?:[a-zA-Z_$][a-zA-Z0-9_$]*)(?:\s*\([^)]*?\))?\s*)+)(export\s+)?(function|interface)\s+([a-zA-Z0-9_$]+)/g;
+      /(?:export\s+)?((?:@(?:[a-zA-Z_$][a-zA-Z0-9_$]*)(?:\s*\([^)]*?\))?\s*)+)(?:export\s+)?(?:async\s+)?(?:function|interface)\s+([a-zA-Z0-9_$]+)/g;
     let match;
     let tsSource = rawSource;
 
     while ((match = topLevelDecBlockRegex.exec(rawSource)) !== null) {
       const decBlock = match[1];
-      const targetName = match[4];
-      const startIndex = match.index;
+      const targetName = match[2];
+      const decBlockStart = rawSource.indexOf(decBlock, match.index);
       const blockLen = decBlock.length;
 
-      const singleDecRegex = /@([a-zA-Z_$][a-zA-Z0-9_$]*)(?:\s*\(\s*["']?([^"']*)["']?\s*\))?/g;
+      const singleDecRegex = /@([a-zA-Z_$][a-zA-Z0-9_$]*)(?:\s*\(\s*["']?([^"')\s]*)["']?\s*\))?/g;
       let dMatch;
       const decList = [];
       while ((dMatch = singleDecRegex.exec(decBlock)) !== null) {
@@ -33,7 +33,7 @@ export class DecoratorParser {
       for (let i = 0; i < blockLen; i++) {
         mask += decBlock[i] === "\n" ? "\n" : " ";
       }
-      tsSource = tsSource.substring(0, startIndex) + mask + tsSource.substring(startIndex + blockLen);
+      tsSource = tsSource.substring(0, decBlockStart) + mask + tsSource.substring(decBlockStart + blockLen);
     }
 
     return { maskedSource: tsSource, syntheticDecoratorsMap };
