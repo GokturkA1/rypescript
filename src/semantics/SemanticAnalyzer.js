@@ -130,6 +130,25 @@ export class SemanticAnalyzer {
     return this.typeChecker.inferExpressionType(expr, expectedType);
   }
 
+  extractFunctionType(typeNode) {
+    const unwrapped = this.unwrapType(typeNode);
+    if (!unwrapped) return null;
+    if (unwrapped.type === "TSFunctionType") {
+      const rawParams = Array.isArray(unwrapped.params)
+        ? unwrapped.params
+        : Array.isArray(unwrapped.params?.items)
+        ? unwrapped.params.items
+        : [];
+      const paramTypes = rawParams.map((p) => {
+        const annot = p.typeAnnotation || p.pattern?.typeAnnotation || p.id?.typeAnnotation;
+        return this.resolveType(annot);
+      });
+      const returnType = this.resolveType(unwrapped.returnType);
+      return { paramTypes, returnType };
+    }
+    return null;
+  }
+
   analyze() {
     // --- 1. GEÇİŞ: Genel Tanımları (İmzaları) Topla ---
     for (const mod of this.modules) {
@@ -181,8 +200,9 @@ export class SemanticAnalyzer {
         if (decl.type === "TSInterfaceDeclaration") {
           const structName = decl.id.name;
           const fields = new Map();
+          const methods = new Map();
 
-          // Üst arayüzlerden alanları miras al (interface extends ...)
+          // Üst arayüzlerden alanları ve metotları miras al (interface extends ...)
           if (decl.extends && Array.isArray(decl.extends)) {
             for (const heritage of decl.extends) {
               const pName = heritage.expression?.name || heritage.id?.name;
@@ -191,6 +211,11 @@ export class SemanticAnalyzer {
                 for (const [fName, fData] of pMeta.fields.entries()) {
                   fields.set(fName, fData);
                 }
+                if (pMeta.methods) {
+                  for (const [mName, mData] of pMeta.methods.entries()) {
+                    methods.set(mName, mData);
+                  }
+                }
               }
             }
           }
@@ -198,8 +223,24 @@ export class SemanticAnalyzer {
           for (const member of decl.body?.body || []) {
             if (member.type === "TSPropertySignature") {
               const fName = member.key?.name || member.key?.value;
-              const fType = this.resolveType(member.typeAnnotation);
-              fields.set(fName, { type: fType, node: member });
+              const typeAnnot = member.typeAnnotation;
+              const fnType = this.extractFunctionType(typeAnnot);
+              const fType = this.resolveType(typeAnnot);
+              fields.set(fName, { type: fType, isFunction: Boolean(fnType), fnType, node: member });
+            } else if (member.type === "TSMethodSignature") {
+              const mName = member.key?.name || member.key?.value;
+              const rawParams = member.params || [];
+              const params = rawParams.map((p) => {
+                const annot = p.typeAnnotation || p.pattern?.typeAnnotation || p.id?.typeAnnotation;
+                return this.resolveType(annot);
+              });
+              const retType = this.resolveType(member.returnType);
+              methods.set(mName, {
+                name: mName,
+                params,
+                returnType: retType,
+                node: member,
+              });
             }
           }
           const rawTypeParams = decl.typeParameters?.params || [];
@@ -208,7 +249,8 @@ export class SemanticAnalyzer {
             name: structName,
             typeParams,
             fields,
-            methods: new Map(),
+            methods,
+            isInterface: true,
             node: decl,
           });
         }
@@ -482,6 +524,26 @@ export class SemanticAnalyzer {
               stmt.superClass,
               `Bilinmeyen üst sınıf: '${superName}'`
             );
+          }
+        }
+
+        // Arayüz implementasyon kontrolü (implements ...)
+        if (stmt.implements && Array.isArray(stmt.implements)) {
+          for (const impl of stmt.implements) {
+            const ifaceName = impl.expression?.name || impl.expression?.value || impl.name;
+            if (ifaceName && !this.builtins.structSignatures.has(ifaceName)) {
+              this.reporter.addError(
+                this.currentFilePath,
+                impl,
+                `Bilinmeyen arayüz: '${ifaceName}'`
+              );
+            } else if (ifaceName && !this.typeChecker.implementsInterface(clsName, ifaceName)) {
+              this.reporter.addError(
+                this.currentFilePath,
+                impl,
+                `'${clsName}' sınıfı '${ifaceName}' arayüzünün gereksinimlerini karşılamıyor.`
+              );
+            }
           }
         }
 

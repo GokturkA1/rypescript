@@ -637,6 +637,11 @@ export class MLIRBuilder {
         header += `    %0 = llvm.mlir.constant(${val} : ${type}) : ${type}\n`;
         header += `    llvm.return %0 : ${type}\n`;
         header += `  }\n\n`;
+      } else if (type === "!llvm.struct<(!llvm.ptr, !llvm.ptr)>") {
+        header += `  llvm.mlir.global internal ${sym}() : !llvm.struct<(!llvm.ptr, !llvm.ptr)> {\n`;
+        header += `    %0 = llvm.mlir.zero : !llvm.struct<(!llvm.ptr, !llvm.ptr)>\n`;
+        header += `    llvm.return %0 : !llvm.struct<(!llvm.ptr, !llvm.ptr)>\n`;
+        header += `  }\n\n`;
       } else {
         header += `  llvm.mlir.global internal ${sym}() : !llvm.ptr {\n`;
         header += `    %0 = llvm.mlir.zero : !llvm.ptr\n`;

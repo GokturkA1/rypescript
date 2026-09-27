@@ -122,6 +122,82 @@ export class TypeChecker {
     return subst;
   }
 
+  getMethodFromHierarchy(typeName, methodName) {
+    let curr = typeName;
+    while (curr && this.builtins.structSignatures.has(curr)) {
+      const meta = this.builtins.structSignatures.get(curr);
+      if (meta.methods && meta.methods.has(methodName)) {
+        return meta.methods.get(methodName);
+      }
+      curr = meta.superClass;
+    }
+    return null;
+  }
+
+  getFieldFromHierarchy(typeName, fieldName) {
+    let curr = typeName;
+    while (curr && this.builtins.structSignatures.has(curr)) {
+      const meta = this.builtins.structSignatures.get(curr);
+      if (meta.fields && meta.fields.has(fieldName)) {
+        return meta.fields.get(fieldName);
+      }
+      curr = meta.superClass;
+    }
+    return null;
+  }
+
+  implementsInterface(actualTypeName, ifaceName) {
+    if (!actualTypeName || !ifaceName) return false;
+    const ifaceBase = this.getBaseTypeName(ifaceName);
+    const ifaceMeta = this.builtins.structSignatures.get(ifaceBase);
+    if (!ifaceMeta || !ifaceMeta.isInterface) return false;
+
+    if (actualTypeName === "null" || actualTypeName === "undefined") return true;
+
+    const actBase = this.getBaseTypeName(actualTypeName);
+    const actMeta = this.builtins.structSignatures.get(actBase);
+    if (!actMeta) return false;
+
+    // 1. Check all methods declared in the interface
+    if (ifaceMeta.methods && ifaceMeta.methods.size > 0) {
+      for (const [mName, mExpected] of ifaceMeta.methods.entries()) {
+        const mActual = this.getMethodFromHierarchy(actBase, mName);
+        if (!mActual) return false;
+
+        const expParams = mExpected.params || [];
+        const actParams = mActual.params || [];
+        if (actParams.length < expParams.length) {
+          return false;
+        }
+
+        for (let i = 0; i < expParams.length; i++) {
+          if (!this.typesAreCompatible(actParams[i], expParams[i])) {
+            return false;
+          }
+        }
+
+        if (mExpected.returnType && mExpected.returnType !== "void") {
+          if (!this.typesAreCompatible(mExpected.returnType, mActual.returnType)) {
+            return false;
+          }
+        }
+      }
+    }
+
+    // 2. Check all fields declared in the interface (for pure data or mixed interfaces)
+    if (ifaceMeta.fields && ifaceMeta.fields.size > 0) {
+      for (const [fName, fExpected] of ifaceMeta.fields.entries()) {
+        const fActual = this.getFieldFromHierarchy(actBase, fName);
+        if (!fActual) return false;
+        if (!this.typesAreCompatible(fExpected.type, fActual.type)) {
+          return false;
+        }
+      }
+    }
+
+    return true;
+  }
+
   typesAreCompatible(expected, actual) {
     if (!expected || !actual) return true;
     if (expected === "any" || actual === "any") return true;
@@ -218,6 +294,15 @@ export class TypeChecker {
       const meta = this.builtins.structSignatures.get(curr);
       if (meta.superClass === expected) return true;
       curr = meta.superClass;
+    }
+
+    // 4.1. Interface Tabanlı Yapısal Polimorfizm (Structural Subtyping / Duck Typing)
+    const expBaseName = this.getBaseTypeName(expected);
+    if (this.builtins.structSignatures.has(expBaseName)) {
+      const expMeta = this.builtins.structSignatures.get(expBaseName);
+      if (expMeta.isInterface && this.implementsInterface(actual, expBaseName)) {
+        return true;
+      }
     }
 
     // 5. Birinci Sınıf Fonksiyon Tipleri

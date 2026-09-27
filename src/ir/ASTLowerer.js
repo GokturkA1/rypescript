@@ -67,6 +67,7 @@ export class ASTLowerer {
     this.scopeStack = [];
     this.closureRegistry = new Map();
     this.thunkRegistry = new Map();
+    this.requiredItables = new Map();
     this.builder.onAllocate = (ptr) => this.trackHeap(ptr);
   }
 
@@ -508,6 +509,10 @@ export class ASTLowerer {
           return en.kind === "string" ? "!llvm.ptr" : "i64";
         }
         if (this.structRegistry.has(typeName)) {
+          const meta = this.structRegistry.get(typeName);
+          if (meta && meta.isInterface && meta.isPolymorphic) {
+            return "!llvm.struct<(!llvm.ptr, !llvm.ptr)>";
+          }
           return "!llvm.ptr";
         }
         if (this.classList.some((c) => c.name === typeName)) {
@@ -521,6 +526,12 @@ export class ASTLowerer {
       default:
         return "f64";
     }
+  }
+
+  isPolymorphicInterface(typeName) {
+    if (!typeName) return false;
+    const meta = this.structRegistry.get(typeName);
+    return Boolean(meta && meta.isInterface && meta.isPolymorphic);
   }
 
   getStructName(typeNode) {
@@ -577,7 +588,13 @@ export class ASTLowerer {
         if (["f64", "double"].includes(tName)) return { elemType: "f64", isString: false, structName: null };
         if (["f32", "float"].includes(tName)) return { elemType: "f32", isString: false, structName: null };
         if (this.structRegistry.has(tName) || this.classList.some((c) => c.name === tName)) {
-          return { elemType: "!llvm.ptr", isString: false, structName: tName };
+          const isPoly = this.isPolymorphicInterface(tName);
+          return {
+            elemType: isPoly ? "!llvm.struct<(!llvm.ptr, !llvm.ptr)>" : "!llvm.ptr",
+            isString: false,
+            structName: tName,
+            isInterface: isPoly,
+          };
         }
       }
       if (elRaw.type === "TSNumberKeyword") {
@@ -859,6 +876,7 @@ export class ASTLowerer {
 
   lowerModules(modules) {
     this.globals = new Map();
+    this.requiredItables = new Map();
 
     // 0. Tüm modüllerdeki en üst düzey (global) değişken tanımlarını tespit et
     for (const mod of modules) {
@@ -1143,10 +1161,12 @@ export class ASTLowerer {
           }
           const isArr = this.unwrapType(typeAnnot)?.type === "TSArrayType";
           const isStr = this.isStringType(typeAnnot);
-          const pType = isFn ? "!llvm.struct<(!llvm.ptr, !llvm.ptr)>" : (isUnion || isArr || isStr) ? "!llvm.ptr" : this.resolveType(typeAnnot);
+          const sName = this.getStructName(typeAnnot);
+          const isPolyIface = this.isPolymorphicInterface(sName);
+          const pType = isFn ? "!llvm.struct<(!llvm.ptr, !llvm.ptr)>" : isPolyIface ? "!llvm.struct<(!llvm.ptr, !llvm.ptr)>" : (isUnion || isArr || isStr) ? "!llvm.ptr" : this.resolveType(typeAnnot);
           const enumName = this.getEnumName(typeAnnot);
           const isChan = this.unwrapType(typeAnnot)?.typeName?.name === "Channel";
-          params.push({ name: param.name || `arg_${i}`, type: pType, isUnion, isArray: isArr, isFunction: isFn, isClosure: isFn, fnSig, enumName, isChannel: isChan, isString: isStr });
+          params.push({ name: param.name || `arg_${i}`, type: pType, structName: sName, isInterface: isPolyIface, isUnion, isArray: isArr, isFunction: isFn, isClosure: isFn, fnSig, enumName, isChannel: isChan, isString: isStr });
           paramTypes.push(pType);
         });
 
@@ -1225,6 +1245,135 @@ export class ASTLowerer {
       const zero = this.builder.createConstant(0, "i32");
       this.builder.createReturn(zero);
     });
+
+    this.emitItables();
+  }
+
+  getMethodImpl(className, methodName) {
+    let curr = className;
+    while (curr && this.structRegistry.has(curr)) {
+      const meta = this.structRegistry.get(curr);
+      if (meta.methods && meta.methods.has(methodName)) {
+        return { className: curr, methodMeta: meta.methods.get(methodName) };
+      }
+      curr = meta.superClass;
+    }
+    return null;
+  }
+
+  boxIntoInterface(val, ifaceName) {
+    if (!ifaceName || !val) return val;
+    if (val.isInterface) return val;
+
+    const ifaceMeta = this.structRegistry.get(ifaceName);
+    if (!ifaceMeta || !ifaceMeta.isPolymorphic) return val;
+
+    const className = val.structName;
+    if (!className) return val;
+
+    const key = `${className}_${ifaceName}`;
+    this.requiredItables.set(key, { className, ifaceName });
+
+    const itableFn = `@rts_get_itable_${className}_${ifaceName}`;
+    const itablePtr = this.builder.nextSSA();
+    this.builder.emit(`${itablePtr} = func.call ${itableFn}() : () -> !llvm.ptr`);
+
+    const instancePtr = val.ssa || val.ptr;
+    const fat0 = this.builder.nextSSA();
+    this.builder.emit(`${fat0} = llvm.mlir.undef : !llvm.struct<(!llvm.ptr, !llvm.ptr)>`);
+    const fat1 = this.builder.nextSSA();
+    this.builder.emit(`${fat1} = llvm.insertvalue ${instancePtr}, ${fat0}[0] : !llvm.struct<(!llvm.ptr, !llvm.ptr)>`);
+    const fat2 = this.builder.nextSSA();
+    this.builder.emit(`${fat2} = llvm.insertvalue ${itablePtr}, ${fat1}[1] : !llvm.struct<(!llvm.ptr, !llvm.ptr)>`);
+
+    return {
+      ssa: fat2,
+      ptr: fat2,
+      type: "!llvm.struct<(!llvm.ptr, !llvm.ptr)>",
+      isInterface: true,
+      structName: ifaceName,
+      isHeap: val.isHeap,
+    };
+  }
+
+  emitItables() {
+    if (!this.requiredItables || this.requiredItables.size === 0) return;
+
+    this.builder.markFeature("heap");
+
+    for (const { className, ifaceName } of this.requiredItables.values()) {
+      const itableBaseName = `itable_${className}_${ifaceName}`;
+      const cacheGlobalName = `${itableBaseName}_cache`;
+      const getterFnName = `rts_get_itable_${className}_${ifaceName}`;
+
+      const ifaceMeta = this.structRegistry.get(ifaceName);
+      if (!ifaceMeta) continue;
+
+      const methodsList = ifaceMeta.methodsList || [];
+      const byteSize = Math.max(methodsList.length * 8, 8);
+
+      // 1. Static cache global
+      this.builder.emit(`llvm.mlir.global internal @${cacheGlobalName}() : !llvm.ptr {`);
+      this.builder.emit(`  %0 = llvm.mlir.zero : !llvm.ptr`);
+      this.builder.emit(`  llvm.return %0 : !llvm.ptr`);
+      this.builder.emit(`}\n`);
+
+      // 2. Getter function
+      this.builder.block(`func.func @${getterFnName}() -> !llvm.ptr`, () => {
+        const addrSSA = this.builder.nextSSA();
+        this.builder.emit(`${addrSSA} = llvm.mlir.addressof @${cacheGlobalName} : !llvm.ptr`);
+        const cachedSSA = this.builder.nextSSA();
+        this.builder.emit(`${cachedSSA} = llvm.load ${addrSSA} : !llvm.ptr -> !llvm.ptr`);
+        const nullSSA = this.builder.nextSSA();
+        this.builder.emit(`${nullSSA} = llvm.mlir.zero : !llvm.ptr`);
+        const condSSA = this.builder.nextSSA();
+        this.builder.emit(`${condSSA} = llvm.icmp "ne" ${cachedSSA}, ${nullSSA} : !llvm.ptr`);
+
+        const cachedBlock = this.builder.nextBlock("itable_cached");
+        const initBlock = this.builder.nextBlock("itable_init");
+
+        this.builder.emitBranchConditional(condSSA, cachedBlock, initBlock);
+
+        // Cached block
+        this.builder.emitBlockLabel(cachedBlock);
+        this.builder.emit(`func.return ${cachedSSA} : !llvm.ptr`);
+
+        // Init block
+        this.builder.emitBlockLabel(initBlock);
+        const szSSA = this.builder.nextSSA();
+        this.builder.emit(`${szSSA} = llvm.mlir.constant(${byteSize} : i64) : i64`);
+        const tableSSA = this.builder.nextSSA();
+        this.builder.emit(`${tableSSA} = llvm.call @malloc(${szSSA}) : (i64) -> !llvm.ptr`);
+
+        for (let i = 0; i < methodsList.length; i++) {
+          const m = methodsList[i];
+          const impl = this.getMethodImpl(className, m.name);
+          if (!impl) {
+            throw new Error(`[Itable] '${className}' sınıfında '${m.name}' metodunun implementasyonu bulunamadı!`);
+          }
+
+          const targetFn = `@${impl.className}_${m.name}`;
+          const rawParamTypes = m.params || [];
+          const paramTypes = rawParamTypes.map((p) => (typeof p === "string" ? p : this.resolveType(p)));
+          const retType = m.retType || "none";
+          const callableType = `(!llvm.ptr${paramTypes.length ? ", " + paramTypes.join(", ") : ""}) -> ${retType === "none" ? "()" : retType}`;
+
+          const fnConst = this.builder.nextSSA();
+          this.builder.emit(`${fnConst} = func.constant ${targetFn} : ${callableType}`);
+          const fnPtr = this.builder.nextSSA();
+          this.builder.emit(`${fnPtr} = builtin.unrealized_conversion_cast ${fnConst} : ${callableType} to !llvm.ptr`);
+
+          const gepSSA = this.builder.nextSSA();
+          this.builder.emit(
+            `${gepSSA} = llvm.getelementptr ${tableSSA}[${i}] : (!llvm.ptr) -> !llvm.ptr, !llvm.ptr`
+          );
+          this.builder.emit(`llvm.store ${fnPtr}, ${gepSSA} : !llvm.ptr, !llvm.ptr`);
+        }
+
+        this.builder.emit(`llvm.store ${tableSSA}, ${addrSSA} : !llvm.ptr, !llvm.ptr`);
+        this.builder.emit(`func.return ${tableSSA} : !llvm.ptr`);
+      });
+    }
   }
 
   emitSpawnRunners() {
@@ -1470,6 +1619,8 @@ export class ASTLowerer {
     const structName = node.id.name;
     const fields = [];
     const types = [];
+    const methods = new Map();
+    const methodsList = [];
 
     // 1. Interface Kalıtımı (interface EntityHeader extends Base, Identifiable)
     const extendsList = node.extends || node.heritage || [];
@@ -1478,16 +1629,25 @@ export class ASTLowerer {
       const parentName = h.expression?.name || h.expression?.value || h.id?.name || h.name;
       if (parentName && this.structRegistry.has(parentName)) {
         const parentMeta = this.structRegistry.get(parentName);
-        for (const f of parentMeta.fields) {
+        for (const f of parentMeta.fields || []) {
           if (f.name !== "__type_id" && !fields.some((existing) => existing.name === f.name)) {
             fields.push({ ...f, index: fields.length });
             types.push(f.type);
           }
         }
+        if (parentMeta.methodsList) {
+          for (const m of parentMeta.methodsList) {
+            if (!methods.has(m.name)) {
+              const inheritedM = { ...m, index: methodsList.length };
+              methods.set(m.name, inheritedM);
+              methodsList.push(inheritedM);
+            }
+          }
+        }
       }
     }
 
-    // 2. Kendi Alanları (Own members)
+    // 2. Kendi Alanları ve Metotları (Own members)
     const members =
       node.members ||
       node.body?.body ||
@@ -1495,13 +1655,45 @@ export class ASTLowerer {
       (Array.isArray(node.body) ? node.body : []);
 
     members.forEach((member) => {
-      if (member.type === "TSPropertySignature" || member.key) {
+      if (member.type === "TSMethodSignature") {
+        const methodName = member.key?.name || member.key?.value || member.name;
+        const rawParams = Array.isArray(member.params)
+          ? member.params
+          : Array.isArray(member.params?.items)
+          ? member.params.items
+          : [];
+        const params = rawParams.map((p) => {
+          const annot = p.typeAnnotation || p.pattern?.typeAnnotation || p.id?.typeAnnotation;
+          return this.resolveType(annot);
+        });
+        const paramsMeta = rawParams.map((p) => {
+          const annot = p.typeAnnotation || p.pattern?.typeAnnotation || p.id?.typeAnnotation;
+          const sName = this.getStructName(annot);
+          return { structName: sName };
+        });
+        const retType = this.resolveType(member.returnType);
+        const isRetString = this.isStringType(member.returnType);
+        const structRetName = this.getStructName(member.returnType);
+
+        const mData = {
+          name: methodName,
+          params,
+          paramsMeta,
+          retType,
+          isRetString,
+          structRetName,
+          index: methodsList.length,
+          node: member,
+        };
+        methods.set(methodName, mData);
+        methodsList.push(mData);
+      } else if (member.type === "TSPropertySignature" || member.key) {
         const fieldName = member.key?.name || member.key?.value || member.name;
-        const existingIdx = fields.findIndex((f) => f.name === fieldName);
         const typeAnnot = member.typeAnnotation;
         const isFn = this.isFunctionType(typeAnnot);
         const fnSig = isFn ? this.extractFunctionType(typeAnnot) : null;
-        const fieldType = this.resolveType(typeAnnot);
+        const existingIdx = fields.findIndex((f) => f.name === fieldName);
+        const fieldType = isFn ? "!llvm.struct<(!llvm.ptr, !llvm.ptr)>" : this.resolveType(typeAnnot);
         const sName = this.getStructName(typeAnnot);
         const enumName = this.getEnumName(typeAnnot);
         const isString = this.isStringType(typeAnnot);
@@ -1534,10 +1726,26 @@ export class ASTLowerer {
       }
     });
 
+    const isPolymorphic = methodsList.length > 0;
     const pragmas = this.getPragmas(node);
     const isPacked = pragmas.packed;
-    const mlirType = isPacked ? `!llvm.struct<packed (${types.join(", ")})>` : `!llvm.struct<(${types.join(", ")})>`;
-    this.structRegistry.set(structName, { name: structName, fields, mlirType, methods: new Map(), isPacked });
+    const mlirType = isPolymorphic
+      ? "!llvm.struct<(!llvm.ptr, !llvm.ptr)>"
+      : isPacked
+      ? `!llvm.struct<packed (${types.join(", ")})>`
+      : `!llvm.struct<(${types.join(", ")})>`;
+
+    this.structRegistry.set(structName, {
+      name: structName,
+      fields,
+      types,
+      mlirType,
+      methods,
+      methodsList,
+      isInterface: true,
+      isPolymorphic,
+      isPacked,
+    });
   }
 
   resolveClassHierarchy(rawClasses) {
@@ -1699,7 +1907,8 @@ export class ASTLowerer {
             else if (["i64", "int64", "u64"].includes(tName)) arrElemType = "i64";
             else if (["bool", "boolean"].includes(tName)) arrElemType = "i1";
             else if (this.structRegistry.has(tName) || this.classList.some((c) => c.name === tName)) {
-              arrElemType = "!llvm.ptr";
+              const isPoly = this.isPolymorphicInterface(tName);
+              arrElemType = isPoly ? "!llvm.struct<(!llvm.ptr, !llvm.ptr)>" : "!llvm.ptr";
               arrStruct = tName;
             }
           } else if (elRaw.type === "TSNumberKeyword") {
@@ -1709,12 +1918,13 @@ export class ASTLowerer {
           }
         }
         const isStr = this.isStringType(typeAnnot);
-        const pType = isFn ? fnSig.mlirType : (isUnion || isArr || isStr) ? "!llvm.ptr" : this.resolveType(typeAnnot);
         const structName = this.getStructName(typeAnnot);
+        const isPolyIface = this.isPolymorphicInterface(structName);
+        const pType = isFn ? fnSig.mlirType : isPolyIface ? "!llvm.struct<(!llvm.ptr, !llvm.ptr)>" : (isUnion || isArr || isStr) ? "!llvm.ptr" : this.resolveType(typeAnnot);
         const ssaArg = `%arg_${pName}`;
 
         paramStrings.push(`${ssaArg}: ${pType}`);
-        params.push({ name: pName, ssa: ssaArg, type: pType, structName, isUnion, isArray: isArr, elemType: arrElemType, isString: isStr || isArrString, arrStruct, isFunction: isFn, fnSig, typeAnnot });
+        params.push({ name: pName, ssa: ssaArg, type: pType, structName, isInterface: isPolyIface, isUnion, isArray: isArr, elemType: arrElemType, isString: isStr || isArrString, arrStruct, isFunction: isFn, fnSig, typeAnnot });
       });
 
       const retType = isConstructor ? "none" : this.resolveType(fnExpr.returnType);
@@ -1762,6 +1972,18 @@ export class ASTLowerer {
               elemType: p.elemType || "f64",
               isString: p.isString || false,
               structName: p.arrStruct || p.structName || null,
+              isRef: true,
+            });
+          } else if (p.isInterface || this.isPolymorphicInterface(p.structName)) {
+            const slot = this.builder.allocateStack("!llvm.struct<(!llvm.ptr, !llvm.ptr)>");
+            this.builder.store(slot.ptr, { ssa: p.ssa, type: "!llvm.struct<(!llvm.ptr, !llvm.ptr)>" });
+            this.symbolTable.set(p.name, {
+              ptr: slot.ptr,
+              ssa: p.ssa,
+              type: "!llvm.struct<(!llvm.ptr, !llvm.ptr)>",
+              structName: p.structName,
+              isInterface: true,
+              isSlot: true,
               isRef: true,
             });
           } else if (p.structName) {
@@ -1838,7 +2060,8 @@ export class ASTLowerer {
           else if (["i64", "int64", "u64"].includes(tName)) arrElemType = "i64";
           else if (["bool", "boolean"].includes(tName)) arrElemType = "i1";
           else if (this.structRegistry.has(tName) || this.classList.some((c) => c.name === tName)) {
-            arrElemType = "!llvm.ptr";
+            const isPoly = this.isPolymorphicInterface(tName);
+            arrElemType = isPoly ? "!llvm.struct<(!llvm.ptr, !llvm.ptr)>" : "!llvm.ptr";
             arrStruct = tName;
           }
         } else if (elRaw.type === "TSNumberKeyword") {
@@ -1849,13 +2072,14 @@ export class ASTLowerer {
       }
       const isChan = this.unwrapType(typeAnnot)?.typeName?.name === "Channel";
       const isStr = this.isStringType(typeAnnot);
-      const pType = isFn ? "!llvm.struct<(!llvm.ptr, !llvm.ptr)>" : (isUnion || isArr || isChan || isStr) ? "!llvm.ptr" : this.resolveType(typeAnnot);
       const structName = this.getStructName(typeAnnot);
+      const isPolyIface = this.isPolymorphicInterface(structName);
+      const pType = isFn ? "!llvm.struct<(!llvm.ptr, !llvm.ptr)>" : isPolyIface ? "!llvm.struct<(!llvm.ptr, !llvm.ptr)>" : (isUnion || isArr || isChan || isStr) ? "!llvm.ptr" : this.resolveType(typeAnnot);
 
       const ssaArg = `%arg_${pName}`;
       paramStrings.push(`${ssaArg}: ${pType}`);
       paramTypes.push(pType);
-      params.push({ name: pName, ssa: ssaArg, type: pType, structName, isUnion, isArray: isArr, elemType: arrElemType, isString: isStr || isArrString, arrStruct, isFunction: isFn, isClosure: isFn, fnSig, typeAnnot, isChannel: isChan });
+      params.push({ name: pName, ssa: ssaArg, type: pType, structName, isInterface: isPolyIface, isUnion, isArray: isArr, elemType: arrElemType, isString: isStr || isArrString, arrStruct, isFunction: isFn, isClosure: isFn, fnSig, typeAnnot, isChannel: isChan });
     });
 
     const innerRetType = fnMeta?.innerRetType || "f64";
@@ -2031,6 +2255,18 @@ export class ASTLowerer {
             ssa: p.ssa,
             type: "!llvm.ptr",
             isChannel: true,
+            isRef: true,
+          });
+        } else if (p.isInterface || this.isPolymorphicInterface(p.structName)) {
+          const slot = this.builder.allocateStack("!llvm.struct<(!llvm.ptr, !llvm.ptr)>");
+          this.builder.store(slot.ptr, { ssa: p.ssa, type: "!llvm.struct<(!llvm.ptr, !llvm.ptr)>" });
+          this.symbolTable.set(p.name, {
+            ptr: slot.ptr,
+            ssa: p.ssa,
+            type: "!llvm.struct<(!llvm.ptr, !llvm.ptr)>",
+            structName: p.structName,
+            isInterface: true,
+            isSlot: true,
             isRef: true,
           });
         } else if (p.structName) {
@@ -2368,7 +2604,7 @@ export class ASTLowerer {
                 innerRetType: val.innerRetType,
                 isRef: true,
               });
-            } else if (val.isFunction || val.isClosure || val.type === "!llvm.struct<(!llvm.ptr, !llvm.ptr)>") {
+            } else if (!val.isInterface && !this.isPolymorphicInterface(explicitStruct) && (val.isFunction || val.isClosure || val.type === "!llvm.struct<(!llvm.ptr, !llvm.ptr)>")) {
               const slot = this.builder.allocateStack("!llvm.struct<(!llvm.ptr, !llvm.ptr)>");
               this.builder.store(slot.ptr, val);
               const explicitFnSig = this.extractFunctionType(decl.id.typeAnnotation);
@@ -2396,6 +2632,35 @@ export class ASTLowerer {
                 isString: isExplicitString || val.isString || false,
                 structName: explicitStruct || val.structName || null,
                 isRef: true,
+              });
+            } else if (!val.isArray && explicitStruct && this.isPolymorphicInterface(explicitStruct)) {
+              if (!val.isInterface) {
+                val = this.boxIntoInterface(val, explicitStruct);
+              }
+              const slot = this.builder.allocateStack("!llvm.struct<(!llvm.ptr, !llvm.ptr)>");
+              this.builder.store(slot.ptr, val);
+              this.symbolTable.set(varName, {
+                ptr: slot.ptr,
+                ssa: val.ssa,
+                type: "!llvm.struct<(!llvm.ptr, !llvm.ptr)>",
+                structName: explicitStruct,
+                isInterface: true,
+                isRef: true,
+                isSlot: true,
+                isHeap: val.isHeap,
+              });
+            } else if (!val.isArray && (val.isInterface || (val.structName && this.isPolymorphicInterface(val.structName)))) {
+              const slot = this.builder.allocateStack("!llvm.struct<(!llvm.ptr, !llvm.ptr)>");
+              this.builder.store(slot.ptr, val);
+              this.symbolTable.set(varName, {
+                ptr: slot.ptr,
+                ssa: val.ssa,
+                type: "!llvm.struct<(!llvm.ptr, !llvm.ptr)>",
+                structName: val.structName,
+                isInterface: true,
+                isRef: true,
+                isSlot: true,
+                isHeap: val.isHeap,
               });
             } else if (decl.init.type === "NewExpression") {
               if (stmt.kind === "let") {
@@ -2699,9 +2964,14 @@ export class ASTLowerer {
 
       case "ReturnStatement": {
         const expectedRet = this.getCurrentFunctionRetType();
+        const expectedStruct = this.getCurrentFunctionStructRetName();
         if (stmt.argument) {
           let val = this.lowerExpression(stmt.argument);
-          if (expectedRet && expectedRet !== "none") {
+          if (expectedStruct && this.isPolymorphicInterface(expectedStruct)) {
+            if (!val.isInterface) {
+              val = this.boxIntoInterface(val, expectedStruct);
+            }
+          } else if (expectedRet && expectedRet !== "none") {
             val = this.coerceType(val, expectedRet);
           }
           if (val.type === "!llvm.ptr" || val.isHeap) {
@@ -2869,7 +3139,9 @@ export class ASTLowerer {
         if (val.isUnion) {
           return { ssa: val.ssa || val.ptr, ptr: val.ssa || val.ptr, type: "!llvm.ptr", isUnion: true };
         }
-        if (paramMeta && !val.isFunction) {
+        if (paramMeta?.structName && this.isPolymorphicInterface(paramMeta.structName) && !val.isInterface) {
+          val = this.boxIntoInterface(val, paramMeta.structName);
+        } else if (paramMeta && !val.isFunction) {
           val = this.coerceType(val, paramMeta.type);
         }
         return val;
@@ -2984,6 +3256,10 @@ export class ASTLowerer {
     let elemType = targetElemType;
     let isStringElem = isTargetString;
     let structNameElem = targetStructName;
+    const isPolyIface = this.isPolymorphicInterface(targetStructName);
+    if (isPolyIface) {
+      elemType = "!llvm.struct<(!llvm.ptr, !llvm.ptr)>";
+    }
 
     if (!elemType && loweredElements.length > 0) {
       const first = loweredElements[0];
@@ -3008,7 +3284,8 @@ export class ASTLowerer {
     if (!elemType) elemType = "f64";
 
     const isI32 = elemType === "i32";
-    const byteSize = isI32 ? Math.max(8 + len * 4, 16) : Math.max((len + 1) * 8, 16);
+    const isFatPtr = elemType === "!llvm.struct<(!llvm.ptr, !llvm.ptr)>";
+    const byteSize = isI32 ? Math.max(8 + len * 4, 16) : isFatPtr ? Math.max((len + 1) * 16, 16) : Math.max((len + 1) * 8, 16);
     const heapSlot = this.builder.allocateHeap(byteSize);
 
     const lenConst = this.builder.nextSSA();
@@ -3017,7 +3294,9 @@ export class ASTLowerer {
 
     loweredElements.forEach((val, index) => {
       let finalVal = val;
-      if (isStringElem) {
+      if (isPolyIface && !finalVal.isInterface) {
+        finalVal = this.boxIntoInterface(finalVal, targetStructName);
+      } else if (isStringElem) {
         finalVal = this.coerceType(finalVal, "!llvm.ptr");
       } else {
         finalVal = this.coerceType(finalVal, elemType);
@@ -3049,6 +3328,7 @@ export class ASTLowerer {
       elemType,
       isString: isStringElem,
       structName: structNameElem,
+      isInterface: false,
       isHeap: true,
       isArray: true,
       isRef: true,
@@ -3457,6 +3737,26 @@ export class ASTLowerer {
       if (this.symbolTable.has(expr.name)) {
         const sym = this.symbolTable.get(expr.name);
 
+        if (!sym.isArray && (sym.isInterface || this.isPolymorphicInterface(sym.structName))) {
+          if (sym.isSlot) {
+            const loaded = this.builder.load(sym.ptr, "!llvm.struct<(!llvm.ptr, !llvm.ptr)>");
+            return {
+              ssa: loaded.ssa,
+              ptr: sym.ptr,
+              type: "!llvm.struct<(!llvm.ptr, !llvm.ptr)>",
+              structName: sym.structName,
+              isInterface: true,
+              isSlot: true,
+            };
+          }
+          return {
+            ssa: sym.ssa || sym.ptr,
+            ptr: sym.ptr || sym.ssa,
+            type: "!llvm.struct<(!llvm.ptr, !llvm.ptr)>",
+            structName: sym.structName,
+            isInterface: true,
+          };
+        }
         if (sym.isFunction || sym.isClosure || sym.type === "!llvm.struct<(!llvm.ptr, !llvm.ptr)>") {
           if (sym.ptr && sym.ptr !== sym.ssa) {
             const loaded = this.builder.load(sym.ptr, "!llvm.struct<(!llvm.ptr, !llvm.ptr)>");
@@ -3546,6 +3846,9 @@ export class ASTLowerer {
         if (g.structName) {
           loaded.structName = g.structName;
           loaded.ptr = loaded.ssa;
+          if (g.isInterface || this.isPolymorphicInterface(g.structName)) {
+            loaded.isInterface = true;
+          }
         }
         if (g.isArray) {
           loaded.isArray = true;
@@ -3682,6 +3985,9 @@ export class ASTLowerer {
         }
         if (base.structName) {
           loaded.structName = base.structName;
+          if (this.isPolymorphicInterface(base.structName)) {
+            loaded.isInterface = true;
+          }
         }
         return loaded;
       }
@@ -3829,7 +4135,13 @@ export class ASTLowerer {
               this.boxIntoUnion(sym.ptr, rhs);
               return { ssa: sym.ptr, ptr: sym.ptr, type: "!llvm.ptr", isUnion: true };
             }
-            rhs = this.coerceType(rhs, sym.type);
+            if (!sym.isArray && (sym.isInterface || this.isPolymorphicInterface(sym.structName))) {
+              if (!rhs.isInterface) {
+                rhs = this.boxIntoInterface(rhs, sym.structName);
+              }
+            } else {
+              rhs = this.coerceType(rhs, sym.type);
+            }
           }
           this.builder.store(sym.ptr, rhs);
           if (rhs.isString) sym.isString = true;
@@ -3859,7 +4171,13 @@ export class ASTLowerer {
               rhs = this.coerceType(rhs, g.type);
             }
           } else {
-            rhs = this.coerceType(rhs, g.type);
+            if (!g.isArray && (g.isInterface || this.isPolymorphicInterface(g.structName))) {
+              if (!rhs.isInterface) {
+                rhs = this.boxIntoInterface(rhs, g.structName);
+              }
+            } else {
+              rhs = this.coerceType(rhs, g.type);
+            }
           }
           this.builder.store(addr, rhs);
           if (rhs.isString) g.isString = true;
@@ -4410,6 +4728,86 @@ export class ASTLowerer {
           }
         }
 
+        if (base.isInterface || (base.structName && this.isPolymorphicInterface(base.structName))) {
+          const ifaceName = base.structName;
+          const ifaceMeta = this.structRegistry.get(ifaceName);
+          if (!ifaceMeta) {
+            throw new Error(`[Itable] Arayüz bulunamadı: '${ifaceName}'`);
+          }
+
+          const methodIdx = ifaceMeta.methodsList ? ifaceMeta.methodsList.findIndex((m) => m.name === methodName) : -1;
+          if (methodIdx === -1) {
+            throw new Error(`[Itable] '${ifaceName}' arayüzünde '${methodName}' metodu bulunamadı!`);
+          }
+          const methodMeta = ifaceMeta.methodsList[methodIdx];
+
+          // 1. Extract instancePtr and itablePtr
+          let fatVal = base;
+          if (!base.ssa && base.ptr) {
+            fatVal = this.builder.load(base.ptr, "!llvm.struct<(!llvm.ptr, !llvm.ptr)>");
+          }
+
+          const instancePtr = this.builder.nextSSA();
+          this.builder.emit(
+            `${instancePtr} = llvm.extractvalue ${fatVal.ssa || fatVal.ptr}[0] : !llvm.struct<(!llvm.ptr, !llvm.ptr)>`
+          );
+          const itablePtr = this.builder.nextSSA();
+          this.builder.emit(
+            `${itablePtr} = llvm.extractvalue ${fatVal.ssa || fatVal.ptr}[1] : !llvm.struct<(!llvm.ptr, !llvm.ptr)>`
+          );
+
+          // 2. Load function pointer from itable
+          const methodPtrAddr = this.builder.nextSSA();
+          this.builder.emit(
+            `${methodPtrAddr} = llvm.getelementptr ${itablePtr}[${methodIdx}] : (!llvm.ptr) -> !llvm.ptr, !llvm.ptr`
+          );
+          const methodFnPtr = this.builder.load(methodPtrAddr, "!llvm.ptr");
+
+          // 3. Prepare parameters and arguments
+          const rawParamTypes = methodMeta.params || [];
+          const paramTypes = rawParamTypes.map((p) => (typeof p === "string" ? p : this.resolveType(p)));
+          const retType = methodMeta.retType || "none";
+
+          const args = expr.arguments
+            ? expr.arguments.map((a, i) => {
+                let val = this.lowerExpression(a);
+                const targetPType = paramTypes[i];
+                const pMeta = methodMeta.paramsMeta?.[i];
+                if (pMeta?.structName && this.isPolymorphicInterface(pMeta.structName) && !val.isInterface) {
+                  val = this.boxIntoInterface(val, pMeta.structName);
+                } else if (targetPType) {
+                  val = this.coerceType(val, targetPType);
+                } else if (val.type === "i64" || val.type === "i32") {
+                  val = this.coerceType(val, "f64");
+                }
+                return val;
+              })
+            : [];
+
+          const callableType = `(!llvm.ptr${paramTypes.length ? ", " + paramTypes.join(", ") : ""}) -> ${retType === "none" ? "()" : retType}`;
+          const callableSSA = this.builder.nextSSA();
+          this.builder.emit(
+            `${callableSSA} = builtin.unrealized_conversion_cast ${methodFnPtr.ssa} : !llvm.ptr to ${callableType}`
+          );
+
+          const allArgsSSA = [instancePtr, ...args.map((a) => a.ssa || a.ptr)].join(", ");
+          if (retType === "none") {
+            this.builder.emit(`func.call_indirect ${callableSSA}(${allArgsSSA}) : ${callableType}`);
+            return { ssa: "", ptr: "", type: "none" };
+          } else {
+            const ssa = this.builder.nextSSA();
+            this.builder.emit(`${ssa} = func.call_indirect ${callableSSA}(${allArgsSSA}) : ${callableType}`);
+            return {
+              ssa,
+              ptr: ssa,
+              type: retType,
+              structName: methodMeta.structRetName,
+              isString: methodMeta.isRetString || false,
+              isHeap: retType === "!llvm.ptr",
+            };
+          }
+        }
+
         if (base.structName) {
           const structMeta = this.structRegistry.get(base.structName);
           const fieldMeta = structMeta?.fields.find((f) => f.name === methodName);
@@ -4501,7 +4899,9 @@ export class ASTLowerer {
             if (val.isUnion) {
               return { ssa: val.ssa || val.ptr, ptr: val.ssa || val.ptr, type: "!llvm.ptr", isUnion: true };
             }
-            if (paramMeta && !val.isFunction) {
+            if (paramMeta?.structName && this.isPolymorphicInterface(paramMeta.structName) && !val.isInterface) {
+              val = this.boxIntoInterface(val, paramMeta.structName);
+            } else if (paramMeta && !val.isFunction) {
               val = this.coerceType(val, paramMeta.type);
             }
             return val;
@@ -4534,7 +4934,7 @@ export class ASTLowerer {
 
       if (expr.callee.type === "Identifier" && this.symbolTable.has(expr.callee.name)) {
         const localSym = this.symbolTable.get(expr.callee.name);
-        if (localSym && (localSym.isFunction || localSym.isClosure || localSym.type === "!llvm.struct<(!llvm.ptr, !llvm.ptr)>")) {
+        if (localSym && !localSym.isInterface && (localSym.isFunction || localSym.isClosure || localSym.type === "!llvm.struct<(!llvm.ptr, !llvm.ptr)>")) {
           const fnSig = localSym.fnSig || {};
           let fatVal;
           if (localSym.ptr && localSym.ptr !== localSym.ssa) {
@@ -4593,6 +4993,7 @@ export class ASTLowerer {
         let calleeVal = this.lowerExpression(expr.callee);
         if (
           calleeVal &&
+          !calleeVal.isInterface &&
           (calleeVal.isClosure ||
             calleeVal.isFunction ||
             calleeVal.type === "!llvm.struct<(!llvm.ptr, !llvm.ptr)>")
@@ -4667,7 +5068,9 @@ export class ASTLowerer {
         if (val.isUnion) {
           return { ssa: val.ssa || val.ptr, ptr: val.ssa || val.ptr, type: "!llvm.ptr", isUnion: true };
         }
-        if (paramMeta && !val.isFunction) {
+        if (paramMeta?.structName && this.isPolymorphicInterface(paramMeta.structName) && !val.isInterface) {
+          val = this.boxIntoInterface(val, paramMeta.structName);
+        } else if (paramMeta && !val.isFunction) {
           val = this.coerceType(val, paramMeta.type);
         }
 
