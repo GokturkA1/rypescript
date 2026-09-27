@@ -64,6 +64,7 @@ export class TypeChecker {
       case "TSTypeReference": {
         const name = curr.typeName?.name || curr.typeName?.value;
         if (!name) return "any";
+        if (["f32x4", "f64x2", "i32x4", "i64x2", "f64x4", "f32x8", "i32x8"].includes(name)) return name;
         if (["i64", "i32", "f64", "f32"].includes(name)) return "number";
         if (name === "bool") return "boolean";
         if (name === "Array") {
@@ -425,6 +426,10 @@ export class TypeChecker {
       }
       if (expr.operator === "-" || expr.operator === "+" || expr.operator === "~") {
         const argType = this.inferExpressionType(expr.argument);
+        const isVectorType = ["f32x4", "f64x2", "i32x4", "i64x2", "f64x4", "f32x8", "i32x8"].includes(argType);
+        if (isVectorType && (expr.operator === "-" || expr.operator === "+")) {
+          return argType;
+        }
         if (argType !== "number" && argType !== "any") {
           this.reporter.addError(
             this.currentFilePath,
@@ -471,6 +476,16 @@ export class TypeChecker {
       const leftType = this.inferExpressionType(expr.left);
       const rightType = this.inferExpressionType(expr.right);
       const op = expr.operator;
+
+      const isVectorType = (t) => ["f32x4", "f64x2", "i32x4", "i64x2", "f64x4", "f32x8", "i32x8"].includes(t);
+      if (isVectorType(leftType) && leftType === rightType) {
+        if (["+", "-", "*", "/"].includes(op)) {
+          return leftType;
+        }
+        if (["===", "==", "!==", "!="].includes(op)) {
+          return "boolean";
+        }
+      }
 
       // 7.1. Toplama ve String Birleştirme (+)
       if (op === "+") {
@@ -614,6 +629,11 @@ export class TypeChecker {
         return sym.type;
       }
 
+      // Vektör ve SIMD Namespace kontrolü
+      if (["f32x4", "f64x2", "i32x4", "i64x2", "f64x4", "f32x8", "i32x8", "simd"].includes(expr.name)) {
+        return expr.name;
+      }
+
       // Genel fonksiyon kontrolü
       if (this.builtins.functionSignatures.has(expr.name)) {
         return "function";
@@ -738,6 +758,13 @@ export class TypeChecker {
             );
           }
           return "string";
+        }
+      }
+
+      // Vektör eleman erişimi (v[idx])
+      if (["f32x4", "f64x2", "i32x4", "i64x2", "f64x4", "f32x8", "i32x8"].includes(baseType)) {
+        if (expr.computed) {
+          return "number";
         }
       }
 
@@ -1035,6 +1062,12 @@ export class TypeChecker {
               );
             }
           });
+          if (structName === "simd") {
+            const firstArgType = actualArgs.length > 0 ? this.inferExpressionType(actualArgs[0]) : null;
+            if (["add", "sub", "mul", "div", "fma", "insert", "sqrt", "abs"].includes(method) && firstArgType) {
+              return firstArgType;
+            }
+          }
           return substitute(methodMeta.returnType || "void");
         }
         return "any";
@@ -1133,11 +1166,12 @@ export class TypeChecker {
         const expectedParams = fnMeta.params.map(substitute);
         const returnType = substitute(fnMeta.outerReturnType || fnMeta.returnType);
 
-        if (actualArgs.length !== expectedParams.length) {
+        const minArgs = fnMeta.minArgs !== undefined ? fnMeta.minArgs : expectedParams.length;
+        if (actualArgs.length < minArgs || actualArgs.length > expectedParams.length) {
           this.reporter.addError(
             this.currentFilePath,
             expr,
-            `Argüman sayısı uyuşmazlığı: '${fnName}' ${expectedParams.length} argüman beklerken ${actualArgs.length} verildi.`
+            `Argüman sayısı uyuşmazlığı: '${fnName}' ${minArgs === expectedParams.length ? expectedParams.length : `${minArgs}-${expectedParams.length}`} argüman beklerken ${actualArgs.length} verildi.`
           );
         }
 

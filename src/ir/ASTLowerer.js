@@ -518,6 +518,13 @@ export class ASTLowerer {
       case "TSTypeReference": {
         const typeName = type.typeName?.name || type.typeName?.value;
         if (typeName === "Channel" || typeName === "Arena" || typeName === "Pool" || typeName === "FixedBuffer") return "!llvm.ptr";
+        if (typeName === "f32x4") return "vector<4xf32>";
+        if (typeName === "f64x2") return "vector<2xf64>";
+        if (typeName === "i32x4") return "vector<4xi32>";
+        if (typeName === "i64x2") return "vector<2xi64>";
+        if (typeName === "f64x4") return "vector<4xf64>";
+        if (typeName === "f32x8") return "vector<8xf32>";
+        if (typeName === "i32x8") return "vector<8xi32>";
         if (["i64", "int64", "u64", "uint64"].includes(typeName)) return "i64";
         if (["i32", "int32", "u32", "uint32", "int"].includes(typeName)) return "i32";
         if (["f64", "double"].includes(typeName)) return "f64";
@@ -631,6 +638,9 @@ export class ASTLowerer {
 
   coerceType(val, targetType) {
     if (!val || val.type === targetType) return val;
+    if ((targetType && targetType.startsWith("vector<")) || (val.type && val.type.startsWith("vector<"))) {
+      return val;
+    }
 
     if (targetType === "i1") {
       if (val.type === "!llvm.ptr") {
@@ -648,6 +658,21 @@ export class ASTLowerer {
       }
     }
 
+    if (targetType === "f64" && val.type === "f32") {
+      const ssa = this.builder.nextSSA();
+      this.builder.emit(`${ssa} = arith.extf ${val.ssa} : f32 to f64`);
+      return { ssa, type: "f64" };
+    }
+    if (targetType === "f32" && val.type === "f64") {
+      const ssa = this.builder.nextSSA();
+      this.builder.emit(`${ssa} = arith.truncf ${val.ssa} : f64 to f32`);
+      return { ssa, type: "f32" };
+    }
+    if (targetType === "f32" && (val.type === "i64" || val.type === "i32")) {
+      const ssa = this.builder.nextSSA();
+      this.builder.emit(`${ssa} = arith.sitofp ${val.ssa} : ${val.type} to f32`);
+      return { ssa, type: "f32" };
+    }
     if (targetType === "f64" && (val.type === "i64" || val.type === "i32")) {
       const ssa = this.builder.nextSSA();
       this.builder.emit(`${ssa} = arith.sitofp ${val.ssa} : ${val.type} to f64`);
@@ -2886,6 +2911,7 @@ export class ASTLowerer {
                   innerRetType: val.innerRetType || null,
                   structName: val.structName || null,
                   isSlot: true,
+                  isVector: Boolean(val.isVector || (targetType && targetType.startsWith("vector<"))),
                 });
               }
             }
@@ -2931,6 +2957,7 @@ export class ASTLowerer {
                 type: resolvedType,
                 isRef: true,
                 isString: isString,
+                isVector: Boolean(resolvedType && resolvedType.startsWith("vector<")),
               });
             }
           }
@@ -3480,6 +3507,276 @@ export class ASTLowerer {
     };
   }
 
+  tryLowerSIMDCall(expr) {
+    const VECTOR_META = {
+      f32x4: { len: 4, elem: "f32", mlirType: "vector<4xf32>", isFloat: true },
+      f64x2: { len: 2, elem: "f64", mlirType: "vector<2xf64>", isFloat: true },
+      i32x4: { len: 4, elem: "i32", mlirType: "vector<4xi32>", isFloat: false },
+      i64x2: { len: 2, elem: "i64", mlirType: "vector<2xi64>", isFloat: false },
+      f64x4: { len: 4, elem: "f64", mlirType: "vector<4xf64>", isFloat: true },
+      f32x8: { len: 8, elem: "f32", mlirType: "vector<8xf32>", isFloat: true },
+      i32x8: { len: 8, elem: "i32", mlirType: "vector<8xi32>", isFloat: false },
+    };
+
+    let calleeName = null;
+    let memberObj = null;
+    let memberProp = null;
+
+    if (expr.callee.type === "Identifier") {
+      calleeName = expr.callee.name;
+    } else if (expr.callee.type === "MemberExpression" && !expr.callee.computed) {
+      memberObj = expr.callee.object?.name;
+      memberProp = expr.callee.property?.name || expr.callee.property?.value;
+    }
+
+    // 1. Doğrudan veya simd.f32x4(...) constructor çağrısı
+    let ctorType = null;
+    if (calleeName && VECTOR_META[calleeName]) {
+      ctorType = calleeName;
+    } else if (memberObj === "simd" && memberProp && VECTOR_META[memberProp]) {
+      ctorType = memberProp;
+    }
+
+    if (ctorType) {
+      const meta = VECTOR_META[ctorType];
+      this.builder.markFeature("vector");
+      if (!expr.arguments || expr.arguments.length === 0) {
+        return this.builder.createConstant(0, meta.mlirType);
+      }
+      if (expr.arguments.length === 1) {
+        let val = this.lowerExpression(expr.arguments[0]);
+        val = this.coerceType(val, meta.elem);
+        const ssa = this.builder.nextSSA();
+        this.builder.emit(`${ssa} = vector.broadcast ${val.ssa || val.ptr} : ${meta.elem} to ${meta.mlirType}`);
+        return { ssa, type: meta.mlirType, isVector: true };
+      }
+      const loweredArgs = expr.arguments.map((arg) => {
+        let val = this.lowerExpression(arg);
+        return this.coerceType(val, meta.elem);
+      });
+      while (loweredArgs.length < meta.len) {
+        loweredArgs.push(this.builder.createConstant(0, meta.elem));
+      }
+      const ssa = this.builder.nextSSA();
+      const argSSAs = loweredArgs.slice(0, meta.len).map((a) => a.ssa || a.ptr).join(", ");
+      this.builder.emit(`${ssa} = vector.from_elements ${argSSAs} : ${meta.mlirType}`);
+      return { ssa, type: meta.mlirType, isVector: true };
+    }
+
+    // 2. splat: f32x4.splat(v) veya simd.splat_f32x4(v)
+    if ((memberObj && VECTOR_META[memberObj] && memberProp === "splat") ||
+        (memberObj === "simd" && memberProp && memberProp.startsWith("splat_"))) {
+      const targetType = memberObj === "simd" ? memberProp.replace("splat_", "") : memberObj;
+      const meta = VECTOR_META[targetType];
+      if (meta) {
+        this.builder.markFeature("vector");
+        let val = this.lowerExpression(expr.arguments[0]);
+        val = this.coerceType(val, meta.elem);
+        const ssa = this.builder.nextSSA();
+        this.builder.emit(`${ssa} = vector.broadcast ${val.ssa || val.ptr} : ${meta.elem} to ${meta.mlirType}`);
+        return { ssa, type: meta.mlirType, isVector: true };
+      }
+    }
+
+    // 3. load: f32x4.load(ptr) veya simd.load_f32x4(ptr)
+    if ((memberObj && VECTOR_META[memberObj] && memberProp === "load") ||
+        (memberObj === "simd" && memberProp && memberProp.startsWith("load_"))) {
+      const targetType = memberObj === "simd" ? memberProp.replace("load_", "") : memberObj;
+      const meta = VECTOR_META[targetType];
+      if (meta) {
+        this.builder.markFeature("vector");
+        const ptrVal = this.lowerExpression(expr.arguments[0]);
+        const ssa = this.builder.nextSSA();
+        this.builder.emit(`${ssa} = llvm.load ${ptrVal.ssa || ptrVal.ptr} : !llvm.ptr -> ${meta.mlirType}`);
+        return { ssa, type: meta.mlirType, isVector: true };
+      }
+    }
+
+    // 4. store: f32x4.store(ptr, vec) veya simd.store(ptr, vec)
+    if ((memberObj && VECTOR_META[memberObj] && memberProp === "store") ||
+        (memberObj === "simd" && memberProp === "store")) {
+      this.builder.markFeature("vector");
+      const ptrVal = this.lowerExpression(expr.arguments[0]);
+      const vecVal = this.lowerExpression(expr.arguments[1]);
+      this.builder.emit(`llvm.store ${vecVal.ssa || vecVal.ptr}, ${ptrVal.ssa || ptrVal.ptr} : ${vecVal.type}, !llvm.ptr`);
+      return { ssa: "", type: "none" };
+    }
+
+    // 5. Aritmetik: simd.add / sub / mul / div veya f32x4.add / sub / mul / div
+    if ((memberObj === "simd" || (memberObj && VECTOR_META[memberObj])) &&
+        ["add", "sub", "mul", "div"].includes(memberProp)) {
+      this.builder.markFeature("vector");
+      const a = this.lowerExpression(expr.arguments[0]);
+      const b = this.lowerExpression(expr.arguments[1]);
+      const opMap = { add: "+", sub: "-", mul: "*", div: "/" };
+      return this.builder.createArithmetic(opMap[memberProp], a, b);
+    }
+
+    // 6. fma: simd.fma(a, b, c) veya f32x4.fma(a, b, c)
+    if ((memberObj === "simd" || (memberObj && VECTOR_META[memberObj])) && memberProp === "fma") {
+      this.builder.markFeature("vector");
+      const a = this.lowerExpression(expr.arguments[0]);
+      const b = this.lowerExpression(expr.arguments[1]);
+      const c = this.lowerExpression(expr.arguments[2]);
+      const ssa = this.builder.nextSSA();
+      this.builder.emit(`${ssa} = vector.fma ${a.ssa || a.ptr}, ${b.ssa || b.ptr}, ${c.ssa || c.ptr} : ${a.type}`);
+      return { ssa, type: a.type, isVector: true };
+    }
+
+    // 7. reduce_add / sum: simd.reduce_add(a), simd.sum(a), f32x4.reduce_add(a)
+    if ((memberObj === "simd" || (memberObj && VECTOR_META[memberObj])) &&
+        (memberProp === "reduce_add" || memberProp === "sum")) {
+      this.builder.markFeature("vector");
+      const a = this.lowerExpression(expr.arguments[0]);
+      const m = (a.type || "").match(/^vector<(\d+)x([a-z0-9]+)>$/);
+      const elemType = m ? m[2] : "f32";
+      const ssa = this.builder.nextSSA();
+      this.builder.emit(`${ssa} = vector.reduction <add>, ${a.ssa || a.ptr} : ${a.type} into ${elemType}`);
+      if (elemType === "f32") {
+        const ext = this.builder.nextSSA();
+        this.builder.emit(`${ext} = arith.extf ${ssa} : f32 to f64`);
+        return { ssa: ext, type: "f64" };
+      }
+      if (elemType === "i32") {
+        const ext = this.builder.nextSSA();
+        this.builder.emit(`${ext} = arith.extsi ${ssa} : i32 to i64`);
+        return { ssa: ext, type: "i64" };
+      }
+      return { ssa, type: elemType };
+    }
+
+    // 8. reduce_mul: simd.reduce_mul(a), f32x4.reduce_mul(a)
+    if ((memberObj === "simd" || (memberObj && VECTOR_META[memberObj])) && memberProp === "reduce_mul") {
+      this.builder.markFeature("vector");
+      const a = this.lowerExpression(expr.arguments[0]);
+      const m = (a.type || "").match(/^vector<(\d+)x([a-z0-9]+)>$/);
+      const elemType = m ? m[2] : "f32";
+      const ssa = this.builder.nextSSA();
+      this.builder.emit(`${ssa} = vector.reduction <mul>, ${a.ssa || a.ptr} : ${a.type} into ${elemType}`);
+      if (elemType === "f32") {
+        const ext = this.builder.nextSSA();
+        this.builder.emit(`${ext} = arith.extf ${ssa} : f32 to f64`);
+        return { ssa: ext, type: "f64" };
+      }
+      if (elemType === "i32") {
+        const ext = this.builder.nextSSA();
+        this.builder.emit(`${ext} = arith.extsi ${ssa} : i32 to i64`);
+        return { ssa: ext, type: "i64" };
+      }
+      return { ssa, type: elemType };
+    }
+
+    // 9. reduce_min: simd.reduce_min(a), f32x4.reduce_min(a)
+    if ((memberObj === "simd" || (memberObj && VECTOR_META[memberObj])) && memberProp === "reduce_min") {
+      this.builder.markFeature("vector");
+      const a = this.lowerExpression(expr.arguments[0]);
+      const m = (a.type || "").match(/^vector<(\d+)x([a-z0-9]+)>$/);
+      const elemType = m ? m[2] : "f32";
+      const isFloat = elemType.startsWith("f");
+      const redKind = isFloat ? "minimumf" : "minsi";
+      const ssa = this.builder.nextSSA();
+      this.builder.emit(`${ssa} = vector.reduction <${redKind}>, ${a.ssa || a.ptr} : ${a.type} into ${elemType}`);
+      if (elemType === "f32") {
+        const ext = this.builder.nextSSA();
+        this.builder.emit(`${ext} = arith.extf ${ssa} : f32 to f64`);
+        return { ssa: ext, type: "f64" };
+      }
+      if (elemType === "i32") {
+        const ext = this.builder.nextSSA();
+        this.builder.emit(`${ext} = arith.extsi ${ssa} : i32 to i64`);
+        return { ssa: ext, type: "i64" };
+      }
+      return { ssa, type: elemType };
+    }
+
+    // 10. reduce_max: simd.reduce_max(a), f32x4.reduce_max(a)
+    if ((memberObj === "simd" || (memberObj && VECTOR_META[memberObj])) && memberProp === "reduce_max") {
+      this.builder.markFeature("vector");
+      const a = this.lowerExpression(expr.arguments[0]);
+      const m = (a.type || "").match(/^vector<(\d+)x([a-z0-9]+)>$/);
+      const elemType = m ? m[2] : "f32";
+      const isFloat = elemType.startsWith("f");
+      const redKind = isFloat ? "maximumf" : "maxsi";
+      const ssa = this.builder.nextSSA();
+      this.builder.emit(`${ssa} = vector.reduction <${redKind}>, ${a.ssa || a.ptr} : ${a.type} into ${elemType}`);
+      if (elemType === "f32") {
+        const ext = this.builder.nextSSA();
+        this.builder.emit(`${ext} = arith.extf ${ssa} : f32 to f64`);
+        return { ssa: ext, type: "f64" };
+      }
+      if (elemType === "i32") {
+        const ext = this.builder.nextSSA();
+        this.builder.emit(`${ext} = arith.extsi ${ssa} : i32 to i64`);
+        return { ssa: ext, type: "i64" };
+      }
+      return { ssa, type: elemType };
+    }
+
+    // 11. extract: simd.extract(v, idx), f32x4.extract(v, idx)
+    if ((memberObj === "simd" || (memberObj && VECTOR_META[memberObj])) && memberProp === "extract") {
+      this.builder.markFeature("vector");
+      const v = this.lowerExpression(expr.arguments[0]);
+      let idxVal = this.lowerExpression(expr.arguments[1]);
+      const idxI32 = this.coerceType(idxVal, "i32");
+      const idxSSA = this.builder.nextSSA();
+      this.builder.emit(`${idxSSA} = arith.index_cast ${idxI32.ssa} : i32 to index`);
+      const m = (v.type || "").match(/^vector<(\d+)x([a-z0-9]+)>$/);
+      const elemType = m ? m[2] : "f32";
+      const ssa = this.builder.nextSSA();
+      this.builder.emit(`${ssa} = vector.extract ${v.ssa || v.ptr}[${idxSSA}] : ${elemType} from ${v.type}`);
+      if (elemType === "f32") {
+        const ext = this.builder.nextSSA();
+        this.builder.emit(`${ext} = arith.extf ${ssa} : f32 to f64`);
+        return { ssa: ext, type: "f64" };
+      }
+      if (elemType === "i32") {
+        const ext = this.builder.nextSSA();
+        this.builder.emit(`${ext} = arith.extsi ${ssa} : i32 to i64`);
+        return { ssa: ext, type: "i64" };
+      }
+      return { ssa, type: elemType };
+    }
+
+    // 12. insert: simd.insert(v, idx, val), f32x4.insert(v, idx, val)
+    if ((memberObj === "simd" || (memberObj && VECTOR_META[memberObj])) && memberProp === "insert") {
+      this.builder.markFeature("vector");
+      const v = this.lowerExpression(expr.arguments[0]);
+      let idxVal = this.lowerExpression(expr.arguments[1]);
+      let val = this.lowerExpression(expr.arguments[2]);
+      const m = (v.type || "").match(/^vector<(\d+)x([a-z0-9]+)>$/);
+      const elemType = m ? m[2] : "f32";
+      val = this.coerceType(val, elemType);
+      const idxI32 = this.coerceType(idxVal, "i32");
+      const idxSSA = this.builder.nextSSA();
+      this.builder.emit(`${idxSSA} = arith.index_cast ${idxI32.ssa} : i32 to index`);
+      const ssa = this.builder.nextSSA();
+      this.builder.emit(`${ssa} = vector.insert ${val.ssa || val.ptr}, ${v.ssa || v.ptr}[${idxSSA}] : ${elemType} into ${v.type}`);
+      return { ssa, type: v.type, isVector: true };
+    }
+
+    // 13. sqrt: simd.sqrt(v), f32x4.sqrt(v)
+    if ((memberObj === "simd" || (memberObj && VECTOR_META[memberObj])) && memberProp === "sqrt") {
+      this.builder.markFeature("vector");
+      const v = this.lowerExpression(expr.arguments[0]);
+      const ssa = this.builder.nextSSA();
+      this.builder.emit(`${ssa} = math.sqrt ${v.ssa || v.ptr} : ${v.type}`);
+      return { ssa, type: v.type, isVector: true };
+    }
+
+    // 14. abs: simd.abs(v), f32x4.abs(v)
+    if ((memberObj === "simd" || (memberObj && VECTOR_META[memberObj])) && memberProp === "abs") {
+      this.builder.markFeature("vector");
+      const v = this.lowerExpression(expr.arguments[0]);
+      const isFloat = v.type.includes("f32") || v.type.includes("f64");
+      const ssa = this.builder.nextSSA();
+      const absOp = isFloat ? "math.absf" : "math.absi";
+      this.builder.emit(`${ssa} = ${absOp} ${v.ssa || v.ptr} : ${v.type}`);
+      return { ssa, type: v.type, isVector: true };
+    }
+
+    return null;
+  }
+
   lowerExpression(expr) {
     if (!expr) return { ssa: "", type: "none" };
 
@@ -3744,6 +4041,19 @@ export class ASTLowerer {
 
     if (expr.type === "UnaryExpression" && expr.operator === "-") {
       let val = this.lowerExpression(expr.argument);
+      if (val.isVector || (val.type && val.type.startsWith("vector<"))) {
+        this.builder.markFeature("vector");
+        const ssa = this.builder.nextSSA();
+        const isFloat = val.type.includes("f32") || val.type.includes("f64");
+        if (isFloat) {
+          this.builder.emit(`${ssa} = arith.negf ${val.ssa || val.ptr} : ${val.type}`);
+        } else {
+          const zero = this.builder.nextSSA();
+          this.builder.emit(`${zero} = arith.constant dense<0> : ${val.type}`);
+          this.builder.emit(`${ssa} = arith.subi ${zero}, ${val.ssa || val.ptr} : ${val.type}`);
+        }
+        return { ssa, type: val.type, isVector: true };
+      }
       if (val.type === "f64" || val.type === "f32") {
         const zero = this.builder.createConstant(0.0, val.type);
         return this.builder.createArithmetic("-", zero, val);
@@ -3979,6 +4289,7 @@ export class ASTLowerer {
         }
         const loaded = this.builder.load(sym.ptr, sym.type);
         if (sym.isString) loaded.isString = true;
+        if (sym.isVector || (sym.type && sym.type.startsWith("vector<"))) loaded.isVector = true;
         return loaded;
       }
 
@@ -4097,6 +4408,21 @@ export class ASTLowerer {
         return { ssa, type: "i64" };
       }
 
+      if (base.isVector || (base.type && base.type.startsWith("vector<"))) {
+        if (expr.computed) {
+          this.builder.markFeature("vector");
+          let idxVal = this.lowerExpression(expr.property);
+          const idxI32 = this.coerceType(idxVal, "i32");
+          const idxSSA = this.builder.nextSSA();
+          this.builder.emit(`${idxSSA} = arith.index_cast ${idxI32.ssa} : i32 to index`);
+          const m = base.type.match(/^vector<(\d+)x([a-z0-9]+)>$/);
+          const elemType = m ? m[2] : "f32";
+          const resSSA = this.builder.nextSSA();
+          this.builder.emit(`${resSSA} = vector.extract ${base.ssa || base.ptr}[${idxSSA}] : ${elemType} from ${base.type}`);
+          return { ssa: resSSA, type: elemType };
+        }
+      }
+
       if (expr.computed) {
         let idxVal = this.lowerExpression(expr.property);
         idxVal = this.coerceType(idxVal, "i64");
@@ -4178,6 +4504,25 @@ export class ASTLowerer {
 
       if (expr.left.type === "MemberExpression") {
         const base = this.lowerExpression(expr.left.object);
+
+        if (expr.left.computed && (base.isVector || (base.type && base.type.startsWith("vector<")))) {
+          this.builder.markFeature("vector");
+          let idxVal = this.lowerExpression(expr.left.property);
+          const idxI32 = this.coerceType(idxVal, "i32");
+          const idxSSA = this.builder.nextSSA();
+          this.builder.emit(`${idxSSA} = arith.index_cast ${idxI32.ssa} : i32 to index`);
+          const m = base.type.match(/^vector<(\d+)x([a-z0-9]+)>$/);
+          const elemType = m ? m[2] : "f32";
+          rhs = this.coerceType(rhs, elemType);
+          const updatedSSA = this.builder.nextSSA();
+          this.builder.emit(`${updatedSSA} = vector.insert ${rhs.ssa || rhs.ptr}, ${base.ssa || base.ptr}[${idxSSA}] : ${elemType} into ${base.type}`);
+          const updatedVec = { ssa: updatedSSA, type: base.type, isVector: true };
+          if (expr.left.object.type === "Identifier" && this.symbolTable.has(expr.left.object.name)) {
+            const sym = this.symbolTable.get(expr.left.object.name);
+            this.builder.store(sym.ptr, updatedVec);
+          }
+          return updatedVec;
+        }
 
         if (expr.left.computed) {
           let idxVal = this.lowerExpression(expr.left.property);
@@ -4365,6 +4710,11 @@ export class ASTLowerer {
     }
 
     if (expr.type === "CallExpression") {
+      const simdRes = this.tryLowerSIMDCall(expr);
+      if (simdRes !== null) {
+        return simdRes;
+      }
+
       if (expr.callee.type === "Identifier" && expr.callee.name === "malloc") {
         this.builder.markFeature("heap");
         let szVal = this.lowerExpression(expr.arguments[0]);
@@ -4646,6 +4996,8 @@ export class ASTLowerer {
           const arg = this.lowerExpression(argNode);
           if (arg.isUnion) {
             this.builder.printUnion(arg.ssa || arg.ptr);
+          } else if (arg.isVector || (arg.type && arg.type.startsWith("vector<"))) {
+            this.builder.printVector(arg);
           } else if (arg.isNull) {
             const nullStrSym = this.builder.getOrRegisterString("null");
             const nullSSA = this.builder.nextSSA();

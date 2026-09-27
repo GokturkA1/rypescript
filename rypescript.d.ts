@@ -323,6 +323,119 @@ declare global {
    * Benzersiz tek sahiplik (unique pointer) özniteliği.
    */
   function unique(...args: any[]): RypePragma;
+
+  // ==========================================
+  // 9. SIMD VEKTÖR TİPLERİ VE DONANIM HIZLANDIRMA (VECTOR DIALECT)
+  // ==========================================
+
+  interface f32x4 {
+    readonly [index: number]: number;
+  }
+  namespace f32x4 {
+    function splat(v: number): f32x4;
+    function load(ptr: pointer): f32x4;
+    function store(ptr: pointer, val: f32x4): void;
+    function add(a: f32x4, b: f32x4): f32x4;
+    function sub(a: f32x4, b: f32x4): f32x4;
+    function mul(a: f32x4, b: f32x4): f32x4;
+    function div(a: f32x4, b: f32x4): f32x4;
+    function fma(a: f32x4, b: f32x4, c: f32x4): f32x4;
+    function reduce_add(a: f32x4): number;
+    function reduce_mul(a: f32x4): number;
+    function reduce_min(a: f32x4): number;
+    function reduce_max(a: f32x4): number;
+    function extract(a: f32x4, idx: number): number;
+    function insert(a: f32x4, idx: number, val: number): f32x4;
+    function sqrt(a: f32x4): f32x4;
+    function abs(a: f32x4): f32x4;
+  }
+  function f32x4(x?: number, y?: number, z?: number, w?: number): f32x4;
+
+  interface f64x2 {
+    readonly [index: number]: number;
+  }
+  namespace f64x2 {
+    function splat(v: number): f64x2;
+    function load(ptr: pointer): f64x2;
+    function store(ptr: pointer, val: f64x2): void;
+    function add(a: f64x2, b: f64x2): f64x2;
+    function sub(a: f64x2, b: f64x2): f64x2;
+    function mul(a: f64x2, b: f64x2): f64x2;
+    function div(a: f64x2, b: f64x2): f64x2;
+    function fma(a: f64x2, b: f64x2, c: f64x2): f64x2;
+    function reduce_add(a: f64x2): number;
+    function reduce_mul(a: f64x2): number;
+    function reduce_min(a: f64x2): number;
+    function reduce_max(a: f64x2): number;
+    function extract(a: f64x2, idx: number): number;
+    function insert(a: f64x2, idx: number, val: number): f64x2;
+    function sqrt(a: f64x2): f64x2;
+    function abs(a: f64x2): f64x2;
+  }
+  function f64x2(x?: number, y?: number): f64x2;
+
+  interface i32x4 {
+    readonly [index: number]: number;
+  }
+  namespace i32x4 {
+    function splat(v: number): i32x4;
+    function load(ptr: pointer): i32x4;
+    function store(ptr: pointer, val: i32x4): void;
+    function add(a: i32x4, b: i32x4): i32x4;
+    function sub(a: i32x4, b: i32x4): i32x4;
+    function mul(a: i32x4, b: i32x4): i32x4;
+    function reduce_add(a: i32x4): number;
+    function reduce_min(a: i32x4): number;
+    function reduce_max(a: i32x4): number;
+    function extract(a: i32x4, idx: number): number;
+    function insert(a: i32x4, idx: number, val: number): i32x4;
+  }
+  function i32x4(x?: number, y?: number, z?: number, w?: number): i32x4;
+
+  interface i64x2 {
+    readonly [index: number]: number;
+  }
+  namespace i64x2 {
+    function splat(v: number): i64x2;
+    function load(ptr: pointer): i64x2;
+    function store(ptr: pointer, val: i64x2): void;
+    function add(a: i64x2, b: i64x2): i64x2;
+    function sub(a: i64x2, b: i64x2): i64x2;
+    function mul(a: i64x2, b: i64x2): i64x2;
+    function reduce_add(a: i64x2): number;
+    function extract(a: i64x2, idx: number): number;
+    function insert(a: i64x2, idx: number, val: number): i64x2;
+  }
+  function i64x2(x?: number, y?: number): i64x2;
+
+  namespace simd {
+    function f32x4(x?: number, y?: number, z?: number, w?: number): f32x4;
+    function f64x2(x?: number, y?: number): f64x2;
+    function i32x4(x?: number, y?: number, z?: number, w?: number): i32x4;
+    function i64x2(x?: number, y?: number): i64x2;
+    function splat_f32x4(v: number): f32x4;
+    function splat_f64x2(v: number): f64x2;
+    function splat_i32x4(v: number): i32x4;
+    function splat_i64x2(v: number): i64x2;
+    function load_f32x4(ptr: pointer): f32x4;
+    function load_f64x2(ptr: pointer): f64x2;
+    function load_i32x4(ptr: pointer): i32x4;
+    function store(ptr: pointer, val: any): void;
+    function add<T>(a: T, b: T): T;
+    function sub<T>(a: T, b: T): T;
+    function mul<T>(a: T, b: T): T;
+    function div<T>(a: T, b: T): T;
+    function fma<T>(a: T, b: T, c: T): T;
+    function reduce_add(a: any): number;
+    function sum(a: any): number;
+    function reduce_mul(a: any): number;
+    function reduce_min(a: any): number;
+    function reduce_max(a: any): number;
+    function extract(a: any, idx: number): number;
+    function insert<T>(a: T, idx: number, val: number): T;
+    function sqrt<T>(a: T): T;
+    function abs<T>(a: T): T;
+  }
 }
 
 // ==========================================

@@ -138,5 +138,133 @@ export class BuiltinRegistry {
       fields: new Map([["length", { type: "number" }]]),
       methods: stringMethods,
     });
+
+    // 10. SIMD Vektör Tipleri ve Fonksiyonları
+    const vectorTypes = ["f32x4", "f64x2", "i32x4", "i64x2", "f64x4", "f32x8", "i32x8"];
+    for (const vt of vectorTypes) {
+      this.typeAliasRegistry.set(vt, { type: "TSTypeReference", typeName: { name: vt } });
+    }
+
+    // Doğrudan vektör yapılandırıcı fonksiyonlar
+    this.functionSignatures.set("f32x4", { params: ["number", "number", "number", "number"], minArgs: 0, returnType: "f32x4" });
+    this.functionSignatures.set("f64x2", { params: ["number", "number"], minArgs: 0, returnType: "f64x2" });
+    this.functionSignatures.set("i32x4", { params: ["number", "number", "number", "number"], minArgs: 0, returnType: "i32x4" });
+    this.functionSignatures.set("i64x2", { params: ["number", "number"], minArgs: 0, returnType: "i64x2" });
+    this.functionSignatures.set("f64x4", { params: ["number", "number", "number", "number"], minArgs: 0, returnType: "f64x4" });
+    this.functionSignatures.set("f32x8", { params: ["number", "number", "number", "number", "number", "number", "number", "number"], minArgs: 0, returnType: "f32x8" });
+    this.functionSignatures.set("i32x8", { params: ["number", "number", "number", "number", "number", "number", "number", "number"], minArgs: 0, returnType: "i32x8" });
+
+    // f32x4 statik ve operasyon metotları
+    this.structSignatures.set("f32x4", {
+      fields: new Map(),
+      methods: new Map([
+        ["splat", { params: ["number"], returnType: "f32x4" }],
+        ["load", { params: ["pointer"], returnType: "f32x4" }],
+        ["store", { params: ["pointer", "f32x4"], returnType: "void" }],
+        ["add", { params: ["f32x4", "f32x4"], returnType: "f32x4" }],
+        ["sub", { params: ["f32x4", "f32x4"], returnType: "f32x4" }],
+        ["mul", { params: ["f32x4", "f32x4"], returnType: "f32x4" }],
+        ["div", { params: ["f32x4", "f32x4"], returnType: "f32x4" }],
+        ["fma", { params: ["f32x4", "f32x4", "f32x4"], returnType: "f32x4" }],
+        ["reduce_add", { params: ["f32x4"], returnType: "number" }],
+        ["reduce_mul", { params: ["f32x4"], returnType: "number" }],
+        ["reduce_min", { params: ["f32x4"], returnType: "number" }],
+        ["reduce_max", { params: ["f32x4"], returnType: "number" }],
+        ["extract", { params: ["f32x4", "number"], returnType: "number" }],
+        ["insert", { params: ["f32x4", "number", "number"], returnType: "f32x4" }],
+        ["sqrt", { params: ["f32x4"], returnType: "f32x4" }],
+        ["abs", { params: ["f32x4"], returnType: "f32x4" }],
+      ]),
+    });
+
+    // f64x2 statik ve operasyon metotları
+    this.structSignatures.set("f64x2", {
+      fields: new Map(),
+      methods: new Map([
+        ["splat", { params: ["number"], returnType: "f64x2" }],
+        ["load", { params: ["pointer"], returnType: "f64x2" }],
+        ["store", { params: ["pointer", "f64x2"], returnType: "void" }],
+        ["add", { params: ["f64x2", "f64x2"], returnType: "f64x2" }],
+        ["sub", { params: ["f64x2", "f64x2"], returnType: "f64x2" }],
+        ["mul", { params: ["f64x2", "f64x2"], returnType: "f64x2" }],
+        ["div", { params: ["f64x2", "f64x2"], returnType: "f64x2" }],
+        ["fma", { params: ["f64x2", "f64x2", "f64x2"], returnType: "f64x2" }],
+        ["reduce_add", { params: ["f64x2"], returnType: "number" }],
+        ["reduce_mul", { params: ["f64x2"], returnType: "number" }],
+        ["reduce_min", { params: ["f64x2"], returnType: "number" }],
+        ["reduce_max", { params: ["f64x2"], returnType: "number" }],
+        ["extract", { params: ["f64x2", "number"], returnType: "number" }],
+        ["insert", { params: ["f64x2", "number", "number"], returnType: "f64x2" }],
+        ["sqrt", { params: ["f64x2"], returnType: "f64x2" }],
+        ["abs", { params: ["f64x2"], returnType: "f64x2" }],
+      ]),
+    });
+
+    // i32x4 statik ve operasyon metotları
+    this.structSignatures.set("i32x4", {
+      fields: new Map(),
+      methods: new Map([
+        ["splat", { params: ["number"], returnType: "i32x4" }],
+        ["load", { params: ["pointer"], returnType: "i32x4" }],
+        ["store", { params: ["pointer", "i32x4"], returnType: "void" }],
+        ["add", { params: ["i32x4", "i32x4"], returnType: "i32x4" }],
+        ["sub", { params: ["i32x4", "i32x4"], returnType: "i32x4" }],
+        ["mul", { params: ["i32x4", "i32x4"], returnType: "i32x4" }],
+        ["reduce_add", { params: ["i32x4"], returnType: "number" }],
+        ["reduce_min", { params: ["i32x4"], returnType: "number" }],
+        ["reduce_max", { params: ["i32x4"], returnType: "number" }],
+        ["extract", { params: ["i32x4", "number"], returnType: "number" }],
+        ["insert", { params: ["i32x4", "number", "number"], returnType: "i32x4" }],
+      ]),
+    });
+
+    // i64x2 statik ve operasyon metotları
+    this.structSignatures.set("i64x2", {
+      fields: new Map(),
+      methods: new Map([
+        ["splat", { params: ["number"], returnType: "i64x2" }],
+        ["load", { params: ["pointer"], returnType: "i64x2" }],
+        ["store", { params: ["pointer", "i64x2"], returnType: "void" }],
+        ["add", { params: ["i64x2", "i64x2"], returnType: "i64x2" }],
+        ["sub", { params: ["i64x2", "i64x2"], returnType: "i64x2" }],
+        ["mul", { params: ["i64x2", "i64x2"], returnType: "i64x2" }],
+        ["reduce_add", { params: ["i64x2"], returnType: "number" }],
+        ["extract", { params: ["i64x2", "number"], returnType: "number" }],
+        ["insert", { params: ["i64x2", "number", "number"], returnType: "i64x2" }],
+      ]),
+    });
+
+    // Evrensel simd Namespace
+    this.structSignatures.set("simd", {
+      fields: new Map(),
+      methods: new Map([
+        ["f32x4", { params: ["number", "number", "number", "number"], returnType: "f32x4" }],
+        ["f64x2", { params: ["number", "number"], returnType: "f64x2" }],
+        ["i32x4", { params: ["number", "number", "number", "number"], returnType: "i32x4" }],
+        ["i64x2", { params: ["number", "number"], returnType: "i64x2" }],
+        ["splat_f32x4", { params: ["number"], returnType: "f32x4" }],
+        ["splat_f64x2", { params: ["number"], returnType: "f64x2" }],
+        ["splat_i32x4", { params: ["number"], returnType: "i32x4" }],
+        ["splat_i64x2", { params: ["number"], returnType: "i64x2" }],
+        ["load_f32x4", { params: ["pointer"], returnType: "f32x4" }],
+        ["load_f64x2", { params: ["pointer"], returnType: "f64x2" }],
+        ["load_i32x4", { params: ["pointer"], returnType: "i32x4" }],
+        ["store", { params: ["pointer", "any"], returnType: "void" }],
+        ["add", { params: ["any", "any"], returnType: "any" }],
+        ["sub", { params: ["any", "any"], returnType: "any" }],
+        ["mul", { params: ["any", "any"], returnType: "any" }],
+        ["div", { params: ["any", "any"], returnType: "any" }],
+        ["fma", { params: ["any", "any", "any"], returnType: "any" }],
+        ["reduce_add", { params: ["any"], returnType: "number" }],
+        ["sum", { params: ["any"], returnType: "number" }],
+        ["reduce_mul", { params: ["any"], returnType: "number" }],
+        ["reduce_min", { params: ["any"], returnType: "number" }],
+        ["reduce_max", { params: ["any"], returnType: "number" }],
+        ["extract", { params: ["any", "number"], returnType: "number" }],
+        ["insert", { params: ["any", "number", "number"], returnType: "any" }],
+        ["sqrt", { params: ["any"], returnType: "any" }],
+        ["abs", { params: ["any"], returnType: "any" }],
+      ]),
+    });
   }
 }

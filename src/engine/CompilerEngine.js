@@ -147,6 +147,8 @@ export class CompilerEngine {
     const opm = mlir.mlirPassManagerGetAsOpPassManager(pm);
 
     const pipelineStr = [
+      "convert-vector-to-llvm",
+      "convert-math-to-llvm",
       "convert-scf-to-cf",
       "convert-cf-to-llvm",
       "convert-arith-to-llvm",

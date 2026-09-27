@@ -97,6 +97,13 @@ export class MLIRBuilder {
 
   createConstant(val, type = "f64") {
     const ssa = this.nextSSA();
+    if (type && type.startsWith("vector<")) {
+      this.markFeature("vector");
+      const isFloat = type.includes("f32") || type.includes("f64");
+      const denseVal = isFloat ? (Number.isInteger(Number(val)) ? `${val}.0` : `${val}`) : `${Math.floor(Number(val) || 0)}`;
+      this.emit(`${ssa} = arith.constant dense<${denseVal}> : ${type}`);
+      return { ssa, type, isVector: true };
+    }
     let formattedVal = val;
     if (type === "f64" || type === "f32") {
       formattedVal = Number.isInteger(Number(val)) ? `${val}.0` : `${val}`;
@@ -144,6 +151,10 @@ export class MLIRBuilder {
   coerceOperands(left, right) {
     let l = left;
     let r = right;
+
+    if ((l.type && l.type.startsWith("vector<")) || (r.type && r.type.startsWith("vector<"))) {
+      return { l, r };
+    }
 
     const isInt = (t) => ["i64", "i32", "i16", "i8"].includes(t);
     const intWidth = (t) => {
@@ -199,6 +210,21 @@ export class MLIRBuilder {
   }
 
   createArithmetic(op, left, right) {
+    const isVector = Boolean(left.isVector || (left.type && left.type.startsWith("vector<")));
+    if (isVector) {
+      this.markFeature("vector");
+      const ssa = this.nextSSA();
+      const isFloat = left.type.includes("f32") || left.type.includes("f64");
+      const opMap = isFloat
+        ? { "+": "arith.addf", "-": "arith.subf", "*": "arith.mulf", "/": "arith.divf" }
+        : { "+": "arith.addi", "-": "arith.subi", "*": "arith.muli", "/": "arith.divsi" };
+      if (!opMap[op]) {
+        throw new Error(`[MLIRBuilder] Desteklenmeyen vector aritmetik operatörü: ${op}`);
+      }
+      this.emit(`${ssa} = ${opMap[op]} ${left.ssa}, ${right.ssa} : ${left.type}`);
+      return { ssa, type: left.type, isVector: true };
+    }
+
     const { l, r } = this.coerceOperands(left, right);
 
     const ssa = this.nextSSA();
@@ -268,6 +294,24 @@ export class MLIRBuilder {
       const pred = predMap[op] || "eq";
       this.emit(`${ssa} = llvm.icmp "${pred}" ${l.ssa || l.ptr}, ${r.ssa || r.ptr} : !llvm.ptr`);
       return { ssa, type: "i1" };
+    }
+
+    if (l.type && l.type.startsWith("vector<")) {
+      this.markFeature("vector");
+      const isFloat = l.type.includes("f32") || l.type.includes("f64");
+      const match = l.type.match(/^vector<(\d+)x/);
+      const len = match ? match[1] : "4";
+      const pred = (op === "==" || op === "===") ? (isFloat ? "oeq" : "eq") : (isFloat ? "one" : "ne");
+      const cmpSSA = this.nextSSA();
+      if (isFloat) {
+        this.emit(`${cmpSSA} = arith.cmpf ${pred}, ${l.ssa}, ${r.ssa} : ${l.type}`);
+      } else {
+        this.emit(`${cmpSSA} = arith.cmpi ${pred}, ${l.ssa}, ${r.ssa} : ${l.type}`);
+      }
+      const redSSA = this.nextSSA();
+      const redOp = (op === "==" || op === "===") ? "<and>" : "<or>";
+      this.emit(`${redSSA} = vector.reduction ${redOp}, ${cmpSSA} : vector<${len}xi1> into i1`);
+      return { ssa: redSSA, type: "i1" };
     }
 
     const coerced = this.coerceOperands(l, r);
@@ -495,6 +539,48 @@ export class MLIRBuilder {
   printPointer(ptr) {
     this.markFeature("printf");
     this.emit(`func.call @rts_print_ptr(${ptr}) : (!llvm.ptr) -> ()`);
+  }
+
+  printVector(arg) {
+    this.markFeature("printf");
+    this.markFeature("vector");
+    const m = (arg.type || "").match(/^vector<(\d+)x([a-z0-9]+)>$/);
+    const len = m ? parseInt(m[1], 10) : 4;
+    const elemType = m ? m[2] : "f32";
+
+    const lbracketSym = this.getOrRegisterString("[");
+    const rbracketSym = this.getOrRegisterString("]");
+    const lbAddr = this.nextSSA();
+    this.emit(`${lbAddr} = llvm.mlir.addressof ${lbracketSym} : !llvm.ptr`);
+    this.printString(lbAddr);
+    this.printSpace();
+
+    for (let i = 0; i < len; i++) {
+      const idxConst = this.nextSSA();
+      this.emit(`${idxConst} = arith.constant ${i} : i32`);
+      const idx = this.nextSSA();
+      this.emit(`${idx} = arith.index_cast ${idxConst} : i32 to index`);
+      const elemSSA = this.nextSSA();
+      this.emit(`${elemSSA} = vector.extract ${arg.ssa || arg.ptr}[${idx}] : ${elemType} from ${arg.type}`);
+      if (elemType === "f32") {
+        const ext = this.nextSSA();
+        this.emit(`${ext} = arith.extf ${elemSSA} : f32 to f64`);
+        this.printF64(ext);
+      } else if (elemType === "f64") {
+        this.printF64(elemSSA);
+      } else if (elemType === "i32") {
+        this.printI32(elemSSA);
+      } else if (elemType === "i64") {
+        this.printI64(elemSSA);
+      }
+      if (i < len - 1) {
+        this.printSpace();
+      }
+    }
+    this.printSpace();
+    const rbAddr = this.nextSSA();
+    this.emit(`${rbAddr} = llvm.mlir.addressof ${rbracketSym} : !llvm.ptr`);
+    this.printString(rbAddr);
   }
 
   buildFullModule(options = {}) {
