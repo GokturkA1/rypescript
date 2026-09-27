@@ -204,6 +204,27 @@ declare global {
    */
   function alloca(sizeBytes: number): pointer;
 
+  /** Ham bellek işaretçisinden belirtilen bayt ofsetinden 1 bayt (u8 / i8) okur. */
+  function ptr_read_u8(ptr: pointer, offset?: number): number;
+
+  /** Ham bellek işaretçisinde belirtilen bayt ofsetine 1 bayt (u8 / i8) yazar. */
+  function ptr_write_u8(ptr: pointer, offset: number, value: number): void;
+
+  /** Ham bellek işaretçisinden belirtilen bayt ofsetinden 32-bit tamsayı (i32) okur. */
+  function ptr_read_i32(ptr: pointer, offset?: number): number;
+
+  /** Ham bellek işaretçisinde belirtilen bayt ofsetine 32-bit tamsayı (i32) yazar. */
+  function ptr_write_i32(ptr: pointer, offset: number, value: number): void;
+
+  /** Ham bellek işaretçisinden belirtilen bayt ofsetinden 64-bit float (f64) okur. */
+  function ptr_read_f64(ptr: pointer, offset?: number): number;
+
+  /** Ham bellek işaretçisinde belirtilen bayt ofsetine 64-bit float (f64) yazar. */
+  function ptr_write_f64(ptr: pointer, offset: number, value: number): void;
+
+  /** İşaretçiye bayt cinsinden ofset ekleyerek yeni bir işaretçi döndürür (pointer arithmetic). */
+  function ptr_add(ptr: pointer, byteOffset: number): pointer;
+
   /**
    * Zig/Rust tarzı bölgesel Bump Allocator.
    * İşaretçi sadece ileri kayar; reset() ile sıfırlanır veya `using` ile toptan yok edilir (RAII).
@@ -286,6 +307,42 @@ declare global {
    * @param ms Beklenecek süre (milisaniye).
    */
   function sleep(ms: number): void;
+
+  /**
+   * Süreci belirtilen çıkış koduyla derhal sonlandırır.
+   * @param code Süreç çıkış kodu (Varsayılan: 0).
+   */
+  function exit(code?: number): never;
+
+  namespace process {
+    /**
+     * Süreci belirtilen çıkış koduyla derhal sonlandırır.
+     * @param code Süreç çıkış kodu (Varsayılan: 0).
+     */
+    function exit(code?: number): never;
+  }
+
+  // ==========================================
+  // 6.1. METİN VE KARAKTER İŞLEMLERİ (STRINGS)
+  // ==========================================
+
+  interface String {
+    /** C-string null-terminated karakter sayısı (bayt uzunluğu). */
+    readonly length: number;
+    /** Sıfır kopyalı alt-dize dilimi üretir. */
+    slice(start?: number, end?: number): string;
+    /** Sıfır kopyalı alt-dize dilimi üretir. */
+    substring(start?: number, end?: number): string;
+    /** Belirtilen indeksteki karakterin ASCII/UTF-8 sayısal kodunu (i32) sıfır maliyetle okur. */
+    charCodeAt(index?: number): number;
+  }
+
+  interface StringConstructor {
+    /** Verilen ASCII/UTF-8 karakter kodundan 1 baytlık null-terminated C-string üretir. */
+    fromCharCode(code: number): string;
+  }
+
+  const String: StringConstructor;
 
   // ==========================================
   // 7. DERLEYİCİ DEKORATÖRLERİ VE PRAGMALAR

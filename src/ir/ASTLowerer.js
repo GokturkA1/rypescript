@@ -517,7 +517,7 @@ export class ASTLowerer {
         return "!llvm.ptr";
       case "TSTypeReference": {
         const typeName = type.typeName?.name || type.typeName?.value;
-        if (typeName === "Channel" || typeName === "Arena" || typeName === "Pool" || typeName === "FixedBuffer") return "!llvm.ptr";
+        if (["Channel", "Arena", "Pool", "FixedBuffer", "pointer", "ptr"].includes(typeName)) return "!llvm.ptr";
         if (typeName === "f32x4") return "vector<4xf32>";
         if (typeName === "f64x2") return "vector<2xf64>";
         if (typeName === "i32x4") return "vector<4xi32>";
@@ -525,8 +525,9 @@ export class ASTLowerer {
         if (typeName === "f64x4") return "vector<4xf64>";
         if (typeName === "f32x8") return "vector<8xf32>";
         if (typeName === "i32x8") return "vector<8xi32>";
-        if (["i64", "int64", "u64", "uint64"].includes(typeName)) return "i64";
+        if (["i64", "int64", "u64", "uint64", "usize", "isize"].includes(typeName)) return "i64";
         if (["i32", "int32", "u32", "uint32", "int"].includes(typeName)) return "i32";
+        if (["byte", "u8", "i8"].includes(typeName)) return "i8";
         if (["f64", "double"].includes(typeName)) return "f64";
         if (["f32", "float"].includes(typeName)) return "f32";
         if (["bool", "boolean"].includes(typeName)) return "i1";
@@ -656,6 +657,38 @@ export class ASTLowerer {
         const zero = this.builder.createConstant(0, val.type);
         return this.builder.createComparison("!=", val, zero);
       }
+    }
+
+    // Pointer <-> Integer (llvm.ptrtoint / llvm.inttoptr)
+    if (val.type === "!llvm.ptr" && (targetType === "i64" || targetType === "i32")) {
+      const ssa = this.builder.nextSSA();
+      this.builder.emit(`${ssa} = llvm.ptrtoint ${val.ssa || val.ptr} : !llvm.ptr to ${targetType}`);
+      return { ssa, type: targetType };
+    }
+    if ((val.type === "i64" || val.type === "i32") && targetType === "!llvm.ptr") {
+      const ssa = this.builder.nextSSA();
+      this.builder.emit(`${ssa} = llvm.inttoptr ${val.ssa || val.ptr} : ${val.type} to !llvm.ptr`);
+      return { ssa, ptr: ssa, type: "!llvm.ptr" };
+    }
+    if (val.type === "!llvm.ptr" && targetType === "f64") {
+      const iVal = this.coerceType(val, "i64");
+      return this.coerceType(iVal, "f64");
+    }
+    if (val.type === "f64" && targetType === "!llvm.ptr") {
+      const iVal = this.coerceType(val, "i64");
+      return this.coerceType(iVal, "!llvm.ptr");
+    }
+
+    // i8 conversions
+    if (targetType === "i8" && (val.type === "i32" || val.type === "i64")) {
+      const ssa = this.builder.nextSSA();
+      this.builder.emit(`${ssa} = arith.trunci ${val.ssa || val.ptr} : ${val.type} to i8`);
+      return { ssa, type: "i8" };
+    }
+    if ((targetType === "i32" || targetType === "i64") && val.type === "i8") {
+      const ssa = this.builder.nextSSA();
+      this.builder.emit(`${ssa} = arith.extui ${val.ssa || val.ptr} : i8 to ${targetType}`);
+      return { ssa, type: targetType };
     }
 
     if (targetType === "f64" && val.type === "f32") {
@@ -1336,7 +1369,10 @@ export class ASTLowerer {
     this.emitSpawnRunners();
     this.emitNapiWrappers();
 
-    this.builder.block("func.func @main() -> i32", () => {
+    const isWasm = Boolean(this.builder.targetInfo?.isWasm);
+    const mainHeader = isWasm ? "func.func @main() -> i32" : "func.func @main(%argc: i32, %argv: !llvm.ptr) -> i32";
+
+    this.builder.block(mainHeader, () => {
       this.builder.hasTerminated = false;
       this.enterScope(true, "i32");
 
@@ -1356,35 +1392,123 @@ export class ASTLowerer {
 
       let exitCodeSSA;
       if (shouldCallUserMain) {
-        const callArgs = [];
-        if (userMainMeta?.params) {
-          for (const p of userMainMeta.params) {
-            if (p.type === "i32" || p.type === "i64" || p.type === "f64") {
-              callArgs.push({ type: "NumericLiteral", value: 0 });
+        const userParams = userMainMeta?.params || [];
+        let preparedArgs = [];
+
+        if (userParams.length === 2) {
+          const argcVal = isWasm ? this.builder.createConstant(0, "i32") : { ssa: "%argc", type: "i32" };
+          let argvVal;
+          if (isWasm) {
+            const nullPtr = this.builder.nextSSA();
+            this.builder.emit(`${nullPtr} = llvm.mlir.zero : !llvm.ptr`);
+            argvVal = { ssa: nullPtr, ptr: nullPtr, type: "!llvm.ptr" };
+          } else {
+            argvVal = { ssa: "%argv", ptr: "%argv", type: "!llvm.ptr" };
+          }
+          const p0 = this.coerceType(argcVal, userParams[0].type);
+          const p1 = this.coerceType(argvVal, userParams[1].type);
+          preparedArgs = [p0, p1];
+        } else if (userParams.length === 1) {
+          const p0Meta = userParams[0];
+          const p0TypeNode = userMainNode.params[0]?.typeAnnotation || userMainNode.params[0]?.pattern?.typeAnnotation || userMainNode.params[0]?.id?.typeAnnotation;
+          const arrMeta = this.extractArrayTargetType(p0TypeNode);
+          const isStringArray = (p0Meta.isArray && p0Meta.isString) || Boolean(arrMeta && arrMeta.isString);
+
+          if (isStringArray) {
+            this.builder.markFeature("heap");
+            this.builder.markFeature("strings");
+            if (isWasm) {
+              const emptyArr = this.instantiateArray({ elements: [] }, "!llvm.ptr", true, null);
+              preparedArgs = [emptyArr];
             } else {
-              callArgs.push({ type: "NullLiteral" });
+              const argcI64 = this.builder.nextSSA();
+              this.builder.emit(`${argcI64} = arith.extsi %argc : i32 to i64`);
+
+              const c8 = this.builder.nextSSA();
+              this.builder.emit(`${c8} = llvm.mlir.constant(8 : i64) : i64`);
+              const elemsSz = this.builder.nextSSA();
+              this.builder.emit(`${elemsSz} = arith.muli ${argcI64}, ${c8} : i64`);
+              const totalSz = this.builder.nextSSA();
+              this.builder.emit(`${totalSz} = arith.addi ${elemsSz}, ${c8} : i64`);
+
+              const arrPtr = this.builder.nextSSA();
+              this.builder.emit(`${arrPtr} = llvm.call @malloc(${totalSz}) : (i64) -> !llvm.ptr`);
+              this.builder.emit(`llvm.store ${argcI64}, ${arrPtr} : i64, !llvm.ptr`);
+
+              const c0Idx = this.builder.nextSSA();
+              this.builder.emit(`${c0Idx} = arith.constant 0 : index`);
+              const c1Idx = this.builder.nextSSA();
+              this.builder.emit(`${c1Idx} = arith.constant 1 : index`);
+              const limitIdx = this.builder.nextSSA();
+              this.builder.emit(`${limitIdx} = arith.index_cast %argc : i32 to index`);
+
+              this.builder.block(`scf.for %iv = ${c0Idx} to ${limitIdx} step ${c1Idx}`, () => {
+                const i64SSA = this.builder.nextSSA();
+                this.builder.emit(`${i64SSA} = arith.index_cast %iv : index to i64`);
+                const argvElemPtr = this.builder.nextSSA();
+                this.builder.emit(`${argvElemPtr} = llvm.getelementptr %argv[${i64SSA}] : (!llvm.ptr, i64) -> !llvm.ptr, !llvm.ptr`);
+                const strPtr = this.builder.nextSSA();
+                this.builder.emit(`${strPtr} = llvm.load ${argvElemPtr} : !llvm.ptr -> !llvm.ptr`);
+                const c1I64 = this.builder.nextSSA();
+                this.builder.emit(`${c1I64} = llvm.mlir.constant(1 : i64) : i64`);
+                const dstIdx = this.builder.nextSSA();
+                this.builder.emit(`${dstIdx} = arith.addi ${i64SSA}, ${c1I64} : i64`);
+                const dstElemPtr = this.builder.nextSSA();
+                this.builder.emit(`${dstElemPtr} = llvm.getelementptr ${arrPtr}[${dstIdx}] : (!llvm.ptr, i64) -> !llvm.ptr, !llvm.ptr`);
+                this.builder.emit(`llvm.store ${strPtr}, ${dstElemPtr} : !llvm.ptr, !llvm.ptr`);
+              });
+
+              preparedArgs = [{ ssa: arrPtr, ptr: arrPtr, type: "!llvm.ptr", isArray: true, isString: true }];
             }
+          } else {
+            const argcVal = isWasm ? this.builder.createConstant(0, "i32") : { ssa: "%argc", type: "i32" };
+            const p0 = this.coerceType(argcVal, p0Meta.type);
+            preparedArgs = [p0];
           }
         }
 
         let res;
+        const argSSAs = preparedArgs.map((a) => a.ssa || a.ptr).join(", ");
+        const argTypes = (userMainMeta?.paramTypes || []).join(", ");
+
         if (userMainMeta?.isAsync) {
-          const awaitExpr = {
-            type: "AwaitExpression",
-            argument: {
-              type: "CallExpression",
-              callee: { type: "Identifier", name: "main" },
-              arguments: callArgs,
-            },
-          };
-          res = this.lowerExpression(awaitExpr);
+          const taskSsa = this.builder.nextSSA();
+          this.builder.emit(`${taskSsa} = func.call @user_main_entry(${argSSAs}) : (${argTypes}) -> !llvm.ptr`);
+
+          const ctxMeta = this.asyncTaskContexts.get("main") || userMainMeta.taskContextMeta;
+          const taskContextType = ctxMeta?.type || "!llvm.struct<(i64, f64, !llvm.ptr, f64, !llvm.ptr, i32)>";
+          const retIdx = ctxMeta ? ctxMeta.retIdx : (userMainMeta.innerRetType === "!llvm.ptr" || userMainMeta.isRetString ? 4 : 3);
+          const innerRetType = ctxMeta?.innerRetType || userMainMeta.innerRetType || "f64";
+          const isRetString = ctxMeta ? ctxMeta.isRetString : (userMainMeta.isRetString || userMainMeta.innerRetType === "!llvm.ptr" || userMainMeta.innerRetType === "string");
+
+          const threadIdPtr = this.builder.nextSSA();
+          this.builder.emit(`${threadIdPtr} = llvm.getelementptr ${taskSsa}[0, 0] : (!llvm.ptr) -> !llvm.ptr, ${taskContextType}`);
+          const threadId = this.builder.load(threadIdPtr, "i64");
+
+          const nullPtr = this.builder.nextSSA();
+          this.builder.emit(`${nullPtr} = llvm.mlir.zero : !llvm.ptr`);
+          this.builder.emit(`llvm.call @pthread_join(${threadId.ssa}, ${nullPtr}) : (i64, !llvm.ptr) -> i32`);
+
+          if (innerRetType === "none" || retIdx < 0) {
+            this.builder.emit(`llvm.call @free(${taskSsa}) : (!llvm.ptr) -> ()`);
+            res = { ssa: "", type: "none" };
+          } else {
+            const resGEP = this.builder.nextSSA();
+            this.builder.emit(`${resGEP} = llvm.getelementptr ${taskSsa}[0, ${retIdx}] : (!llvm.ptr) -> !llvm.ptr, ${taskContextType}`);
+            const loaded = this.builder.load(resGEP, innerRetType);
+            this.builder.emit(`llvm.call @free(${taskSsa}) : (!llvm.ptr) -> ()`);
+            res = { ssa: loaded.ssa, type: innerRetType, isString: Boolean(isRetString) };
+          }
         } else {
-          const callExpr = {
-            type: "CallExpression",
-            callee: { type: "Identifier", name: "main" },
-            arguments: callArgs,
-          };
-          res = this.lowerExpression(callExpr);
+          const retType = userMainMeta?.retType || "none";
+          if (retType === "none") {
+            this.builder.emit(`func.call @user_main_entry(${argSSAs}) : (${argTypes}) -> ()`);
+            res = { ssa: "", type: "none" };
+          } else {
+            const ssa = this.builder.nextSSA();
+            this.builder.emit(`${ssa} = func.call @user_main_entry(${argSSAs}) : (${argTypes}) -> ${retType}`);
+            res = { ssa, type: retType };
+          }
         }
 
         if (res && res.type !== "none" && res.ssa) {
@@ -3782,11 +3906,19 @@ export class ASTLowerer {
 
     if (
       expr.type === "ParenthesizedExpression" ||
-      expr.type === "TSAsExpression" ||
       expr.type === "NonNullExpression" ||
       expr.type === "TSSatisfiesExpression"
     ) {
       return this.lowerExpression(expr.expression);
+    }
+
+    if (expr.type === "TSAsExpression") {
+      const val = this.lowerExpression(expr.expression);
+      if (expr.typeAnnotation) {
+        const targetType = this.resolveType(expr.typeAnnotation);
+        return this.coerceType(val, targetType);
+      }
+      return val;
     }
 
     // --- ADIM 7: AWAIT İFADESİ (pthread_join) ---
@@ -4715,6 +4847,119 @@ export class ASTLowerer {
         return simdRes;
       }
 
+      // 1. exit(code) ve process.exit(code)
+      if (
+        (expr.callee.type === "Identifier" && expr.callee.name === "exit") ||
+        (expr.callee.type === "MemberExpression" && expr.callee.object?.name === "process" && (expr.callee.property?.name === "exit" || expr.callee.property?.value === "exit"))
+      ) {
+        this.builder.markFeature("exit");
+        let codeVal = expr.arguments?.[0] ? this.lowerExpression(expr.arguments[0]) : this.builder.createConstant(0, "i32");
+        const codeI32 = this.coerceType(codeVal, "i32");
+        this.builder.emit(`llvm.call @exit(${codeI32.ssa}) : (i32) -> ()`);
+        return { ssa: "", type: "none" };
+      }
+
+      // 2. Ham Bellek İndeksleme ve Pointer Aritmetiği Intrinsics
+      if (expr.callee.type === "Identifier" && expr.callee.name === "ptr_read_u8") {
+        const ptrVal = this.lowerExpression(expr.arguments[0]);
+        let offVal = expr.arguments?.[1] ? this.lowerExpression(expr.arguments[1]) : this.builder.createConstant(0, "i64");
+        offVal = this.coerceType(offVal, "i64");
+        const elemPtr = this.builder.nextSSA();
+        this.builder.emit(`${elemPtr} = llvm.getelementptr ${ptrVal.ssa || ptrVal.ptr}[${offVal.ssa}] : (!llvm.ptr, i64) -> !llvm.ptr, i8`);
+        const byteVal = this.builder.load(elemPtr, "i8");
+        const extVal = this.builder.nextSSA();
+        this.builder.emit(`${extVal} = arith.extui ${byteVal.ssa} : i8 to i32`);
+        return { ssa: extVal, type: "i32" };
+      }
+
+      if (expr.callee.type === "Identifier" && expr.callee.name === "ptr_write_u8") {
+        const ptrVal = this.lowerExpression(expr.arguments[0]);
+        let offVal = this.lowerExpression(expr.arguments[1]);
+        offVal = this.coerceType(offVal, "i64");
+        let byteVal = this.lowerExpression(expr.arguments[2]);
+        byteVal = this.coerceType(byteVal, "i32");
+        const byteTrunc = this.builder.nextSSA();
+        this.builder.emit(`${byteTrunc} = arith.trunci ${byteVal.ssa} : i32 to i8`);
+        const elemPtr = this.builder.nextSSA();
+        this.builder.emit(`${elemPtr} = llvm.getelementptr ${ptrVal.ssa || ptrVal.ptr}[${offVal.ssa}] : (!llvm.ptr, i64) -> !llvm.ptr, i8`);
+        this.builder.store(elemPtr, { ssa: byteTrunc, type: "i8" });
+        return { ssa: "", type: "none" };
+      }
+
+      if (expr.callee.type === "Identifier" && expr.callee.name === "ptr_read_i32") {
+        const ptrVal = this.lowerExpression(expr.arguments[0]);
+        let offVal = expr.arguments?.[1] ? this.lowerExpression(expr.arguments[1]) : this.builder.createConstant(0, "i64");
+        offVal = this.coerceType(offVal, "i64");
+        const elemPtr = this.builder.nextSSA();
+        this.builder.emit(`${elemPtr} = llvm.getelementptr ${ptrVal.ssa || ptrVal.ptr}[${offVal.ssa}] : (!llvm.ptr, i64) -> !llvm.ptr, i32`);
+        const res = this.builder.load(elemPtr, "i32");
+        return res;
+      }
+
+      if (expr.callee.type === "Identifier" && expr.callee.name === "ptr_write_i32") {
+        const ptrVal = this.lowerExpression(expr.arguments[0]);
+        let offVal = this.lowerExpression(expr.arguments[1]);
+        offVal = this.coerceType(offVal, "i64");
+        let v = this.lowerExpression(expr.arguments[2]);
+        v = this.coerceType(v, "i32");
+        const elemPtr = this.builder.nextSSA();
+        this.builder.emit(`${elemPtr} = llvm.getelementptr ${ptrVal.ssa || ptrVal.ptr}[${offVal.ssa}] : (!llvm.ptr, i64) -> !llvm.ptr, i32`);
+        this.builder.store(elemPtr, v);
+        return { ssa: "", type: "none" };
+      }
+
+      if (expr.callee.type === "Identifier" && expr.callee.name === "ptr_read_f64") {
+        const ptrVal = this.lowerExpression(expr.arguments[0]);
+        let offVal = expr.arguments?.[1] ? this.lowerExpression(expr.arguments[1]) : this.builder.createConstant(0, "i64");
+        offVal = this.coerceType(offVal, "i64");
+        const elemPtr = this.builder.nextSSA();
+        this.builder.emit(`${elemPtr} = llvm.getelementptr ${ptrVal.ssa || ptrVal.ptr}[${offVal.ssa}] : (!llvm.ptr, i64) -> !llvm.ptr, f64`);
+        const res = this.builder.load(elemPtr, "f64");
+        return res;
+      }
+
+      if (expr.callee.type === "Identifier" && expr.callee.name === "ptr_write_f64") {
+        const ptrVal = this.lowerExpression(expr.arguments[0]);
+        let offVal = this.lowerExpression(expr.arguments[1]);
+        offVal = this.coerceType(offVal, "i64");
+        let v = this.lowerExpression(expr.arguments[2]);
+        v = this.coerceType(v, "f64");
+        const elemPtr = this.builder.nextSSA();
+        this.builder.emit(`${elemPtr} = llvm.getelementptr ${ptrVal.ssa || ptrVal.ptr}[${offVal.ssa}] : (!llvm.ptr, i64) -> !llvm.ptr, f64`);
+        this.builder.store(elemPtr, v);
+        return { ssa: "", type: "none" };
+      }
+
+      if (expr.callee.type === "Identifier" && expr.callee.name === "ptr_add") {
+        const ptrVal = this.lowerExpression(expr.arguments[0]);
+        let offVal = this.lowerExpression(expr.arguments[1]);
+        offVal = this.coerceType(offVal, "i64");
+        const resPtr = this.builder.nextSSA();
+        this.builder.emit(`${resPtr} = llvm.getelementptr ${ptrVal.ssa || ptrVal.ptr}[${offVal.ssa}] : (!llvm.ptr, i64) -> !llvm.ptr, i8`);
+        return { ssa: resPtr, ptr: resPtr, type: "!llvm.ptr", isRef: true };
+      }
+
+      // 3. String.fromCharCode(code)
+      if (
+        expr.callee.type === "MemberExpression" &&
+        expr.callee.object?.name === "String" &&
+        (expr.callee.property?.name === "fromCharCode" || expr.callee.property?.value === "fromCharCode")
+      ) {
+        this.builder.markFeature("heap");
+        this.builder.markFeature("strings");
+        let codeVal = this.lowerExpression(expr.arguments[0]);
+        codeVal = this.coerceType(codeVal, "i32");
+        const byteTrunc = this.builder.nextSSA();
+        this.builder.emit(`${byteTrunc} = arith.trunci ${codeVal.ssa} : i32 to i8`);
+        const slot = this.builder.allocateHeap(2);
+        this.builder.store(slot.ptr, { ssa: byteTrunc, type: "i8" });
+        const termPtr = this.builder.nextSSA();
+        this.builder.emit(`${termPtr} = llvm.getelementptr ${slot.ptr}[1] : (!llvm.ptr) -> !llvm.ptr, i8`);
+        const zeroByte = this.builder.createConstant(0, "i8");
+        this.builder.store(termPtr, zeroByte);
+        return { ssa: slot.ptr, ptr: slot.ptr, type: "!llvm.ptr", isString: true, isHeap: true };
+      }
+
       if (expr.callee.type === "Identifier" && expr.callee.name === "malloc") {
         this.builder.markFeature("heap");
         let szVal = this.lowerExpression(expr.arguments[0]);
@@ -5093,6 +5338,15 @@ export class ASTLowerer {
               `${ssa} = func.call @rts_str_slice(${base.ptr || base.ssa}, ${startVal.ssa}, ${endVal.ssa}) : (!llvm.ptr, i64, i64) -> !llvm.ptr`
             );
             return { ssa, ptr: ssa, type: "!llvm.ptr", isString: true, isHeap: true };
+          } else if (methodName === "charCodeAt") {
+            let idxVal = expr.arguments?.[0] ? this.lowerExpression(expr.arguments[0]) : this.builder.createConstant(0, "i64");
+            idxVal = this.coerceType(idxVal, "i64");
+            const charPtr = this.builder.nextSSA();
+            this.builder.emit(`${charPtr} = llvm.getelementptr ${base.ptr || base.ssa}[${idxVal.ssa}] : (!llvm.ptr, i64) -> !llvm.ptr, i8`);
+            const charByte = this.builder.load(charPtr, "i8");
+            const extSsa = this.builder.nextSSA();
+            this.builder.emit(`${extSsa} = arith.extui ${charByte.ssa} : i8 to i32`);
+            return { ssa: extSsa, type: "i32" };
           }
         }
 

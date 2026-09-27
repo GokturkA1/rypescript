@@ -30,10 +30,20 @@ export class BuiltinRegistry {
     this.functionSignatures.set("free", { params: ["pointer"], returnType: "void" });
     this.functionSignatures.set("alloca", { params: ["number"], returnType: "pointer" });
     this.functionSignatures.set("sleep", { params: ["number"], returnType: "void" });
+    this.functionSignatures.set("exit", { params: ["number"], minArgs: 0, returnType: "never" });
     this.functionSignatures.set("panic", { params: ["string"], returnType: "never" });
     this.functionSignatures.set("assert", { params: ["boolean", "string"], returnType: "void" });
     this.functionSignatures.set("join", { params: ["pointer"], returnType: "void" });
     this.functionSignatures.set("spawn", { params: ["function", "any"], minArgs: 1, returnType: "pointer" });
+
+    // Ham Bellek İndeksleme ve Pointer Aritmetiği Fonksiyonları
+    this.functionSignatures.set("ptr_read_u8", { params: ["pointer", "number"], minArgs: 1, returnType: "number" });
+    this.functionSignatures.set("ptr_write_u8", { params: ["pointer", "number", "number"], returnType: "void" });
+    this.functionSignatures.set("ptr_read_i32", { params: ["pointer", "number"], minArgs: 1, returnType: "number" });
+    this.functionSignatures.set("ptr_write_i32", { params: ["pointer", "number", "number"], returnType: "void" });
+    this.functionSignatures.set("ptr_read_f64", { params: ["pointer", "number"], minArgs: 1, returnType: "number" });
+    this.functionSignatures.set("ptr_write_f64", { params: ["pointer", "number", "number"], returnType: "void" });
+    this.functionSignatures.set("ptr_add", { params: ["pointer", "number"], returnType: "pointer" });
 
     // 3. Result<T, E> ve Hata Yönetimi Fonksiyonları
     this.functionSignatures.set("Ok", { params: ["any"], returnType: "Result" });
@@ -125,10 +135,11 @@ export class BuiltinRegistry {
       ]),
     });
 
-    // 9. String Metotları (C-Style sıfır maliyetli dilimleme)
+    // 9. String Metotları (C-Style sıfır maliyetli dilimleme ve karakter işlemleri)
     const stringMethods = new Map([
       ["slice", { params: ["number", "number"], minArgs: 1, returnType: "string" }],
       ["substring", { params: ["number", "number"], minArgs: 1, returnType: "string" }],
+      ["charCodeAt", { params: ["number"], minArgs: 1, returnType: "number" }],
     ]);
     this.structSignatures.set("string", {
       fields: new Map([["length", { type: "number" }]]),
@@ -136,7 +147,18 @@ export class BuiltinRegistry {
     });
     this.structSignatures.set("String", {
       fields: new Map([["length", { type: "number" }]]),
-      methods: stringMethods,
+      methods: new Map([
+        ...stringMethods,
+        ["fromCharCode", { params: ["number"], returnType: "string" }],
+      ]),
+    });
+
+    // 10. process Namespace (Süreç Kontrolü)
+    this.structSignatures.set("process", {
+      fields: new Map(),
+      methods: new Map([
+        ["exit", { params: ["number"], minArgs: 0, returnType: "never" }],
+      ]),
     });
 
     // 10. SIMD Vektör Tipleri ve Fonksiyonları

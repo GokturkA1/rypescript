@@ -65,7 +65,8 @@ export class TypeChecker {
         const name = curr.typeName?.name || curr.typeName?.value;
         if (!name) return "any";
         if (["f32x4", "f64x2", "i32x4", "i64x2", "f64x4", "f32x8", "i32x8"].includes(name)) return name;
-        if (["i64", "i32", "f64", "f32"].includes(name)) return "number";
+        if (["i64", "i32", "f64", "f32", "usize", "isize", "u64", "u32", "byte", "int", "float", "double"].includes(name)) return "number";
+        if (name === "pointer" || name === "ptr") return "pointer";
         if (name === "bool") return "boolean";
         if (name === "Array") {
           const param = curr.typeParameters?.params?.[0] || curr.typeArguments?.params?.[0];
@@ -333,6 +334,11 @@ export class TypeChecker {
         this.inferExpressionType(e);
       }
       return "string";
+    }
+
+    if (expr.type === "TSAsExpression" || expr.type === "TSSatisfiesExpression") {
+      this.inferExpressionType(expr.expression);
+      return this.resolveType(expr.typeAnnotation);
     }
 
     // 2. Dizi İfadesi (ArrayExpression)
@@ -629,8 +635,8 @@ export class TypeChecker {
         return sym.type;
       }
 
-      // Vektör ve SIMD Namespace kontrolü
-      if (["f32x4", "f64x2", "i32x4", "i64x2", "f64x4", "f32x8", "i32x8", "simd"].includes(expr.name)) {
+      // Vektör, SIMD, String ve process Namespace kontrolü
+      if (["f32x4", "f64x2", "i32x4", "i64x2", "f64x4", "f32x8", "i32x8", "simd", "String", "process"].includes(expr.name)) {
         return expr.name;
       }
 

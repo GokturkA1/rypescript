@@ -24,6 +24,7 @@ export class MLIRBuilder {
       allocators: false,
       napi: false,
       sleep: false,
+      exit: false,
       exceptions: false,
       strings: false,
       strcmp: false,
@@ -664,6 +665,14 @@ export class MLIRBuilder {
         header += `  llvm.func @Sleep(i32) -> ()\n`;
       } else if (!isWasm) {
         header += `  llvm.func @usleep(i32) -> i32\n`;
+      }
+    }
+
+    if (this.usedFeatures.exit) {
+      if (isWasm) {
+        header += `  llvm.func @exit(%code: i32) {\n    llvm.unreachable\n  }\n`;
+      } else {
+        header += `  llvm.func @exit(i32) -> ()\n`;
       }
     }
     header += `\n`;
