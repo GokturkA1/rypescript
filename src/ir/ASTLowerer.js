@@ -30,6 +30,7 @@ export class ASTLowerer {
     this.spawnRunners = new Map();
     this.globals = new Map();
     this.napiFunctions = [];
+    this.asyncTaskContexts = new Map();
 
     // Standart Kütüphane: Yerleşik Result<T, E = string> Şablonu
     this.genericInterfaceTemplates.set("Result", {
@@ -64,6 +65,8 @@ export class ASTLowerer {
     });
 
     this.scopeStack = [];
+    this.closureRegistry = new Map();
+    this.thunkRegistry = new Map();
     this.builder.onAllocate = (ptr) => this.trackHeap(ptr);
   }
 
@@ -351,15 +354,54 @@ export class ASTLowerer {
       let retType = this.resolveType(retAnnot);
       if (!retType) retType = "none";
 
-      const mlirType = `(${paramTypes.join(", ")}) -> ${retType === "none" ? "()" : retType}`;
+      const rawCallableType = `(${paramTypes.join(", ")}) -> ${retType === "none" ? "()" : retType}`;
+      const callableType = `(!llvm.ptr${paramTypes.length ? ", " + paramTypes.join(", ") : ""}) -> ${retType === "none" ? "()" : retType}`;
       return {
         paramTypes,
         retType,
-        mlirType,
+        mlirType: "!llvm.struct<(!llvm.ptr, !llvm.ptr)>",
+        callableType,
+        rawCallableType,
       };
     }
 
     return null;
+  }
+
+  getOrCreateThunk(funcName) {
+    const thunkName = `__thunk_${funcName}`;
+    if (this.thunkRegistry.has(funcName)) {
+      return this.thunkRegistry.get(funcName);
+    }
+
+    const fnMeta = this.functionRegistry.get(funcName);
+    const paramTypes = fnMeta?.paramTypes || [];
+    const retType = fnMeta?.retType || "none";
+    const retStr = retType === "none" ? "()" : retType;
+    const thunkSig = `(!llvm.ptr${paramTypes.length ? ", " + paramTypes.join(", ") : ""}) -> ${retStr}`;
+
+    const thunkParams = [`%arg_env: !llvm.ptr`];
+    const callArgs = [];
+    paramTypes.forEach((pt, i) => {
+      thunkParams.push(`%arg_${i}: ${pt}`);
+      callArgs.push(`%arg_${i}`);
+    });
+
+    const lines = [];
+    lines.push(`  func.func @${thunkName}(${thunkParams.join(", ")}) -> ${retStr} {`);
+    if (retType === "none") {
+      lines.push(`    func.call @${funcName}(${callArgs.join(", ")}) : (${paramTypes.join(", ")}) -> ()`);
+      lines.push(`    func.return`);
+    } else {
+      lines.push(`    %res = func.call @${funcName}(${callArgs.join(", ")}) : (${paramTypes.join(", ")}) -> ${retType}`);
+      lines.push(`    func.return %res : ${retType}`);
+    }
+    lines.push(`  }`);
+
+    this.builder.addModuleFunction(lines.join("\n"));
+    const thunkInfo = { thunkName, thunkSig, paramTypes, retType };
+    this.thunkRegistry.set(funcName, thunkInfo);
+    return thunkInfo;
   }
 
   isFunctionType(typeNode) {
@@ -850,11 +892,12 @@ export class ASTLowerer {
               } else if (decl.init.type === "TemplateLiteral") {
                 type = "!llvm.ptr";
                 isString = true;
-              } else if (decl.init.type === "ArrayExpression") {
+              } else if (decl.init.type === "NewExpression") {
                 type = "!llvm.ptr";
-              } else if (decl.init.type === "ObjectExpression" || decl.init.type === "NewExpression") {
+                structName = this.getStructName(decl.id.typeAnnotation) || decl.init.callee?.name;
+              } else if (decl.init.type === "ObjectExpression") {
                 type = "!llvm.ptr";
-                structName = this.inferStructName(decl.init);
+                structName = this.getStructName(decl.id.typeAnnotation) || this.inferStructName(decl.init);
               } else if (decl.init.type === "BinaryExpression" && decl.init.operator === "+") {
                 const isStr = (n) => n && (n.type === "StringLiteral" || (n.type === "Literal" && typeof n.value === "string") || n.type === "TemplateLiteral");
                 if (isStr(decl.init.left) || isStr(decl.init.right)) {
@@ -1044,25 +1087,43 @@ export class ASTLowerer {
 
         let innerRetType = "f64";
         const unwrappedRet = this.unwrapType(node.returnType);
+        let innerParamNode = null;
         if (unwrappedRet && unwrappedRet.type === "TSTypeReference" && (unwrappedRet.typeName?.name === "Promise" || unwrappedRet.typeName?.value === "Promise")) {
-          const innerParam = unwrappedRet.typeParameters?.params?.[0] || unwrappedRet.typeArguments?.params?.[0];
-          innerRetType = innerParam ? this.resolveType(innerParam) : "none";
+          innerParamNode = unwrappedRet.typeParameters?.params?.[0] || unwrappedRet.typeArguments?.params?.[0];
+          innerRetType = innerParamNode ? this.resolveType(innerParamNode) : "none";
         } else if (node.returnType) {
           innerRetType = this.resolveType(node.returnType);
         } else {
           let hasReturnVal = false;
+          let isClosureRet = false;
           if (node.body?.body) {
             this.walkAST(node.body, (n) => {
-              if (n.type === "ReturnStatement" && n.argument) hasReturnVal = true;
+              if (n.type === "ReturnStatement" && n.argument) {
+                hasReturnVal = true;
+                if (
+                  n.argument.type === "ArrowFunctionExpression" ||
+                  n.argument.type === "FunctionExpression" ||
+                  n.argument.type === "ClosureExpression"
+                ) {
+                  isClosureRet = true;
+                }
+              }
             });
           }
-          innerRetType = hasReturnVal ? "f64" : "none";
+          innerRetType = isClosureRet
+            ? "!llvm.struct<(!llvm.ptr, !llvm.ptr)>"
+            : hasReturnVal
+            ? "f64"
+            : "none";
         }
 
         const retType = isAsync ? "!llvm.ptr" : innerRetType;
-        const structRetName = this.getStructName(node.returnType);
-        const enumRetName = this.getEnumName(node.returnType);
-        const isRetString = this.isStringType(node.returnType);
+        const effectiveRetNode = isAsync && innerParamNode ? innerParamNode : node.returnType;
+        const structRetName = this.getStructName(effectiveRetNode);
+        const enumRetName = this.getEnumName(effectiveRetNode);
+        const isRetString = this.isStringType(effectiveRetNode);
+        const isRetFn = this.isFunctionType(effectiveRetNode);
+        const retFnSig = isRetFn ? this.extractFunctionType(effectiveRetNode) : null;
 
         const rawParams = Array.isArray(node.params)
           ? node.params
@@ -1082,16 +1143,42 @@ export class ASTLowerer {
           }
           const isArr = this.unwrapType(typeAnnot)?.type === "TSArrayType";
           const isStr = this.isStringType(typeAnnot);
-          const pType = isFn ? fnSig.mlirType : (isUnion || isArr || isStr) ? "!llvm.ptr" : this.resolveType(typeAnnot);
+          const pType = isFn ? "!llvm.struct<(!llvm.ptr, !llvm.ptr)>" : (isUnion || isArr || isStr) ? "!llvm.ptr" : this.resolveType(typeAnnot);
           const enumName = this.getEnumName(typeAnnot);
           const isChan = this.unwrapType(typeAnnot)?.typeName?.name === "Channel";
-          params.push({ name: param.name || `arg_${i}`, type: pType, isUnion, isArray: isArr, isFunction: isFn, fnSig, enumName, isChannel: isChan, isString: isStr });
+          params.push({ name: param.name || `arg_${i}`, type: pType, isUnion, isArray: isArr, isFunction: isFn, isClosure: isFn, fnSig, enumName, isChannel: isChan, isString: isStr });
           paramTypes.push(pType);
         });
 
+        let taskContextMeta = null;
+        if (isAsync) {
+          const contextFields = ["i64", ...paramTypes];
+          let retIdx = -1;
+          if (innerRetType !== "none") {
+            retIdx = contextFields.length;
+            contextFields.push(innerRetType);
+          }
+          const statusIdx = contextFields.length;
+          contextFields.push("i32");
+          const taskContextType = `!llvm.struct<(${contextFields.join(", ")})>`;
+          const taskContextByteSize = Math.max(contextFields.length * 8, 16);
+          taskContextMeta = {
+            type: taskContextType,
+            fields: contextFields,
+            paramTypes,
+            retIdx,
+            statusIdx,
+            innerRetType,
+            isRetString,
+            structRetName,
+            byteSize: taskContextByteSize,
+          };
+          this.asyncTaskContexts.set(funcName, taskContextMeta);
+        }
+
         const declSig = retType === "none" ? `(${paramTypes.join(", ")})` : `(${paramTypes.join(", ")}) -> ${retType}`;
         const mlirType = `(${paramTypes.join(", ")}) -> ${retType === "none" ? "()" : retType}`;
-        this.functionRegistry.set(funcName, { isAsync, isDeclare, innerRetType, retType, structRetName, enumRetName, isRetString, params, paramTypes, mlirType, declSig });
+        this.functionRegistry.set(funcName, { isAsync, isDeclare, innerRetType, retType, structRetName, enumRetName, isRetString, isRetFn, retFnSig, params, paramTypes, mlirType, declSig, isClosure: Boolean(node.isClosure), taskContextMeta });
 
         if (isDeclare) {
           this.builder.declareExternalFunction(funcName, declSig);
@@ -1128,6 +1215,13 @@ export class ASTLowerer {
       }
 
       this.exitScope();
+
+      if (!this.builder.targetInfo?.isWasm && (this.builder.usedFeatures.threads || this.builder.usedFeatures.channels)) {
+        const nullPtr = this.builder.nextSSA();
+        this.builder.emit(`${nullPtr} = llvm.mlir.zero : !llvm.ptr`);
+        this.builder.emit(`llvm.call @pthread_exit(${nullPtr}) : (!llvm.ptr) -> ()`);
+      }
+
       const zero = this.builder.createConstant(0, "i32");
       this.builder.createReturn(zero);
     });
@@ -1281,7 +1375,7 @@ export class ASTLowerer {
         const typeAnnot = member.typeAnnotation;
         const isFn = this.isFunctionType(typeAnnot);
         const fnSig = isFn ? this.extractFunctionType(typeAnnot) : null;
-        const fieldType = isFn ? "!llvm.ptr" : this.resolveType(typeAnnot);
+        const fieldType = this.resolveType(typeAnnot);
         const structName = this.getStructName(typeAnnot);
         const enumName = this.getEnumName(typeAnnot);
         const isString = this.isStringType(typeAnnot);
@@ -1345,7 +1439,7 @@ export class ASTLowerer {
             const typeAnnot = member.typeAnnotation;
             const isFn = this.isFunctionType(typeAnnot);
             const fnSig = isFn ? this.extractFunctionType(typeAnnot) : null;
-            const fieldType = isFn ? "!llvm.ptr" : this.resolveType(typeAnnot);
+            const fieldType = this.resolveType(typeAnnot);
             const sNameSub = this.getStructName(typeAnnot);
             const enumName = this.getEnumName(typeAnnot);
             const isString = this.isStringType(typeAnnot);
@@ -1407,7 +1501,7 @@ export class ASTLowerer {
         const typeAnnot = member.typeAnnotation;
         const isFn = this.isFunctionType(typeAnnot);
         const fnSig = isFn ? this.extractFunctionType(typeAnnot) : null;
-        const fieldType = isFn ? "!llvm.ptr" : this.resolveType(typeAnnot);
+        const fieldType = this.resolveType(typeAnnot);
         const sName = this.getStructName(typeAnnot);
         const enumName = this.getEnumName(typeAnnot);
         const isString = this.isStringType(typeAnnot);
@@ -1755,13 +1849,13 @@ export class ASTLowerer {
       }
       const isChan = this.unwrapType(typeAnnot)?.typeName?.name === "Channel";
       const isStr = this.isStringType(typeAnnot);
-      const pType = isFn ? fnSig.mlirType : (isUnion || isArr || isChan || isStr) ? "!llvm.ptr" : this.resolveType(typeAnnot);
+      const pType = isFn ? "!llvm.struct<(!llvm.ptr, !llvm.ptr)>" : (isUnion || isArr || isChan || isStr) ? "!llvm.ptr" : this.resolveType(typeAnnot);
       const structName = this.getStructName(typeAnnot);
 
       const ssaArg = `%arg_${pName}`;
       paramStrings.push(`${ssaArg}: ${pType}`);
       paramTypes.push(pType);
-      params.push({ name: pName, ssa: ssaArg, type: pType, structName, isUnion, isArray: isArr, elemType: arrElemType, isString: isStr || isArrString, arrStruct, isFunction: isFn, fnSig, typeAnnot, isChannel: isChan });
+      params.push({ name: pName, ssa: ssaArg, type: pType, structName, isUnion, isArray: isArr, elemType: arrElemType, isString: isStr || isArrString, arrStruct, isFunction: isFn, isClosure: isFn, fnSig, typeAnnot, isChannel: isChan });
     });
 
     const innerRetType = fnMeta?.innerRetType || "f64";
@@ -1774,6 +1868,14 @@ export class ASTLowerer {
       const innerName = `__async_inner_${funcName}`;
       const runnerName = `__async_runner_${funcName}`;
       const innerSig = innerRetType === "none" ? "" : ` -> ${innerRetType}`;
+
+      const ctxMeta = this.asyncTaskContexts.get(funcName) || fnMeta?.taskContextMeta || {
+        type: `!llvm.struct<(i64${paramTypes.length ? ", " + paramTypes.join(", ") : ""}${innerRetType !== "none" ? ", " + innerRetType : ""}, i32)>`,
+        retIdx: innerRetType !== "none" ? paramTypes.length + 1 : -1,
+        statusIdx: innerRetType !== "none" ? paramTypes.length + 2 : paramTypes.length + 1,
+        byteSize: Math.max((paramTypes.length + (innerRetType !== "none" ? 3 : 2)) * 8, 16),
+      };
+      const taskContextType = ctxMeta.type;
 
       // 1. İç mantık fonksiyonu (@__async_inner_*)
       this.builder.block(`func.func @${innerName}(${paramStrings.join(", ")})${innerSig}`, () => {
@@ -1804,17 +1906,11 @@ export class ASTLowerer {
         const callArgs = [];
         for (let i = 0; i < params.length; i++) {
           const p = params[i];
-          if (p.type === "f64") {
-            const gep = this.builder.nextSSA();
-            this.builder.emit(`${gep} = llvm.getelementptr %arg_ctx[0, 1] : (!llvm.ptr) -> !llvm.ptr, !llvm.struct<(i64, f64, !llvm.ptr, f64, !llvm.ptr, i32)>`);
-            const loaded = this.builder.load(gep, "f64");
-            callArgs.push(loaded.ssa);
-          } else {
-            const gep = this.builder.nextSSA();
-            this.builder.emit(`${gep} = llvm.getelementptr %arg_ctx[0, 2] : (!llvm.ptr) -> !llvm.ptr, !llvm.struct<(i64, f64, !llvm.ptr, f64, !llvm.ptr, i32)>`);
-            const loaded = this.builder.load(gep, "!llvm.ptr");
-            callArgs.push(loaded.ssa);
-          }
+          const fieldIdx = i + 1;
+          const gep = this.builder.nextSSA();
+          this.builder.emit(`${gep} = llvm.getelementptr %arg_ctx[0, ${fieldIdx}] : (!llvm.ptr) -> !llvm.ptr, ${taskContextType}`);
+          const loaded = this.builder.load(gep, p.type);
+          callArgs.push(loaded.ssa);
         }
 
         const callStr = callArgs.join(", ");
@@ -1825,46 +1921,46 @@ export class ASTLowerer {
         } else {
           const resSSA = this.builder.nextSSA();
           this.builder.emit(`${resSSA} = func.call @${innerName}(${callStr}) : (${typeStr}) -> ${innerRetType}`);
-          if (innerRetType === "f64") {
+          if (ctxMeta.retIdx >= 0) {
             const resGEP = this.builder.nextSSA();
-            this.builder.emit(`${resGEP} = llvm.getelementptr %arg_ctx[0, 3] : (!llvm.ptr) -> !llvm.ptr, !llvm.struct<(i64, f64, !llvm.ptr, f64, !llvm.ptr, i32)>`);
-            this.builder.emit(`llvm.store ${resSSA}, ${resGEP} : f64, !llvm.ptr`);
-          } else {
-            const resGEP = this.builder.nextSSA();
-            this.builder.emit(`${resGEP} = llvm.getelementptr %arg_ctx[0, 4] : (!llvm.ptr) -> !llvm.ptr, !llvm.struct<(i64, f64, !llvm.ptr, f64, !llvm.ptr, i32)>`);
-            this.builder.emit(`llvm.store ${resSSA}, ${resGEP} : !llvm.ptr, !llvm.ptr`);
+            this.builder.emit(`${resGEP} = llvm.getelementptr %arg_ctx[0, ${ctxMeta.retIdx}] : (!llvm.ptr) -> !llvm.ptr, ${taskContextType}`);
+            this.builder.store(resGEP, { ssa: resSSA, type: innerRetType });
           }
         }
+
+        const statusGEP = this.builder.nextSSA();
+        this.builder.emit(`${statusGEP} = llvm.getelementptr %arg_ctx[0, ${ctxMeta.statusIdx}] : (!llvm.ptr) -> !llvm.ptr, ${taskContextType}`);
+        const c1 = this.builder.createConstant(1, "i32");
+        this.builder.store(statusGEP, c1);
 
         const nullRet = this.builder.nextSSA();
         this.builder.emit(`${nullRet} = llvm.mlir.zero : !llvm.ptr`);
         this.builder.emit(`func.return ${nullRet} : !llvm.ptr`);
       });
 
-      // 3. Çağrıcı fonksiyon (@compute: TaskContext ayırır, pthread_create başlatır ve döner)
+      // 3. Çağrıcı fonksiyon (@funcName)
       this.builder.block(`func.func @${funcName}(${paramStrings.join(", ")}) -> !llvm.ptr`, () => {
         const ctxSz = this.builder.nextSSA();
-        this.builder.emit(`${ctxSz} = llvm.mlir.constant(48 : i64) : i64`);
+        this.builder.emit(`${ctxSz} = llvm.mlir.constant(${ctxMeta.byteSize} : i64) : i64`);
         const taskPtr = this.builder.nextSSA();
         this.builder.emit(`${taskPtr} = llvm.call @malloc(${ctxSz}) : (i64) -> !llvm.ptr`);
 
         for (let i = 0; i < params.length; i++) {
           const p = params[i];
-          if (p.type === "f64") {
-            const gep = this.builder.nextSSA();
-            this.builder.emit(`${gep} = llvm.getelementptr ${taskPtr}[0, 1] : (!llvm.ptr) -> !llvm.ptr, !llvm.struct<(i64, f64, !llvm.ptr, f64, !llvm.ptr, i32)>`);
-            this.builder.emit(`llvm.store ${p.ssa}, ${gep} : f64, !llvm.ptr`);
-          } else {
-            const gep = this.builder.nextSSA();
-            this.builder.emit(`${gep} = llvm.getelementptr ${taskPtr}[0, 2] : (!llvm.ptr) -> !llvm.ptr, !llvm.struct<(i64, f64, !llvm.ptr, f64, !llvm.ptr, i32)>`);
-            this.builder.emit(`llvm.store ${p.ssa}, ${gep} : !llvm.ptr, !llvm.ptr`);
-          }
+          const fieldIdx = i + 1;
+          const gep = this.builder.nextSSA();
+          this.builder.emit(`${gep} = llvm.getelementptr ${taskPtr}[0, ${fieldIdx}] : (!llvm.ptr) -> !llvm.ptr, ${taskContextType}`);
+          this.builder.store(gep, { ssa: p.ssa, type: p.type });
         }
+
+        const statusGEP = this.builder.nextSSA();
+        this.builder.emit(`${statusGEP} = llvm.getelementptr ${taskPtr}[0, ${ctxMeta.statusIdx}] : (!llvm.ptr) -> !llvm.ptr, ${taskContextType}`);
+        const c0 = this.builder.createConstant(0, "i32");
+        this.builder.store(statusGEP, c0);
 
         const nullAttr = this.builder.nextSSA();
         this.builder.emit(`${nullAttr} = llvm.mlir.zero : !llvm.ptr`);
 
-        // DÜZELTME: Runner fonksiyonunu func.constant ile alıp func.call ile pthread_create'e geçiyoruz
         const runnerAddr = this.builder.nextSSA();
         this.builder.emit(`${runnerAddr} = func.constant @${runnerName} : (!llvm.ptr) -> !llvm.ptr`);
 
@@ -1901,12 +1997,13 @@ export class ASTLowerer {
       const prevSyms = new Map(this.symbolTable);
 
       for (const p of params) {
-        if (p.isFunction) {
+        if (p.isFunction || p.isClosure) {
           this.symbolTable.set(p.name, {
             ssa: p.ssa,
             ptr: p.ssa,
             type: p.type,
             isFunction: true,
+            isClosure: true,
             fnSig: p.fnSig,
           });
         } else if (p.isUnion) {
@@ -1936,14 +2033,6 @@ export class ASTLowerer {
             isChannel: true,
             isRef: true,
           });
-        } else if (p.isChannel) {
-          this.symbolTable.set(p.name, {
-            ptr: p.ssa,
-            ssa: p.ssa,
-            type: "!llvm.ptr",
-            isChannel: true,
-            isRef: true,
-          });
         } else if (p.structName) {
           this.symbolTable.set(p.name, {
             ptr: p.ssa,
@@ -1957,6 +2046,39 @@ export class ASTLowerer {
           this.builder.store(slot.ptr, { ssa: p.ssa, type: p.type });
           this.symbolTable.set(p.name, { ptr: slot.ptr, type: p.type, isRef: true, isString: p.isString });
         }
+      }
+
+      // Closure ise ve serbest değişkenleri yakalamışsa, ortamdan (environment) aç (unpack)
+      if (node.isClosure && node.captures && node.captures.length > 0) {
+        const meta = this.closureRegistry?.get(effectiveFnName);
+        const capturesMeta = meta?.captureMeta || (node.capturesMeta || []).map((c) => ({
+          name: c.name,
+          type: c.typeAnnotation ? this.resolveType(c.typeAnnotation) : "f64",
+          isString: c.typeAnnotation ? this.isStringType(c.typeAnnotation) : false,
+          structName: c.typeAnnotation ? this.getStructName(c.typeAnnotation) : null,
+        }));
+        const envTypes = capturesMeta.map((c) => c.type || "f64");
+        const envStructType = `!llvm.struct<(${envTypes.join(", ")})>`;
+        capturesMeta.forEach((cap, idx) => {
+          const cType = cap.type || "f64";
+          const gep = this.builder.nextSSA();
+          this.builder.emit(
+            `${gep} = llvm.getelementptr %arg___env[0, ${idx}] : (!llvm.ptr) -> !llvm.ptr, ${envStructType}`
+          );
+          this.symbolTable.set(cap.name, {
+            ptr: gep,
+            ssa: gep,
+            type: cType,
+            isString: cap.isString || false,
+            structName: cap.structName || null,
+            isArray: cap.isArray || false,
+            elemType: cap.elemType || "f64",
+            isClosure: cap.isClosure || false,
+            isFunction: cap.isFunction || false,
+            fnSig: cap.fnSig || null,
+            isRef: true,
+          });
+        });
       }
 
       if (node.body?.body) {
@@ -2246,13 +2368,17 @@ export class ASTLowerer {
                 innerRetType: val.innerRetType,
                 isRef: true,
               });
-            } else if (val.isFunction) {
+            } else if (val.isFunction || val.isClosure || val.type === "!llvm.struct<(!llvm.ptr, !llvm.ptr)>") {
+              const slot = this.builder.allocateStack("!llvm.struct<(!llvm.ptr, !llvm.ptr)>");
+              this.builder.store(slot.ptr, val);
+              const explicitFnSig = this.extractFunctionType(decl.id.typeAnnotation);
               this.symbolTable.set(varName, {
+                ptr: slot.ptr,
                 ssa: val.ssa,
-                ptr: val.ssa,
-                type: val.type,
+                type: "!llvm.struct<(!llvm.ptr, !llvm.ptr)>",
+                isClosure: true,
                 isFunction: true,
-                fnSig: val.fnSig,
+                fnSig: explicitFnSig || val.fnSig || null,
               });
             } else if (val.isArray || (decl.init && decl.init.type === "ArrayExpression")) {
               const arrTarget = this.extractArrayTargetType(decl.id.typeAnnotation);
@@ -2344,6 +2470,12 @@ export class ASTLowerer {
                   type: targetType,
                   isRef: true,
                   isString: coerced.isString || this.isStringType(decl.id.typeAnnotation),
+                  isPromise: Boolean(val.isPromise),
+                  asyncFnName: val.asyncFnName || null,
+                  taskContextMeta: val.taskContextMeta || null,
+                  innerRetType: val.innerRetType || null,
+                  structName: val.structName || null,
+                  isSlot: true,
                 });
               }
             }
@@ -2575,6 +2707,9 @@ export class ASTLowerer {
           if (val.type === "!llvm.ptr" || val.isHeap) {
             this.markTransferred(val.ssa || val.ptr);
           }
+          if (val.isClosure && val.envPtr) {
+            this.markTransferred(val.envPtr);
+          }
           this.cleanupFunctionScopes();
           this.builder.createReturn(val);
         } else {
@@ -2762,6 +2897,9 @@ export class ASTLowerer {
     if (hintStructName && this.structRegistry.has(hintStructName)) {
       return hintStructName;
     }
+    if (!objExpr || !objExpr.properties) {
+      return hintStructName || null;
+    }
     const propNames = objExpr.properties.map((p) => p.key?.name || p.key?.value);
     for (const [sName, sMeta] of this.structRegistry.entries()) {
       const metaFields = sMeta.fields.filter((f) => f.name !== "__type_id").map((f) => f.name);
@@ -2817,7 +2955,9 @@ export class ASTLowerer {
       }
       let val = this.lowerExpression(prop.value);
 
-      if (fieldMeta.isFunction && (val.isFunction || val.type !== "!llvm.ptr")) {
+      if (fieldMeta.type === "!llvm.struct<(!llvm.ptr, !llvm.ptr)>" || val.type === "!llvm.struct<(!llvm.ptr, !llvm.ptr)>") {
+        // Struct alanı fat pointer taşıyor - doğrudan sakla
+      } else if (fieldMeta.isFunction && (val.isFunction || val.type !== "!llvm.ptr")) {
         const castSSA = this.builder.nextSSA();
         this.builder.emit(
           `${castSSA} = builtin.unrealized_conversion_cast ${val.ssa || val.ptr} : ${val.type} to !llvm.ptr`
@@ -2901,7 +3041,9 @@ export class ASTLowerer {
     });
 
     return {
+      ssa: heapSlot.ptr,
       ptr: heapSlot.ptr,
+      type: "!llvm.ptr",
       length: len,
       arrayLen: len,
       elemType,
@@ -2909,6 +3051,7 @@ export class ASTLowerer {
       structName: structNameElem,
       isHeap: true,
       isArray: true,
+      isRef: true,
     };
   }
 
@@ -2927,8 +3070,17 @@ export class ASTLowerer {
     // --- ADIM 7: AWAIT İFADESİ (pthread_join) ---
     if (expr.type === "AwaitExpression") {
       const task = this.lowerExpression(expr.argument);
+      const asyncFnName = task.asyncFnName || (expr.argument.type === "CallExpression" ? expr.argument.callee?.name : null);
+      const ctxMeta = (asyncFnName ? this.asyncTaskContexts.get(asyncFnName) : null) || task.taskContextMeta;
+
+      const taskContextType = ctxMeta?.type || "!llvm.struct<(i64, f64, !llvm.ptr, f64, !llvm.ptr, i32)>";
+      const retIdx = ctxMeta ? ctxMeta.retIdx : (task.innerRetType === "!llvm.ptr" || task.isString ? 4 : 3);
+      const innerRetType = ctxMeta?.innerRetType || task.innerRetType || "f64";
+      const isRetString = ctxMeta ? ctxMeta.isRetString : (task.isString || task.innerRetType === "!llvm.ptr" || task.innerRetType === "string");
+      const structName = ctxMeta ? ctxMeta.structRetName : task.structName;
+
       const threadIdPtr = this.builder.nextSSA();
-      this.builder.emit(`${threadIdPtr} = llvm.getelementptr ${task.ssa || task.ptr}[0, 0] : (!llvm.ptr) -> !llvm.ptr, !llvm.struct<(i64, f64, !llvm.ptr, f64, !llvm.ptr, i32)>`);
+      this.builder.emit(`${threadIdPtr} = llvm.getelementptr ${task.ssa || task.ptr}[0, 0] : (!llvm.ptr) -> !llvm.ptr, ${taskContextType}`);
       const threadId = this.builder.load(threadIdPtr, "i64");
 
       const nullPtr = this.builder.nextSSA();
@@ -2937,18 +3089,128 @@ export class ASTLowerer {
       const joinRes = this.builder.nextSSA();
       this.builder.emit(`${joinRes} = llvm.call @pthread_join(${threadId.ssa}, ${nullPtr}) : (i64, !llvm.ptr) -> i32`);
 
-      const isStringRes = task.innerRetType === "!llvm.ptr" || task.isString || task.isPromise && task.innerRetType === "string";
-      if (isStringRes) {
-        const resPtrGEP = this.builder.nextSSA();
-        this.builder.emit(`${resPtrGEP} = llvm.getelementptr ${task.ssa || task.ptr}[0, 4] : (!llvm.ptr) -> !llvm.ptr, !llvm.struct<(i64, f64, !llvm.ptr, f64, !llvm.ptr, i32)>`);
-        const loaded = this.builder.load(resPtrGEP, "!llvm.ptr");
-        loaded.isString = true;
-        return loaded;
-      } else {
-        const resF64GEP = this.builder.nextSSA();
-        this.builder.emit(`${resF64GEP} = llvm.getelementptr ${task.ssa || task.ptr}[0, 3] : (!llvm.ptr) -> !llvm.ptr, !llvm.struct<(i64, f64, !llvm.ptr, f64, !llvm.ptr, i32)>`);
-        return this.builder.load(resF64GEP, "f64");
+      if (innerRetType === "none" || retIdx < 0) {
+        this.builder.emit(`llvm.call @free(${task.ssa || task.ptr}) : (!llvm.ptr) -> ()`);
+        return { ssa: "", type: "none" };
       }
+
+      const resGEP = this.builder.nextSSA();
+      this.builder.emit(`${resGEP} = llvm.getelementptr ${task.ssa || task.ptr}[0, ${retIdx}] : (!llvm.ptr) -> !llvm.ptr, ${taskContextType}`);
+      const loaded = this.builder.load(resGEP, innerRetType);
+
+      // Görev tamamlandıktan ve sonuç okunduktan sonra TaskContext serbest bırakılır (zero-leak)
+      this.builder.emit(`llvm.call @free(${task.ssa || task.ptr}) : (!llvm.ptr) -> ()`);
+
+      return {
+        ssa: loaded.ssa,
+        ptr: loaded.ssa,
+        type: innerRetType,
+        isString: Boolean(isRetString),
+        structName: structName || null,
+      };
+    }
+
+    if (expr.type === "ClosureExpression") {
+      const lambdaName = expr.lambdaName;
+      const captures = expr.captures || [];
+      const captureMeta = [];
+      const captureValues = [];
+
+      for (const capName of captures) {
+        if (this.symbolTable.has(capName)) {
+          const sym = this.symbolTable.get(capName);
+          let val;
+          if (sym.ptr && sym.ptr !== sym.ssa) {
+            val = this.builder.load(sym.ptr, sym.type);
+            if (sym.isString) val.isString = true;
+            if (sym.structName) val.structName = sym.structName;
+            if (sym.isArray) {
+              val.isArray = true;
+              val.elemType = sym.elemType;
+            }
+          } else {
+            val = {
+              ssa: sym.ssa || sym.ptr,
+              ptr: sym.ssa || sym.ptr,
+              type: sym.type,
+              isString: sym.isString,
+              structName: sym.structName,
+            };
+          }
+          captureMeta.push({
+            name: capName,
+            type: sym.type,
+            isString: Boolean(sym.isString),
+            structName: sym.structName || null,
+            isArray: Boolean(sym.isArray),
+            elemType: sym.elemType || "f64",
+            isClosure: Boolean(sym.isClosure),
+            isFunction: Boolean(sym.isFunction),
+            fnSig: sym.fnSig || null,
+          });
+          captureValues.push(val);
+        }
+      }
+
+      if (!this.closureRegistry) {
+        this.closureRegistry = new Map();
+      }
+      this.closureRegistry.set(lambdaName, { captureMeta });
+
+      let envPtr;
+      if (captures.length > 0) {
+        this.builder.markFeature("heap");
+        const envTypes = captureMeta.map((c) => c.type);
+        const envStructType = `!llvm.struct<(${envTypes.join(", ")})>`;
+        const byteSize = Math.max(captureMeta.length * 8, 8);
+        const envAlloc = this.builder.allocateHeap(byteSize);
+        envPtr = envAlloc.ptr;
+        this.markTransferred(envPtr);
+
+        for (let i = 0; i < captureValues.length; i++) {
+          const val = captureValues[i];
+          const gep = this.builder.nextSSA();
+          this.builder.emit(
+            `${gep} = llvm.getelementptr ${envPtr}[0, ${i}] : (!llvm.ptr) -> !llvm.ptr, ${envStructType}`
+          );
+          this.builder.store(gep, val);
+        }
+      } else {
+        envPtr = this.builder.nextSSA();
+        this.builder.emit(`${envPtr} = llvm.mlir.zero : !llvm.ptr`);
+      }
+
+      const fnMeta = this.functionRegistry.get(lambdaName);
+      const paramTypes = fnMeta?.paramTypes ? fnMeta.paramTypes.slice(1) : (expr.params || []).map((p) => this.resolveType(p.typeAnnotation));
+      const retType = fnMeta?.retType || (expr.returnType ? this.resolveType(expr.returnType) : "f64");
+      const callableType = `(!llvm.ptr${paramTypes.length ? ", " + paramTypes.join(", ") : ""}) -> ${retType === "none" ? "()" : retType}`;
+
+      const fnConst = this.builder.nextSSA();
+      this.builder.emit(`${fnConst} = func.constant @${lambdaName} : ${callableType}`);
+      const fnPtr = this.builder.nextSSA();
+      this.builder.emit(`${fnPtr} = builtin.unrealized_conversion_cast ${fnConst} : ${callableType} to !llvm.ptr`);
+
+      const fat0 = this.builder.nextSSA();
+      this.builder.emit(`${fat0} = llvm.mlir.undef : !llvm.struct<(!llvm.ptr, !llvm.ptr)>`);
+      const fat1 = this.builder.nextSSA();
+      this.builder.emit(`${fat1} = llvm.insertvalue ${fnPtr}, ${fat0}[0] : !llvm.struct<(!llvm.ptr, !llvm.ptr)>`);
+      const fat2 = this.builder.nextSSA();
+      this.builder.emit(`${fat2} = llvm.insertvalue ${envPtr}, ${fat1}[1] : !llvm.struct<(!llvm.ptr, !llvm.ptr)>`);
+
+      return {
+        ssa: fat2,
+        ptr: fat2,
+        type: "!llvm.struct<(!llvm.ptr, !llvm.ptr)>",
+        isClosure: true,
+        isFunction: true,
+        envPtr,
+        fnSig: {
+          paramTypes,
+          retType,
+          mlirType: "!llvm.struct<(!llvm.ptr, !llvm.ptr)>",
+          callableType,
+        },
+      };
     }
 
     if (expr.type === "ArrayExpression") {
@@ -3195,11 +3457,23 @@ export class ASTLowerer {
       if (this.symbolTable.has(expr.name)) {
         const sym = this.symbolTable.get(expr.name);
 
-        if (sym.isFunction) {
+        if (sym.isFunction || sym.isClosure || sym.type === "!llvm.struct<(!llvm.ptr, !llvm.ptr)>") {
+          if (sym.ptr && sym.ptr !== sym.ssa) {
+            const loaded = this.builder.load(sym.ptr, "!llvm.struct<(!llvm.ptr, !llvm.ptr)>");
+            return {
+              ssa: loaded.ssa,
+              ptr: sym.ptr,
+              type: "!llvm.struct<(!llvm.ptr, !llvm.ptr)>",
+              isClosure: true,
+              isFunction: true,
+              fnSig: sym.fnSig,
+            };
+          }
           return {
             ssa: sym.ssa,
-            ptr: sym.ptr,
-            type: sym.type,
+            ptr: sym.ptr || sym.ssa,
+            type: sym.type || "!llvm.struct<(!llvm.ptr, !llvm.ptr)>",
+            isClosure: true,
             isFunction: true,
             fnSig: sym.fnSig,
           };
@@ -3285,18 +3559,33 @@ export class ASTLowerer {
       }
 
       if (this.functionRegistry.has(expr.name)) {
-        const fnMeta = this.functionRegistry.get(expr.name);
-        const ssa = this.builder.nextSSA();
-        this.builder.emit(`${ssa} = func.constant @${expr.name} : ${fnMeta.mlirType}`);
+        const thunk = this.getOrCreateThunk(expr.name);
+        const fnConst = this.builder.nextSSA();
+        this.builder.emit(`${fnConst} = func.constant @${thunk.thunkName} : ${thunk.thunkSig}`);
+        const fnPtr = this.builder.nextSSA();
+        this.builder.emit(`${fnPtr} = builtin.unrealized_conversion_cast ${fnConst} : ${thunk.thunkSig} to !llvm.ptr`);
+
+        const envNull = this.builder.nextSSA();
+        this.builder.emit(`${envNull} = llvm.mlir.zero : !llvm.ptr`);
+
+        const fat0 = this.builder.nextSSA();
+        this.builder.emit(`${fat0} = llvm.mlir.undef : !llvm.struct<(!llvm.ptr, !llvm.ptr)>`);
+        const fat1 = this.builder.nextSSA();
+        this.builder.emit(`${fat1} = llvm.insertvalue ${fnPtr}, ${fat0}[0] : !llvm.struct<(!llvm.ptr, !llvm.ptr)>`);
+        const fat2 = this.builder.nextSSA();
+        this.builder.emit(`${fat2} = llvm.insertvalue ${envNull}, ${fat1}[1] : !llvm.struct<(!llvm.ptr, !llvm.ptr)>`);
+
         return {
-          ssa,
-          ptr: ssa,
-          type: fnMeta.mlirType,
+          ssa: fat2,
+          ptr: fat2,
+          type: "!llvm.struct<(!llvm.ptr, !llvm.ptr)>",
+          isClosure: true,
           isFunction: true,
           fnSig: {
-            paramTypes: fnMeta.paramTypes,
-            retType: fnMeta.retType,
-            mlirType: fnMeta.mlirType,
+            paramTypes: thunk.paramTypes,
+            retType: thunk.retType,
+            mlirType: "!llvm.struct<(!llvm.ptr, !llvm.ptr)>",
+            callableType: thunk.thunkSig,
           },
         };
       }
@@ -4125,33 +4414,54 @@ export class ASTLowerer {
           const structMeta = this.structRegistry.get(base.structName);
           const fieldMeta = structMeta?.fields.find((f) => f.name === methodName);
 
-          if (fieldMeta && fieldMeta.isFunction && fieldMeta.fnSig) {
-            const fnSig = fieldMeta.fnSig;
+          if (fieldMeta && fieldMeta.isFunction) {
+            const fnSig = fieldMeta.fnSig || {};
             const fieldPtr = this.builder.nextSSA();
             this.builder.emit(
               `${fieldPtr} = llvm.getelementptr ${base.ptr || base.ssa}[0, ${fieldMeta.index}] : (!llvm.ptr) -> !llvm.ptr, ${structMeta.mlirType}`
             );
-            const loadedPtr = this.builder.load(fieldPtr, "!llvm.ptr");
-            const fnValSSA = this.builder.nextSSA();
+            const fatVal = this.builder.load(fieldPtr, "!llvm.struct<(!llvm.ptr, !llvm.ptr)>");
+            const fnPtr = this.builder.nextSSA();
             this.builder.emit(
-              `${fnValSSA} = builtin.unrealized_conversion_cast ${loadedPtr.ssa} : !llvm.ptr to ${fnSig.mlirType}`
+              `${fnPtr} = llvm.extractvalue ${fatVal.ssa}[0] : !llvm.struct<(!llvm.ptr, !llvm.ptr)>`
             );
+            const envPtr = this.builder.nextSSA();
+            this.builder.emit(
+              `${envPtr} = llvm.extractvalue ${fatVal.ssa}[1] : !llvm.struct<(!llvm.ptr, !llvm.ptr)>`
+            );
+
+            let paramTypes = fnSig.paramTypes;
+            const retType = fnSig.retType || "none";
 
             const args = expr.arguments ? expr.arguments.map((a, i) => {
               let val = this.lowerExpression(a);
-              const targetPType = fnSig.paramTypes?.[i];
-              if (targetPType) val = this.coerceType(val, targetPType);
+              const targetPType = paramTypes ? paramTypes[i] : null;
+              if (targetPType) {
+                val = this.coerceType(val, targetPType);
+              } else if (val.type === "i64" || val.type === "i32") {
+                val = this.coerceType(val, "f64");
+              }
               return val;
             }) : [];
 
-            const argSSAs = args.map((a) => a.ssa || a.ptr).join(", ");
-            if (fnSig.retType === "none") {
-              this.builder.emit(`func.call_indirect ${fnValSSA}(${argSSAs}) : ${fnSig.mlirType}`);
+            if (!paramTypes || paramTypes.length !== args.length) {
+              paramTypes = args.map((a) => a.type);
+            }
+
+            const callableType = `(!llvm.ptr${paramTypes.length ? ", " + paramTypes.join(", ") : ""}) -> ${retType === "none" ? "()" : retType}`;
+            const callableSSA = this.builder.nextSSA();
+            this.builder.emit(
+              `${callableSSA} = builtin.unrealized_conversion_cast ${fnPtr} : !llvm.ptr to ${callableType}`
+            );
+
+            const allArgsSSA = [envPtr, ...args.map((a) => a.ssa || a.ptr)].join(", ");
+            if (retType === "none") {
+              this.builder.emit(`func.call_indirect ${callableSSA}(${allArgsSSA}) : ${callableType}`);
               return { ssa: "", ptr: "", type: "none" };
             } else {
               const ssa = this.builder.nextSSA();
-              this.builder.emit(`${ssa} = func.call_indirect ${fnValSSA}(${argSSAs}) : ${fnSig.mlirType}`);
-              return { ssa, ptr: ssa, type: fnSig.retType };
+              this.builder.emit(`${ssa} = func.call_indirect ${callableSSA}(${allArgsSSA}) : ${callableType}`);
+              return { ssa, ptr: ssa, type: retType };
             }
           }
 
@@ -4224,25 +4534,114 @@ export class ASTLowerer {
 
       if (expr.callee.type === "Identifier" && this.symbolTable.has(expr.callee.name)) {
         const localSym = this.symbolTable.get(expr.callee.name);
-        if (localSym && localSym.isFunction) {
-          const fnSig = localSym.fnSig;
+        if (localSym && (localSym.isFunction || localSym.isClosure || localSym.type === "!llvm.struct<(!llvm.ptr, !llvm.ptr)>")) {
+          const fnSig = localSym.fnSig || {};
+          let fatVal;
+          if (localSym.ptr && localSym.ptr !== localSym.ssa) {
+            fatVal = this.builder.load(localSym.ptr, "!llvm.struct<(!llvm.ptr, !llvm.ptr)>");
+          } else {
+            fatVal = { ssa: localSym.ssa || localSym.ptr };
+          }
+
+          const fnPtr = this.builder.nextSSA();
+          this.builder.emit(
+            `${fnPtr} = llvm.extractvalue ${fatVal.ssa}[0] : !llvm.struct<(!llvm.ptr, !llvm.ptr)>`
+          );
+          const envPtr = this.builder.nextSSA();
+          this.builder.emit(
+            `${envPtr} = llvm.extractvalue ${fatVal.ssa}[1] : !llvm.struct<(!llvm.ptr, !llvm.ptr)>`
+          );
+
+          let paramTypes = fnSig.paramTypes;
+          const retType = fnSig.retType || "f64";
+
           const args = expr.arguments ? expr.arguments.map((a, i) => {
             let val = this.lowerExpression(a);
-            const targetPType = fnSig.paramTypes?.[i];
+            const targetPType = paramTypes ? paramTypes[i] : null;
             if (targetPType) {
               val = this.coerceType(val, targetPType);
+            } else if (val.type === "i64" || val.type === "i32") {
+              val = this.coerceType(val, "f64");
             }
             return val;
           }) : [];
 
-          const argSSAs = args.map((a) => a.ssa || a.ptr).join(", ");
-          if (fnSig.retType === "none") {
-            this.builder.emit(`func.call_indirect ${localSym.ssa || localSym.ptr}(${argSSAs}) : ${fnSig.mlirType}`);
+          if (!paramTypes || paramTypes.length !== args.length) {
+            paramTypes = args.map((a) => a.type);
+          }
+
+          const callableType = `(!llvm.ptr${paramTypes.length ? ", " + paramTypes.join(", ") : ""}) -> ${retType === "none" ? "()" : retType}`;
+
+          const callableSSA = this.builder.nextSSA();
+          this.builder.emit(
+            `${callableSSA} = builtin.unrealized_conversion_cast ${fnPtr} : !llvm.ptr to ${callableType}`
+          );
+
+          const allArgsSSA = [envPtr, ...args.map((a) => a.ssa || a.ptr)].join(", ");
+          if (retType === "none") {
+            this.builder.emit(`func.call_indirect ${callableSSA}(${allArgsSSA}) : ${callableType}`);
             return { ssa: "", ptr: "", type: "none" };
           } else {
             const ssa = this.builder.nextSSA();
-            this.builder.emit(`${ssa} = func.call_indirect ${localSym.ssa || localSym.ptr}(${argSSAs}) : ${fnSig.mlirType}`);
-            return { ssa, ptr: ssa, type: fnSig.retType };
+            this.builder.emit(`${ssa} = func.call_indirect ${callableSSA}(${allArgsSSA}) : ${callableType}`);
+            return { ssa, ptr: ssa, type: retType };
+          }
+        }
+      }
+
+      if (expr.callee.type !== "Identifier" || !this.functionRegistry.has(expr.callee.name)) {
+        let calleeVal = this.lowerExpression(expr.callee);
+        if (
+          calleeVal &&
+          (calleeVal.isClosure ||
+            calleeVal.isFunction ||
+            calleeVal.type === "!llvm.struct<(!llvm.ptr, !llvm.ptr)>")
+        ) {
+          const fnSig = calleeVal.fnSig || {};
+          const fnPtr = this.builder.nextSSA();
+          this.builder.emit(
+            `${fnPtr} = llvm.extractvalue ${calleeVal.ssa || calleeVal.ptr}[0] : !llvm.struct<(!llvm.ptr, !llvm.ptr)>`
+          );
+          const envPtr = this.builder.nextSSA();
+          this.builder.emit(
+            `${envPtr} = llvm.extractvalue ${calleeVal.ssa || calleeVal.ptr}[1] : !llvm.struct<(!llvm.ptr, !llvm.ptr)>`
+          );
+
+          let paramTypes = fnSig.paramTypes;
+          const retType = fnSig.retType || "f64";
+
+          const args = expr.arguments
+            ? expr.arguments.map((a, i) => {
+                let val = this.lowerExpression(a);
+                const targetPType = paramTypes ? paramTypes[i] : null;
+                if (targetPType) {
+                  val = this.coerceType(val, targetPType);
+                } else if (val.type === "i64" || val.type === "i32") {
+                  val = this.coerceType(val, "f64");
+                }
+                return val;
+              })
+            : [];
+
+          if (!paramTypes || paramTypes.length !== args.length) {
+            paramTypes = args.map((a) => a.type);
+          }
+
+          const callableType = `(!llvm.ptr${paramTypes.length ? ", " + paramTypes.join(", ") : ""}) -> ${retType === "none" ? "()" : retType}`;
+
+          const callableSSA = this.builder.nextSSA();
+          this.builder.emit(
+            `${callableSSA} = builtin.unrealized_conversion_cast ${fnPtr} : !llvm.ptr to ${callableType}`
+          );
+
+          const allArgsSSA = [envPtr, ...args.map((a) => a.ssa || a.ptr)].join(", ");
+          if (retType === "none") {
+            this.builder.emit(`func.call_indirect ${callableSSA}(${allArgsSSA}) : ${callableType}`);
+            return { ssa: "", ptr: "", type: "none" };
+          } else {
+            const ssa = this.builder.nextSSA();
+            this.builder.emit(`${ssa} = func.call_indirect ${callableSSA}(${allArgsSSA}) : ${callableType}`);
+            return { ssa, ptr: ssa, type: retType };
           }
         }
       }
@@ -4292,7 +4691,12 @@ export class ASTLowerer {
           ssa,
           ptr: ssa,
           type: retType,
+          isFunction: Boolean(fnMeta?.isRetFn),
+          isClosure: Boolean(fnMeta?.isRetFn),
+          fnSig: fnMeta?.retFnSig || null,
           isPromise: Boolean(fnMeta?.isAsync),
+          asyncFnName: fnMeta?.isAsync ? funcName : null,
+          taskContextMeta: fnMeta?.taskContextMeta || null,
           innerRetType: fnMeta?.innerRetType || "f64",
           structName: fnMeta?.structRetName || null,
           isString: fnMeta?.isRetString || false,

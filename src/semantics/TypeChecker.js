@@ -59,6 +59,8 @@ export class TypeChecker {
         const elem = this.resolveType(curr.elementType);
         return `${elem}[]`;
       }
+      case "TSFunctionType":
+        return "function";
       case "TSTypeReference": {
         const name = curr.typeName?.name || curr.typeName?.value;
         if (!name) return "any";
@@ -81,11 +83,43 @@ export class TypeChecker {
           const param = curr.typeParameters?.params?.[0] || curr.typeArguments?.params?.[0];
           return param ? this.resolveType(param) : "any";
         }
+        const rawParams = curr.typeParameters?.params || curr.typeArguments?.params;
+        if (rawParams && rawParams.length > 0) {
+          const typeArgs = rawParams.map((p) => this.resolveType(p));
+          return `${name}<${typeArgs.join(", ")}>`;
+        }
         return name;
       }
       default:
         return "any";
     }
+  }
+
+  getBaseTypeName(type) {
+    if (!type || typeof type !== "string") return type;
+    const idx = type.indexOf("<");
+    return idx === -1 ? type : type.slice(0, idx);
+  }
+
+  getTypeArguments(type) {
+    if (!type || typeof type !== "string") return [];
+    const open = type.indexOf("<");
+    const close = type.lastIndexOf(">");
+    if (open === -1 || close === -1 || close <= open) return [];
+    return type
+      .slice(open + 1, close)
+      .split(",")
+      .map((s) => s.trim());
+  }
+
+  getSubstitutions(structMeta, typeStr) {
+    const subst = new Map();
+    if (!structMeta?.typeParams || !typeStr) return subst;
+    const typeArgs = this.getTypeArguments(typeStr);
+    structMeta.typeParams.forEach((tp, i) => {
+      if (typeArgs[i]) subst.set(tp, typeArgs[i]);
+    });
+    return subst;
   }
 
   typesAreCompatible(expected, actual) {
@@ -95,6 +129,22 @@ export class TypeChecker {
     if (expected === "void" && actual === "void") return true;
     if (expected === "never") return false;
     if (actual === "never") return true;
+
+    // Tip parametresi uyumluluğu (örn. henüz çözümlenmemiş T veya U)
+    if (expected.length === 1 && expected >= "A" && expected <= "Z") return true;
+    if (actual.length === 1 && actual >= "A" && actual <= "Z") return true;
+
+    // Generic Struct / Interface uyumluluğu (Storage<number> <=> Storage<number> veya Storage)
+    const expBase = this.getBaseTypeName(expected);
+    const actBase = this.getBaseTypeName(actual);
+    if (expBase === actBase && this.builtins.structSignatures.has(expBase)) {
+      const expArgs = this.getTypeArguments(expected);
+      const actArgs = this.getTypeArguments(actual);
+      if (expArgs.length === 0 || actArgs.length === 0) return true;
+      if (expArgs.length === actArgs.length) {
+        return expArgs.every((ea, i) => this.typesAreCompatible(ea, actArgs[i]));
+      }
+    }
 
     // null / undefined atanabilirliği
     if (actual === "null" || actual === "undefined") {
@@ -495,8 +545,11 @@ export class TypeChecker {
 
     // 11. Nesne Değişmezi (ObjectExpression: { a: 1, b: 'hi' })
     if (expr.type === "ObjectExpression") {
-      if (expectedType && this.builtins.structSignatures.has(expectedType)) {
-        const structMeta = this.builtins.structSignatures.get(expectedType);
+      const structName = this.getBaseTypeName(expectedType);
+      if (structName && this.builtins.structSignatures.has(structName)) {
+        const structMeta = this.builtins.structSignatures.get(structName);
+        const subst = this.getSubstitutions(structMeta, expectedType);
+        const substitute = (t) => (subst.has(t) ? subst.get(t) : t);
         const providedProps = new Set();
 
         for (const prop of expr.properties || []) {
@@ -512,14 +565,15 @@ export class TypeChecker {
             continue;
           }
 
-          const expectedField = structMeta.fields.get(pName);
-          const actualFieldType = this.inferExpressionType(prop.value, expectedField.type);
+          const rawExpectedField = structMeta.fields.get(pName);
+          const expectedFieldType = substitute(rawExpectedField.type);
+          const actualFieldType = this.inferExpressionType(prop.value, expectedFieldType);
 
-          if (!this.typesAreCompatible(expectedField.type, actualFieldType)) {
+          if (!this.typesAreCompatible(expectedFieldType, actualFieldType)) {
             this.reporter.addError(
               this.currentFilePath,
               prop.value,
-              `'${expectedType}.${pName}' alanı için tür uyuşmazlığı: '${expectedField.type}' beklenirken '${actualFieldType}' verildi.`
+              `'${expectedType}.${pName}' alanı için tür uyuşmazlığı: '${expectedFieldType}' beklenirken '${actualFieldType}' verildi.`
             );
           }
         }
@@ -529,7 +583,7 @@ export class TypeChecker {
             this.reporter.addError(
               this.currentFilePath,
               expr,
-              `Eksik alan: '${expectedType}' nesnesi için zorunlu olan '${fName}: ${fMeta.type}' alanı tanımlanmadı.`
+              `Eksik alan: '${expectedType}' nesnesi için zorunlu olan '${fName}: ${substitute(fMeta.type)}' alanı tanımlanmadı.`
             );
           }
         }
@@ -603,20 +657,24 @@ export class TypeChecker {
       }
 
       // Struct / Interface / Class üye erişimi
-      if (this.builtins.structSignatures.has(baseType)) {
-        const structMeta = this.builtins.structSignatures.get(baseType);
+      const structName = this.getBaseTypeName(baseType);
+      if (this.builtins.structSignatures.has(structName)) {
+        const structMeta = this.builtins.structSignatures.get(structName);
+        const subst = this.getSubstitutions(structMeta, baseType);
+        const substitute = (t) => (subst.has(t) ? subst.get(t) : t);
+
         if (structMeta.fields.has(propName)) {
-          return structMeta.fields.get(propName).type;
+          return substitute(structMeta.fields.get(propName).type);
         }
         if (structMeta.methods.has(propName)) {
-          return structMeta.methods.get(propName).returnType;
+          return substitute(structMeta.methods.get(propName).returnType);
         }
 
         let curr = structMeta.superClass;
         while (curr && this.builtins.structSignatures.has(curr)) {
           const parentMeta = this.builtins.structSignatures.get(curr);
-          if (parentMeta.fields?.has(propName)) return parentMeta.fields.get(propName).type;
-          if (parentMeta.methods?.has(propName)) return parentMeta.methods.get(propName).returnType;
+          if (parentMeta.fields?.has(propName)) return substitute(parentMeta.fields.get(propName).type);
+          if (parentMeta.methods?.has(propName)) return substitute(parentMeta.methods.get(propName).returnType);
           curr = parentMeta.superClass;
         }
 
@@ -625,7 +683,7 @@ export class TypeChecker {
           expr.property,
           `'${baseType}' türünde '${propName}' alanı veya metodu bulunamadı!`
         );
-        return "any";
+        return "void";
       }
 
       if (
@@ -837,8 +895,12 @@ export class TypeChecker {
           return "void";
         }
 
-        if (this.builtins.structSignatures.has(objType)) {
-          const structMeta = this.builtins.structSignatures.get(objType);
+        const structName = this.getBaseTypeName(objType);
+        if (this.builtins.structSignatures.has(structName)) {
+          const structMeta = this.builtins.structSignatures.get(structName);
+          const subst = this.getSubstitutions(structMeta, objType);
+          const substitute = (t) => (subst.has(t) ? subst.get(t) : t);
+
           let methodMeta = structMeta?.methods?.get(method);
           let curr = structMeta?.superClass;
           while (!methodMeta && curr && this.builtins.structSignatures.has(curr)) {
@@ -853,7 +915,9 @@ export class TypeChecker {
           if (!methodMeta) {
             if (structMeta.fields?.has(method)) {
               for (const a of expr.arguments || []) this.inferExpressionType(a);
-              return "any";
+              const fieldMeta = structMeta.fields.get(method);
+              const fnSig = this.builtins.functionSignatures.get(fieldMeta?.type);
+              return fnSig?.returnType || "number";
             }
             this.reporter.addError(
               this.currentFilePath,
@@ -861,11 +925,12 @@ export class TypeChecker {
               `'${objType}' türünde '${method}' metodu bulunamadı!`
             );
             for (const a of expr.arguments || []) this.inferExpressionType(a);
-            return "any";
+            return "void";
           }
 
           const actualArgs = expr.arguments || [];
-          const expectedParams = methodMeta.params || [];
+          const rawParams = methodMeta.params || [];
+          const expectedParams = rawParams.map(substitute);
           const minArgs = methodMeta.minArgs !== undefined ? methodMeta.minArgs : expectedParams.length;
           if (actualArgs.length < minArgs || actualArgs.length > expectedParams.length) {
             this.reporter.addError(
@@ -885,7 +950,7 @@ export class TypeChecker {
               );
             }
           });
-          return methodMeta.returnType || "any";
+          return substitute(methodMeta.returnType || "void");
         }
         return "any";
       }
@@ -946,9 +1011,10 @@ export class TypeChecker {
         }
 
         const localSym = this.scopeManager.lookupSymbol(fnName);
-        if (localSym && (localSym.type === "function" || this.builtins.functionTypeAliases.has(localSym.type))) {
+        if (localSym && (localSym.type === "function" || localSym.type === "any" || this.builtins.functionTypeAliases.has(localSym.type))) {
           for (const a of expr.arguments || []) this.inferExpressionType(a);
-          return "number";
+          const fnSig = this.builtins.functionSignatures.get(localSym.type);
+          return fnSig?.returnType || "number";
         }
 
         const fnMeta = this.builtins.functionSignatures.get(fnName);
@@ -1003,8 +1069,9 @@ export class TypeChecker {
           }
         });
 
-        return returnType;
       }
+      this.inferExpressionType(callee);
+      for (const a of expr.arguments || []) this.inferExpressionType(a);
       return "any";
     }
 

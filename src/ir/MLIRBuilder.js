@@ -141,19 +141,65 @@ export class MLIRBuilder {
     return { ssa, type };
   }
 
-  createArithmetic(op, left, right) {
+  coerceOperands(left, right) {
     let l = left;
     let r = right;
 
-    if ((l.type === "f64" || l.type === "f32") && (r.type === "i64" || r.type === "i32")) {
+    const isInt = (t) => ["i64", "i32", "i16", "i8"].includes(t);
+    const intWidth = (t) => {
+      if (t === "i64") return 64;
+      if (t === "i32") return 32;
+      if (t === "i16") return 16;
+      if (t === "i8") return 8;
+      if (t === "i1") return 1;
+      return null;
+    };
+
+    if ((l.type === "f64" || l.type === "f32") && isInt(r.type)) {
       const castSSA = this.nextSSA();
       this.emit(`${castSSA} = arith.sitofp ${r.ssa} : ${r.type} to f64`);
       r = { ssa: castSSA, type: "f64" };
-    } else if ((r.type === "f64" || r.type === "f32") && (l.type === "i64" || l.type === "i32")) {
+      if (l.type === "f32") {
+        const castL = this.nextSSA();
+        this.emit(`${castL} = arith.extf ${l.ssa} : f32 to f64`);
+        l = { ssa: castL, type: "f64" };
+      }
+    } else if ((r.type === "f64" || r.type === "f32") && isInt(l.type)) {
       const castSSA = this.nextSSA();
       this.emit(`${castSSA} = arith.sitofp ${l.ssa} : ${l.type} to f64`);
       l = { ssa: castSSA, type: "f64" };
+      if (r.type === "f32") {
+        const castR = this.nextSSA();
+        this.emit(`${castR} = arith.extf ${r.ssa} : f32 to f64`);
+        r = { ssa: castR, type: "f64" };
+      }
+    } else if (l.type === "f64" && r.type === "f32") {
+      const castSSA = this.nextSSA();
+      this.emit(`${castSSA} = arith.extf ${r.ssa} : f32 to f64`);
+      r = { ssa: castSSA, type: "f64" };
+    } else if (r.type === "f64" && l.type === "f32") {
+      const castSSA = this.nextSSA();
+      this.emit(`${castSSA} = arith.extf ${l.ssa} : f32 to f64`);
+      l = { ssa: castSSA, type: "f64" };
+    } else if (intWidth(l.type) && intWidth(r.type) && l.type !== r.type) {
+      if (intWidth(l.type) < intWidth(r.type)) {
+        const castSSA = this.nextSSA();
+        const extOp = l.type === "i1" ? "arith.extui" : "arith.extsi";
+        this.emit(`${castSSA} = ${extOp} ${l.ssa} : ${l.type} to ${r.type}`);
+        l = { ssa: castSSA, type: r.type };
+      } else {
+        const castSSA = this.nextSSA();
+        const extOp = r.type === "i1" ? "arith.extui" : "arith.extsi";
+        this.emit(`${castSSA} = ${extOp} ${r.ssa} : ${r.type} to ${l.type}`);
+        r = { ssa: castSSA, type: l.type };
+      }
     }
+
+    return { l, r };
+  }
+
+  createArithmetic(op, left, right) {
+    const { l, r } = this.coerceOperands(left, right);
 
     const ssa = this.nextSSA();
     const isFloat = l.type === "f64" || l.type === "f32";
@@ -224,15 +270,9 @@ export class MLIRBuilder {
       return { ssa, type: "i1" };
     }
 
-    if ((l.type === "f64" || l.type === "f32") && (r.type === "i64" || r.type === "i32")) {
-      const castSSA = this.nextSSA();
-      this.emit(`${castSSA} = arith.sitofp ${r.ssa} : ${r.type} to f64`);
-      r = { ssa: castSSA, type: "f64" };
-    } else if ((r.type === "f64" || r.type === "f32") && (l.type === "i64" || l.type === "i32")) {
-      const castSSA = this.nextSSA();
-      this.emit(`${castSSA} = arith.sitofp ${l.ssa} : ${l.type} to f64`);
-      l = { ssa: castSSA, type: "f64" };
-    }
+    const coerced = this.coerceOperands(l, r);
+    l = coerced.l;
+    r = coerced.r;
 
     const ssa = this.nextSSA();
     const isFloat = l.type === "f64" || l.type === "f32";
@@ -520,6 +560,7 @@ export class MLIRBuilder {
       if (this.usedFeatures.threads || this.usedFeatures.channels) {
         header += `  func.func private @pthread_create(!llvm.ptr, !llvm.ptr, (!llvm.ptr) -> !llvm.ptr, !llvm.ptr) -> i32\n`;
         header += `  llvm.func @pthread_join(i64, !llvm.ptr) -> i32\n`;
+        header += `  llvm.func @pthread_exit(!llvm.ptr) -> ()\n`;
       }
 
       if (this.usedFeatures.channels) {
@@ -615,6 +656,18 @@ export class MLIRBuilder {
 
     header += RuntimeEmitters.emitAll(this, isWasm, needsHeap);
 
-    return header + this.buffer.join("\n") + "\n}\n";
+    const addFns = this.additionalFunctions && this.additionalFunctions.length > 0
+      ? this.additionalFunctions.join("\n\n") + "\n\n"
+      : "";
+
+    return header + addFns + this.buffer.join("\n") + "\n}\n";
+  }
+
+  addModuleFunction(fnCode) {
+    if (!this.additionalFunctions) {
+      this.additionalFunctions = [];
+    }
+    this.additionalFunctions.push(fnCode);
   }
 }
+

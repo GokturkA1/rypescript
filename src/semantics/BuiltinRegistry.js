@@ -33,6 +33,7 @@ export class BuiltinRegistry {
     this.functionSignatures.set("panic", { params: ["string"], returnType: "never" });
     this.functionSignatures.set("assert", { params: ["boolean", "string"], returnType: "void" });
     this.functionSignatures.set("join", { params: ["pointer"], returnType: "void" });
+    this.functionSignatures.set("spawn", { params: ["function", "any"], minArgs: 1, returnType: "pointer" });
 
     // 3. Result<T, E> ve Hata Yönetimi Fonksiyonları
     this.functionSignatures.set("Ok", { params: ["any"], returnType: "Result" });

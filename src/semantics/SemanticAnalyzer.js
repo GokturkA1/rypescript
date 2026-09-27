@@ -202,8 +202,11 @@ export class SemanticAnalyzer {
               fields.set(fName, { type: fType, node: member });
             }
           }
+          const rawTypeParams = decl.typeParameters?.params || [];
+          const typeParams = rawTypeParams.map((p) => p.name?.name || p.name?.value || p.name || "");
           this.builtins.structSignatures.set(structName, {
             name: structName,
+            typeParams,
             fields,
             methods: new Map(),
             node: decl,
@@ -265,6 +268,12 @@ export class SemanticAnalyzer {
             this.builtins.unionRegistry.set(aliasName, variants);
           } else if (inner.type === "TSFunctionType") {
             this.builtins.functionTypeAliases.add(aliasName);
+            const retType = this.resolveType(inner.returnType);
+            this.builtins.functionSignatures.set(aliasName, {
+              returnType: retType,
+              outerReturnType: retType,
+              params: (inner.parameters || inner.params || []).map((p) => this.resolveType(p.typeAnnotation)),
+            });
           }
         }
 
@@ -303,7 +312,7 @@ export class SemanticAnalyzer {
           });
         }
 
-        if (decl.type === "FunctionDeclaration") {
+        if (decl.type === "FunctionDeclaration" || decl.type === "TSDeclareFunction") {
           const fnName = decl.id.name;
           const isAsync = Boolean(decl.async);
           const isAmbient = Boolean(decl.declare || !decl.body);
@@ -328,22 +337,22 @@ export class SemanticAnalyzer {
             return this.resolveType(annot);
           });
 
-          let innerReturnType = "any";
-          let outerReturnType = "any";
+          let innerReturnType = "void";
+          let outerReturnType = "void";
 
           if (decl.returnType) {
             const unwrapped = this.unwrapType(decl.returnType);
             const typeName = unwrapped?.typeName?.name || unwrapped?.typeName?.value;
             if (typeName === "Promise") {
               const innerParam = unwrapped.typeParameters?.params?.[0] || unwrapped.typeArguments?.params?.[0];
-              innerReturnType = innerParam ? this.resolveType(innerParam) : "any";
+              innerReturnType = innerParam ? this.resolveType(innerParam) : "void";
               outerReturnType = `Promise<${innerReturnType}>`;
             } else {
               innerReturnType = this.resolveType(decl.returnType);
               outerReturnType = isAsync ? `Promise<${innerReturnType}>` : innerReturnType;
             }
           } else {
-            innerReturnType = isAsync ? "number" : "any";
+            innerReturnType = isAsync ? "number" : "void";
             outerReturnType = isAsync ? `Promise<${innerReturnType}>` : innerReturnType;
           }
 

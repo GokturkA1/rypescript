@@ -157,7 +157,7 @@ export class TargetManager {
       else format = outExt === ".so" ? "so" : (outExt === ".node" ? "node" : "elf");
     }
 
-    const isShared = format === "so" || format === "node" || format === "dll" || format === "dylib";
+    const isShared = format === "so" || format === "node" || format === "napi" || format === "dll" || format === "dylib";
 
     // 5. LLVM Relocation Mode (0: Default/Static, 2: PIC)
     // Paylaşımlı kütüphaneler (.so, .node, .dll, .dylib) ve Linux PIE için RelocMode: 2 zorunludur

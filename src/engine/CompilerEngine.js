@@ -1,6 +1,6 @@
 // src/engine/CompilerEngine.js
 import { dlopen, getRawPointer, suffix } from "node:ffi";
-import { existsSync, unlinkSync, readFileSync } from "node:fs";
+import { existsSync, unlinkSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
