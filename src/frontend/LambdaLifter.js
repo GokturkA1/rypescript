@@ -106,7 +106,7 @@ export class LambdaLifter {
 
     const captured = new Map();
     const builtins = new Set([
-      "console",
+      // [COMPILER_BUILTIN_STD_COMMENTED_OUT] "console",
       "Math",
       "undefined",
       "NaN",

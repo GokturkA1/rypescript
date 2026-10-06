@@ -5,12 +5,26 @@
  * ve statik denetim mantığını yöneten motor.
  */
 export class TypeChecker {
-  constructor(builtinRegistry, scopeManager, reporter, getCurrentFilePath = () => "", checkStatement = null) {
+  constructor(builtinRegistry, scopeManager, reporter, getCurrentFilePath = () => "", checkStatement = null, getNamespace = () => null) {
     this.builtins = builtinRegistry;
     this.scopeManager = scopeManager;
     this.reporter = reporter;
     this.getCurrentFilePath = getCurrentFilePath;
     this.checkStatementCallback = checkStatement;
+    this.getNamespace = getNamespace;
+  }
+
+  extractMemberChain(node) {
+    if (!node) return null;
+    if (node.type === "Identifier") return [node.name];
+    if (node.type === "MemberExpression" && !node.computed) {
+      const objChain = this.extractMemberChain(node.object);
+      if (!objChain) return null;
+      const prop = node.property?.name || node.property?.value;
+      if (!prop) return null;
+      return [...objChain, prop];
+    }
+    return null;
   }
 
   setCheckStatement(fn) {
@@ -39,6 +53,8 @@ export class TypeChecker {
     if (!curr) return "any";
 
     switch (curr.type) {
+      case "TSTypePredicate":
+        return "boolean";
       case "TSNumberKeyword":
         return "number";
       case "TSStringKeyword":
@@ -65,7 +81,7 @@ export class TypeChecker {
         const name = curr.typeName?.name || curr.typeName?.value;
         if (!name) return "any";
         if (["f32x4", "f64x2", "i32x4", "i64x2", "f64x4", "f32x8", "i32x8"].includes(name)) return name;
-        if (["i64", "i32", "f64", "f32", "usize", "isize", "u64", "u32", "byte", "int", "float", "double"].includes(name)) return "number";
+        if (["i64", "i32", "i16", "i8", "u64", "u32", "u16", "u8", "f64", "f32", "usize", "isize", "byte", "int", "float", "double"].includes(name)) return "number";
         if (name === "pointer" || name === "ptr") return "pointer";
         if (name === "bool") return "boolean";
         if (name === "Array") {
@@ -89,6 +105,18 @@ export class TypeChecker {
         if (rawParams && rawParams.length > 0) {
           const typeArgs = rawParams.map((p) => this.resolveType(p));
           return `${name}<${typeArgs.join(", ")}>`;
+        }
+        if (name && !this.builtins.structSignatures.has(name)) {
+          const curNs = this.getNamespace();
+          if (curNs) {
+            const parts = curNs.split("_");
+            for (let len = parts.length; len >= 1; len--) {
+              const c = `${parts.slice(0, len).join("_")}_${name}`;
+              if (this.builtins.structSignatures.has(c)) {
+                return c;
+              }
+            }
+          }
         }
         return name;
       }
@@ -208,6 +236,16 @@ export class TypeChecker {
     if (expected === "never") return false;
     if (actual === "never") return true;
 
+    // Namespace önekli sınıf karşılaştırması (örn: Service <=> Domain_Service)
+    if (actual.endsWith(`_${expected}`) && this.builtins.structSignatures.has(actual)) {
+      const nsPart = actual.slice(0, actual.length - expected.length - 1);
+      if (this.builtins.namespaceRegistry.has(nsPart)) return true;
+    }
+    if (expected.endsWith(`_${actual}`) && this.builtins.structSignatures.has(expected)) {
+      const nsPart = expected.slice(0, expected.length - actual.length - 1);
+      if (this.builtins.namespaceRegistry.has(nsPart)) return true;
+    }
+
     // Tip parametresi uyumluluğu (örn. henüz çözümlenmemiş T veya U)
     if (expected.length === 1 && expected >= "A" && expected <= "Z") return true;
     if (actual.length === 1 && actual >= "A" && actual <= "Z") return true;
@@ -313,6 +351,18 @@ export class TypeChecker {
     return false;
   }
 
+  isSubclassOf(childClass, parentClass) {
+    if (!childClass || !parentClass) return false;
+    if (childClass === parentClass) return true;
+    let curr = childClass;
+    while (curr && this.builtins.structSignatures.has(curr)) {
+      const meta = this.builtins.structSignatures.get(curr);
+      if (meta.superClass === parentClass) return true;
+      curr = meta.superClass;
+    }
+    return false;
+  }
+
   inferExpressionType(expr, expectedType = null) {
     if (!expr) return "void";
 
@@ -336,7 +386,28 @@ export class TypeChecker {
       return "string";
     }
 
-    if (expr.type === "TSAsExpression" || expr.type === "TSSatisfiesExpression") {
+    if (
+      expr.type === "ParenthesizedExpression" ||
+      expr.type === "NonNullExpression" ||
+      expr.type === "TSNonNullExpression" ||
+      expr.type === "ChainExpression"
+    ) {
+      return this.inferExpressionType(expr.expression, expectedType);
+    }
+
+    if (expr.type === "SpreadElement") {
+      return this.inferExpressionType(expr.argument, expectedType);
+    }
+
+    if (expr.type === "SequenceExpression") {
+      let lastType = "void";
+      for (const e of expr.expressions || []) {
+        lastType = this.inferExpressionType(e);
+      }
+      return lastType;
+    }
+
+    if (expr.type === "TSAsExpression" || expr.type === "TSTypeAssertion" || expr.type === "TSSatisfiesExpression") {
       this.inferExpressionType(expr.expression);
       return this.resolveType(expr.typeAnnotation);
     }
@@ -426,6 +497,10 @@ export class TypeChecker {
         this.inferExpressionType(expr.argument);
         return "boolean";
       }
+      if (expr.operator === "void") {
+        this.inferExpressionType(expr.argument);
+        return "void";
+      }
       if (expr.operator === "typeof") {
         this.inferExpressionType(expr.argument);
         return "string";
@@ -465,6 +540,29 @@ export class TypeChecker {
             `Tanımsız değişken: '${expr.argument.name}'`
           );
         }
+      } else if (expr.argument.type === "MemberExpression") {
+        const objType = this.inferExpressionType(expr.argument.object);
+        const propName = expr.argument.property?.name || expr.argument.property?.value;
+        const structName = this.getBaseTypeName(objType);
+        if (this.builtins.structSignatures.has(structName)) {
+          const structMeta = this.builtins.structSignatures.get(structName);
+          let fieldMeta = structMeta.fields?.get(propName);
+          if (!fieldMeta && structMeta.superClass) {
+            let curr = structMeta.superClass;
+            while (curr && this.builtins.structSignatures.has(curr)) {
+              const sm = this.builtins.structSignatures.get(curr);
+              if (sm.fields?.has(propName)) { fieldMeta = sm.fields.get(propName); break; }
+              curr = sm.superClass;
+            }
+          }
+          if (fieldMeta?.readonly) {
+            this.reporter.addError(
+              this.currentFilePath,
+              expr.argument.property || expr.argument,
+              `'${propName}' alanı 'readonly' olarak tanımlanmıştır, değeri değiştirilemez.`
+            );
+          }
+        }
       }
       const argType = this.inferExpressionType(expr.argument);
       if (argType !== "number" && argType !== "any") {
@@ -479,9 +577,58 @@ export class TypeChecker {
 
     // 7. İkili Operatörler (BinaryExpression)
     if (expr.type === "BinaryExpression") {
+      const op = expr.operator;
+      if (op === "instanceof") {
+        this.inferExpressionType(expr.left);
+        let candidateName = null;
+        let displayName = null;
+        if (expr.right.type === "Identifier") {
+          candidateName = expr.right.name;
+          displayName = expr.right.name;
+        } else if (expr.right.type === "MemberExpression") {
+          const chain = this.extractMemberChain(expr.right);
+          if (chain && chain.length > 0) {
+            candidateName = chain.join("_");
+            displayName = chain.join(".");
+          }
+        }
+
+        if (candidateName) {
+          let resolvedMeta = null;
+          if (this.builtins.structSignatures.has(candidateName)) {
+            resolvedMeta = this.builtins.structSignatures.get(candidateName);
+          } else {
+            const curNs = this.getNamespace();
+            if (curNs) {
+              const parts = curNs.split("_");
+              for (let len = parts.length; len >= 1; len--) {
+                const c = `${parts.slice(0, len).join("_")}_${candidateName}`;
+                if (this.builtins.structSignatures.has(c)) {
+                  resolvedMeta = this.builtins.structSignatures.get(c);
+                  break;
+                }
+              }
+            }
+          }
+
+          if (resolvedMeta && resolvedMeta.isInterface) {
+            this.reporter.addError(
+              this.currentFilePath,
+              expr.right,
+              `'instanceof' yalnızca sınıflar ile kullanılabilir; arayüz ('${displayName}') bir değer olarak kullanılamaz.`
+            );
+          }
+        }
+        return "boolean";
+      }
+      if (op === "in") {
+        this.inferExpressionType(expr.left);
+        this.inferExpressionType(expr.right);
+        return "boolean";
+      }
+
       const leftType = this.inferExpressionType(expr.left);
       const rightType = this.inferExpressionType(expr.right);
-      const op = expr.operator;
 
       const isVectorType = (t) => ["f32x4", "f64x2", "i32x4", "i64x2", "f64x4", "f32x8", "i32x8"].includes(t);
       if (isVectorType(leftType) && leftType === rightType) {
@@ -513,15 +660,17 @@ export class TypeChecker {
       }
 
       // 7.2. Aritmetik Operatörler (-, *, /, %)
+      const isNumOrEnum = (t) => t === "number" || t === "any" || (this.builtins.enumSignatures.has(t) && this.builtins.enumSignatures.get(t).kind !== "string");
+
       if (["-", "*", "/", "%"].includes(op)) {
-        if (leftType !== "number" && leftType !== "any") {
+        if (!isNumOrEnum(leftType)) {
           this.reporter.addError(
             this.currentFilePath,
             expr.left,
             `'${op}' aritmetik operatörü yalnızca sayı türleri üzerinde kullanılabilir ('${leftType}' verildi).`
           );
         }
-        if (rightType !== "number" && rightType !== "any") {
+        if (!isNumOrEnum(rightType)) {
           this.reporter.addError(
             this.currentFilePath,
             expr.right,
@@ -533,14 +682,14 @@ export class TypeChecker {
 
       // 7.3. Bitwise Operatörler (&, |, ^, <<, >>, >>>)
       if (["&", "|", "^", "<<", ">>", ">>>"].includes(op)) {
-        if (leftType !== "number" && leftType !== "any") {
+        if (!isNumOrEnum(leftType)) {
           this.reporter.addError(
             this.currentFilePath,
             expr.left,
             `'${op}' bitwise operatörü yalnızca sayı türleri üzerinde kullanılabilir ('${leftType}' verildi).`
           );
         }
-        if (rightType !== "number" && rightType !== "any") {
+        if (!isNumOrEnum(rightType)) {
           this.reporter.addError(
             this.currentFilePath,
             expr.right,
@@ -604,6 +753,14 @@ export class TypeChecker {
 
     // 10. This İfadesi (ThisExpression)
     if (expr.type === "ThisExpression" || (expr.type === "Identifier" && expr.name === "this")) {
+      if (this.scopeManager.isInStaticMethod()) {
+        this.reporter.addError(
+          this.currentFilePath,
+          expr,
+          `'this' anahtar sözcüğü statik metotlar içinde kullanılamaz.`
+        );
+        return "any";
+      }
       if (!this.scopeManager.isInClass()) {
         this.reporter.addError(
           this.currentFilePath,
@@ -620,7 +777,8 @@ export class TypeChecker {
     if (expr.type === "Identifier") {
       if (expr.name === "undefined") return "undefined";
       if (expr.name === "NaN" || expr.name === "Infinity") return "number";
-      if (expr.name === "console") return "any";
+      // [COMPILER_BUILTIN_STD_COMMENTED_OUT] Yerleşik console desteği yorum satırına alındı (artık std/ üzerinden import edilmelidir)
+      // if (expr.name === "console") return "any";
       if (expr.name === "Math") return "Math";
       if (expr.name === "borrow") return "any";
 
@@ -635,8 +793,36 @@ export class TypeChecker {
         return sym.type;
       }
 
-      // Vektör, SIMD, String ve process Namespace kontrolü
-      if (["f32x4", "f64x2", "i32x4", "i64x2", "f64x4", "f32x8", "i32x8", "simd", "String", "process"].includes(expr.name)) {
+      // Namespace içi sembol kontrolü (değişken, sınıf, fonksiyon, alt namespace)
+      const curNs = this.getNamespace();
+      if (curNs) {
+        const parts = curNs.split("_");
+        for (let len = parts.length; len >= 1; len--) {
+          const prefix = parts.slice(0, len).join("_");
+          const nsObj = this.builtins.getNamespace(prefix);
+          if (nsObj && nsObj.variables.has(expr.name)) {
+            return nsObj.variables.get(expr.name).type;
+          }
+          const candidateName = `${prefix}_${expr.name}`;
+          if (this.builtins.structSignatures.has(candidateName)) {
+            return candidateName;
+          }
+          if (this.builtins.functionSignatures.has(candidateName)) {
+            return "function";
+          }
+          if (this.builtins.namespaceRegistry.has(candidateName)) {
+            return candidateName;
+          }
+        }
+      }
+
+      // Namespace nesnesi kontrolü
+      if (this.builtins.namespaceRegistry.has(expr.name)) {
+        return expr.name;
+      }
+
+      // [COMPILER_BUILTIN_STD_COMMENTED_OUT] Yerleşik "process" kaldırıldı (artık std/process.ts kullanılmalıdır)
+      if (["f32x4", "f64x2", "i32x4", "i64x2", "f64x4", "f32x8", "i32x8", "simd", "String"/*, "process"*/].includes(expr.name)) {
         return expr.name;
       }
 
@@ -705,7 +891,80 @@ export class TypeChecker {
     }
 
     // 12. Üye Erişimi (MemberExpression: obj.prop veya arr[idx])
-    if (expr.type === "MemberExpression") {
+    if (expr.type === "MemberExpression" || expr.type === "OptionalMemberExpression") {
+      const chain = this.extractMemberChain(expr);
+      if (chain && chain.length >= 2) {
+        // 1. Tam zincir bir sınıf veya namespace mi? (örn: Tools.Counter veya Outer.Inner)
+        const fullJoined = chain.join("_");
+        if (this.builtins.structSignatures.has(fullJoined)) {
+          return fullJoined;
+        }
+        if (this.builtins.namespaceRegistry.has(fullJoined)) {
+          return fullJoined;
+        }
+
+        const curNs = this.getNamespace();
+        for (let i = chain.length - 1; i >= 1; i--) {
+          const classCandidate = chain.slice(0, i).join("_");
+          const propCandidate = chain.slice(i).join("_");
+
+          let resolvedCls = null;
+          if (this.builtins.structSignatures.has(classCandidate)) {
+            resolvedCls = classCandidate;
+          } else if (curNs) {
+            const parts = curNs.split("_");
+            for (let len = parts.length; len >= 1; len--) {
+              const c = `${parts.slice(0, len).join("_")}_${classCandidate}`;
+              if (this.builtins.structSignatures.has(c)) {
+                resolvedCls = c;
+                break;
+              }
+            }
+          }
+
+          if (resolvedCls) {
+            const clsMeta = this.builtins.structSignatures.get(resolvedCls);
+            if (clsMeta.isClass) {
+              if (clsMeta.staticFields?.has(propCandidate)) {
+                return clsMeta.staticFields.get(propCandidate).type;
+              }
+              if (clsMeta.staticMethods?.has(propCandidate)) {
+                return clsMeta.staticMethods.get(propCandidate).returnType;
+              }
+              if (clsMeta.fields?.has(propCandidate) || clsMeta.methods?.has(propCandidate)) {
+                this.reporter.addError(
+                  this.currentFilePath,
+                  expr.property,
+                  `'${propCandidate}' bir instance üyesidir; '${resolvedCls}' sınıfı üzerinden doğrudan statik olarak erişilemez.`
+                );
+                return "any";
+              }
+            }
+          }
+
+          // Namespace değişkeni mi?
+          let resolvedNs = null;
+          if (this.builtins.getNamespace(classCandidate)) {
+            resolvedNs = classCandidate;
+          } else if (curNs) {
+            const parts = curNs.split("_");
+            for (let len = parts.length; len >= 1; len--) {
+              const c = `${parts.slice(0, len).join("_")}_${classCandidate}`;
+              if (this.builtins.getNamespace(c)) {
+                resolvedNs = c;
+                break;
+              }
+            }
+          }
+          if (resolvedNs) {
+            const ns = this.builtins.getNamespace(resolvedNs);
+            if (ns && ns.variables.has(propCandidate)) {
+              return ns.variables.get(propCandidate).type;
+            }
+          }
+        }
+      }
+
       let baseType = null;
       let isEnum = false;
 
@@ -781,19 +1040,77 @@ export class TypeChecker {
         const subst = this.getSubstitutions(structMeta, baseType);
         const substitute = (t) => (subst.has(t) ? subst.get(t) : t);
 
+        let fieldMeta = null;
+        let methodMeta = null;
+        let declaringClass = structName;
+
         if (structMeta.fields.has(propName)) {
-          return substitute(structMeta.fields.get(propName).type);
-        }
-        if (structMeta.methods.has(propName)) {
-          return substitute(structMeta.methods.get(propName).returnType);
+          fieldMeta = structMeta.fields.get(propName);
+          declaringClass = fieldMeta.declaringClass || structName;
+        } else if (structMeta.methods.has(propName)) {
+          methodMeta = structMeta.methods.get(propName);
+          declaringClass = methodMeta.declaringClass || structName;
+        } else if (structMeta.staticFields?.has(propName) || structMeta.staticMethods?.has(propName)) {
+          this.reporter.addError(
+            this.currentFilePath,
+            expr.property,
+            `'${propName}' statik bir üyedir; '${structName}' sınıf örneği (instance) üzerinden erişilemez. '${structName}.${propName}' şeklinde erişiniz.`
+          );
+          return "any";
+        } else {
+          let curr = structMeta.superClass;
+          while (curr && this.builtins.structSignatures.has(curr)) {
+            const parentMeta = this.builtins.structSignatures.get(curr);
+            if (parentMeta.fields?.has(propName)) {
+              fieldMeta = parentMeta.fields.get(propName);
+              declaringClass = fieldMeta.declaringClass || curr;
+              break;
+            }
+            if (parentMeta.methods?.has(propName)) {
+              methodMeta = parentMeta.methods.get(propName);
+              declaringClass = methodMeta.declaringClass || curr;
+              break;
+            }
+            curr = parentMeta.superClass;
+          }
         }
 
-        let curr = structMeta.superClass;
-        while (curr && this.builtins.structSignatures.has(curr)) {
-          const parentMeta = this.builtins.structSignatures.get(curr);
-          if (parentMeta.fields?.has(propName)) return substitute(parentMeta.fields.get(propName).type);
-          if (parentMeta.methods?.has(propName)) return substitute(parentMeta.methods.get(propName).returnType);
-          curr = parentMeta.superClass;
+        if (fieldMeta) {
+          const acc = fieldMeta.accessibility || "public";
+          const currentClass = this.scopeManager.getCurrentClass()?.name;
+          if (acc === "private" && currentClass !== declaringClass) {
+            this.reporter.addError(
+              this.currentFilePath,
+              expr.property,
+              `'${propName}' alanı private olarak tanımlanmıştır ve yalnızca '${declaringClass}' sınıfı içinden erişilebilir.`
+            );
+          } else if (acc === "protected" && (!currentClass || !this.isSubclassOf(currentClass, declaringClass))) {
+            this.reporter.addError(
+              this.currentFilePath,
+              expr.property,
+              `'${propName}' alanı protected olarak tanımlanmıştır ve yalnızca '${declaringClass}' sınıfı ve alt sınıfları içinden erişilebilir.`
+            );
+          }
+          return substitute(fieldMeta.type);
+        }
+
+        if (methodMeta) {
+          const acc = methodMeta.accessibility || "public";
+          const currentClass = this.scopeManager.getCurrentClass()?.name;
+          if (acc === "private" && currentClass !== declaringClass) {
+            this.reporter.addError(
+              this.currentFilePath,
+              expr.property,
+              `'${propName}' metodu private olarak tanımlanmıştır ve yalnızca '${declaringClass}' sınıfı içinden erişilebilir.`
+            );
+          } else if (acc === "protected" && (!currentClass || !this.isSubclassOf(currentClass, declaringClass))) {
+            this.reporter.addError(
+              this.currentFilePath,
+              expr.property,
+              `'${propName}' metodu protected olarak tanımlanmıştır ve yalnızca '${declaringClass}' sınıfı ve alt sınıfları içinden erişilebilir.`
+            );
+          }
+          return substitute(methodMeta.returnType);
         }
 
         this.reporter.addError(
@@ -808,7 +1125,8 @@ export class TypeChecker {
         baseType !== "any" &&
         baseType !== "object" &&
         baseType !== "pointer" &&
-        expr.object.name !== "console" &&
+        // [COMPILER_BUILTIN_STD_COMMENTED_OUT]
+        // expr.object.name !== "console" &&
         expr.object.name !== "Math"
       ) {
         this.reporter.addError(
@@ -850,6 +1168,68 @@ export class TypeChecker {
             expr.left,
             `Atama yapılan tanımsız değişken: '${targetName}'`
           );
+          this.inferExpressionType(expr.right);
+          return "any";
+        }
+      } else if (expr.left.type === "MemberExpression") {
+        const objType = this.inferExpressionType(expr.left.object);
+        const propName = expr.left.property?.name || expr.left.property?.value;
+        const structName = this.getBaseTypeName(objType);
+        if (this.builtins.structSignatures.has(structName)) {
+          const structMeta = this.builtins.structSignatures.get(structName);
+          let fieldMeta = null;
+          let declaringClass = structName;
+          if (structMeta.fields?.has(propName)) {
+            fieldMeta = structMeta.fields.get(propName);
+            declaringClass = fieldMeta.declaringClass || structName;
+          } else {
+            let curr = structMeta.superClass;
+            while (curr && this.builtins.structSignatures.has(curr)) {
+              const parentMeta = this.builtins.structSignatures.get(curr);
+              if (parentMeta.fields?.has(propName)) {
+                fieldMeta = parentMeta.fields.get(propName);
+                declaringClass = fieldMeta.declaringClass || curr;
+                break;
+              }
+              curr = parentMeta.superClass;
+            }
+          }
+
+          if (fieldMeta) {
+            // Readonly kontrolü
+            if (fieldMeta.readonly) {
+              const inCtor = this.scopeManager.isInConstructor();
+              const isThis = expr.left.object.type === "ThisExpression" ||
+                             (expr.left.object.type === "Identifier" && expr.left.object.name === "this");
+              const curCls = this.scopeManager.getCurrentClass()?.name;
+              const isDeclaringOrSub = curCls && this.isSubclassOf(curCls, declaringClass);
+
+              if (!inCtor || !isThis || !isDeclaringOrSub) {
+                this.reporter.addError(
+                  this.currentFilePath,
+                  expr.left.property || expr.left,
+                  `'${propName}' alanı 'readonly' olarak tanımlanmıştır ve yalnızca yapıcı metot (constructor) içinde atanabilir.`
+                );
+              }
+            }
+
+            // Accessibility kontrolü (private / protected)
+            const acc = fieldMeta.accessibility || "public";
+            const currentClass = this.scopeManager.getCurrentClass()?.name;
+            if (acc === "private" && currentClass !== declaringClass) {
+              this.reporter.addError(
+                this.currentFilePath,
+                expr.left.property || expr.left,
+                `'${propName}' alanı private olarak tanımlanmıştır ve yalnızca '${declaringClass}' sınıfı içinden erişilebilir.`
+              );
+            } else if (acc === "protected" && (!currentClass || !this.isSubclassOf(currentClass, declaringClass))) {
+              this.reporter.addError(
+                this.currentFilePath,
+                expr.left.property || expr.left,
+                `'${propName}' alanı protected olarak tanımlanmıştır ve yalnızca '${declaringClass}' sınıfı ve alt sınıfları içinden erişilebilir.`
+              );
+            }
+          }
         }
       }
 
@@ -901,7 +1281,7 @@ export class TypeChecker {
     }
 
     // 14. Çağrı İfadeleri (CallExpression)
-    if (expr.type === "CallExpression") {
+    if (expr.type === "CallExpression" || expr.type === "OptionalCallExpression") {
       const callee = expr.callee;
 
       // 14.1. super(...) çağrısı
@@ -1005,19 +1385,132 @@ export class TypeChecker {
 
       // 14.3. Metot Çağrısı (obj.method(...))
       if (callee.type === "MemberExpression") {
+        const chain = this.extractMemberChain(callee);
+        if (chain && chain.length >= 2) {
+          const curNs = this.getNamespace();
+          for (let i = chain.length - 1; i >= 1; i--) {
+            const classCandidate = chain.slice(0, i).join("_");
+            const method = chain.slice(i).join("_");
+
+            let resolvedCls = null;
+            if (this.builtins.structSignatures.has(classCandidate)) {
+              resolvedCls = classCandidate;
+            } else if (curNs) {
+              const parts = curNs.split("_");
+              for (let len = parts.length; len >= 1; len--) {
+                const c = `${parts.slice(0, len).join("_")}_${classCandidate}`;
+                if (this.builtins.structSignatures.has(c)) {
+                  resolvedCls = c;
+                  break;
+                }
+              }
+            }
+
+            if (resolvedCls) {
+              const clsMeta = this.builtins.structSignatures.get(resolvedCls);
+              if (clsMeta.isClass) {
+                if (clsMeta.staticMethods?.has(method)) {
+                  const methodMeta = clsMeta.staticMethods.get(method);
+                  const actualArgs = expr.arguments || [];
+                  const expectedParams = methodMeta.params || [];
+                  const minArgs = methodMeta.minArgs !== undefined ? methodMeta.minArgs : expectedParams.length;
+                  const maxArgs = methodMeta.hasRest ? Infinity : expectedParams.length;
+                  if (actualArgs.length < minArgs || actualArgs.length > maxArgs) {
+                    this.reporter.addError(
+                      this.currentFilePath,
+                      expr,
+                      `Argüman sayısı uyuşmazlığı: '${resolvedCls}.${method}' ${expectedParams.length} argüman beklerken ${actualArgs.length} verildi.`
+                    );
+                  }
+                  actualArgs.forEach((arg, idx) => {
+                    let expectedParamType;
+                    let isRestArg = false;
+                    if (methodMeta.hasRest && idx >= minArgs) {
+                      expectedParamType = methodMeta.restElemType || "string";
+                      isRestArg = true;
+                    } else if (idx < expectedParams.length) {
+                      expectedParamType = expectedParams[idx];
+                    } else {
+                      expectedParamType = null;
+                    }
+                    const actualArgType = this.inferExpressionType(arg, expectedParamType);
+                    const isRestStringConvertible = isRestArg && expectedParamType === "string";
+                    if (!isRestStringConvertible && expectedParamType && actualArgType !== "any" && !this.typesAreCompatible(expectedParamType, actualArgType)) {
+                      this.reporter.addError(
+                        this.currentFilePath,
+                        arg,
+                        `'${resolvedCls}.${method}()' için geçersiz argüman: Parametre ${idx + 1} için '${expectedParamType}' beklenirken '${actualArgType}' verildi.`
+                      );
+                    }
+                  });
+                  return methodMeta.returnType || "void";
+                }
+                if (clsMeta.methods?.has(method)) {
+                  this.reporter.addError(
+                    this.currentFilePath,
+                    callee.property,
+                    `'${method}' bir instance metodudur; '${resolvedCls}' sınıfı üzerinden doğrudan statik olarak çağrılamaz.`
+                  );
+                  for (const a of expr.arguments || []) this.inferExpressionType(a);
+                  return "void";
+                }
+              }
+            }
+          }
+
+          // 2. Namespace fonksiyon çağrısı mı?
+          const mangledFn = chain.join("_");
+          if (this.builtins.functionSignatures.has(mangledFn)) {
+            const fnMeta = this.builtins.functionSignatures.get(mangledFn);
+            const actualArgs = expr.arguments || [];
+            const expectedParams = fnMeta.params || [];
+            if (actualArgs.length !== expectedParams.length) {
+              this.reporter.addError(
+                this.currentFilePath,
+                expr,
+                `Argüman sayısı uyuşmazlığı: '${chain.join(".")}' ${expectedParams.length} argüman beklerken ${actualArgs.length} verildi.`
+              );
+            }
+            actualArgs.forEach((arg, idx) => {
+              const actualArgType = this.inferExpressionType(arg, expectedParams[idx]);
+              if (expectedParams[idx] && actualArgType !== "any" && !this.typesAreCompatible(expectedParams[idx], actualArgType)) {
+                this.reporter.addError(
+                  this.currentFilePath,
+                  arg,
+                  `'${chain.join(".")}()' için geçersiz argüman: Parametre ${idx + 1} için '${expectedParams[idx]}' beklenirken '${actualArgType}' verildi.`
+                );
+              }
+            });
+            return fnMeta.returnType || "void";
+          }
+        }
+
         const objType = this.inferExpressionType(callee.object);
         const method = callee.property?.name || callee.property?.value;
 
+        // [COMPILER_BUILTIN_STD_COMMENTED_OUT] Otomatik console metot tipi çıkarımı devredışı bırakıldı (artık std/ üzerinden import edilmelidir)
+        /*
         if (callee.object.name === "console" && ["log", "warn", "error"].includes(method)) {
           for (const a of expr.arguments || []) this.inferExpressionType(a);
           return "void";
         }
+        */
 
         const structName = this.getBaseTypeName(objType);
         if (this.builtins.structSignatures.has(structName)) {
           const structMeta = this.builtins.structSignatures.get(structName);
           const subst = this.getSubstitutions(structMeta, objType);
           const substitute = (t) => (subst.has(t) ? subst.get(t) : t);
+
+          if (structMeta.staticMethods?.has(method)) {
+            this.reporter.addError(
+              this.currentFilePath,
+              callee.property,
+              `'${method}' statik bir metottur; '${structName}' sınıf örneği (instance) üzerinden çağrılamaz. '${structName}.${method}()' şeklinde çağırınız.`
+            );
+            for (const a of expr.arguments || []) this.inferExpressionType(a);
+            return "void";
+          }
 
           let methodMeta = structMeta?.methods?.get(method);
           let curr = structMeta?.superClass;
@@ -1028,6 +1521,25 @@ export class TypeChecker {
               break;
             }
             curr = parentMeta.superClass;
+          }
+
+          if (methodMeta) {
+            const acc = methodMeta.accessibility || "public";
+            const declaringClass = methodMeta.declaringClass || structName;
+            const currentClass = this.scopeManager.getCurrentClass()?.name;
+            if (acc === "private" && currentClass !== declaringClass) {
+              this.reporter.addError(
+                this.currentFilePath,
+                callee.property,
+                `'${method}' metodu private olarak tanımlanmıştır ve yalnızca '${declaringClass}' sınıfı içinden erişilebilir.`
+              );
+            } else if (acc === "protected" && (!currentClass || !this.isSubclassOf(currentClass, declaringClass))) {
+              this.reporter.addError(
+                this.currentFilePath,
+                callee.property,
+                `'${method}' metodu protected olarak tanımlanmıştır ve yalnızca '${declaringClass}' sınıfı ve alt sınıfları içinden erişilebilir.`
+              );
+            }
           }
 
           if (!methodMeta) {
@@ -1050,7 +1562,8 @@ export class TypeChecker {
           const rawParams = methodMeta.params || [];
           const expectedParams = rawParams.map(substitute);
           const minArgs = methodMeta.minArgs !== undefined ? methodMeta.minArgs : expectedParams.length;
-          if (actualArgs.length < minArgs || actualArgs.length > expectedParams.length) {
+          const maxArgs = methodMeta.hasRest ? Infinity : expectedParams.length;
+          if (actualArgs.length < minArgs || actualArgs.length > maxArgs) {
             this.reporter.addError(
               this.currentFilePath,
               expr,
@@ -1058,9 +1571,19 @@ export class TypeChecker {
             );
           }
           actualArgs.forEach((arg, idx) => {
-            const expectedParamType = expectedParams[idx];
+            let expectedParamType;
+            let isRestArg = false;
+            if (methodMeta.hasRest && idx >= minArgs) {
+              expectedParamType = methodMeta.restElemType || "string";
+              isRestArg = true;
+            } else if (idx < expectedParams.length) {
+              expectedParamType = expectedParams[idx];
+            } else {
+              expectedParamType = null;
+            }
             const actualArgType = this.inferExpressionType(arg, expectedParamType);
-            if (expectedParamType && !this.typesAreCompatible(expectedParamType, actualArgType)) {
+            const isRestStringConvertible = isRestArg && expectedParamType === "string";
+            if (!isRestStringConvertible && expectedParamType && !this.typesAreCompatible(expectedParamType, actualArgType)) {
               this.reporter.addError(
                 this.currentFilePath,
                 arg,
@@ -1141,7 +1664,23 @@ export class TypeChecker {
           return fnSig?.returnType || "number";
         }
 
-        const fnMeta = this.builtins.functionSignatures.get(fnName);
+        let fnMeta = this.builtins.functionSignatures.get(fnName);
+        if (fnName === "join" && expr.arguments?.length === 1) {
+          fnMeta = { params: ["pointer"], returnType: "void", minArgs: 1 };
+        }
+        if (!fnMeta) {
+          const curNs = this.getNamespace();
+          if (curNs) {
+            const parts = curNs.split("_");
+            for (let len = parts.length; len >= 1; len--) {
+              const candidate = `${parts.slice(0, len).join("_")}_${fnName}`;
+              if (this.builtins.functionSignatures.has(candidate)) {
+                fnMeta = this.builtins.functionSignatures.get(candidate);
+                break;
+              }
+            }
+          }
+        }
         if (!fnMeta) {
           this.reporter.addError(this.currentFilePath, callee, `Tanımsız fonksiyon çağrısı: '${fnName}()'`);
           for (const a of expr.arguments || []) this.inferExpressionType(a);
@@ -1173,7 +1712,8 @@ export class TypeChecker {
         const returnType = substitute(fnMeta.outerReturnType || fnMeta.returnType);
 
         const minArgs = fnMeta.minArgs !== undefined ? fnMeta.minArgs : expectedParams.length;
-        if (actualArgs.length < minArgs || actualArgs.length > expectedParams.length) {
+        const maxArgs = fnMeta.hasRest ? Infinity : expectedParams.length;
+        if (actualArgs.length < minArgs || actualArgs.length > maxArgs) {
           this.reporter.addError(
             this.currentFilePath,
             expr,
@@ -1182,10 +1722,20 @@ export class TypeChecker {
         }
 
         actualArgs.forEach((arg, idx) => {
-          const expectedParamType = expectedParams[idx];
+          let expectedParamType;
+          let isRestArg = false;
+          if (fnMeta.hasRest && idx >= minArgs) {
+            expectedParamType = fnMeta.restElemType || "string";
+            isRestArg = true;
+          } else if (idx < expectedParams.length) {
+            expectedParamType = expectedParams[idx];
+          } else {
+            expectedParamType = null;
+          }
           const actualArgType = this.inferExpressionType(arg, expectedParamType);
+          const isRestStringConvertible = isRestArg && expectedParamType === "string";
 
-          if (expectedParamType && !this.typesAreCompatible(expectedParamType, actualArgType)) {
+          if (!isRestStringConvertible && expectedParamType && !this.typesAreCompatible(expectedParamType, actualArgType)) {
             this.reporter.addError(
               this.currentFilePath,
               arg,
@@ -1202,17 +1752,43 @@ export class TypeChecker {
 
     // 15. New İfadesi (NewExpression: new Cls(...))
     if (expr.type === "NewExpression") {
-      const clsName = expr.callee.name;
+      let clsName = expr.callee.name;
+      if (!clsName && expr.callee.type === "MemberExpression") {
+        const chain = this.extractMemberChain(expr.callee);
+        if (chain) clsName = chain.join("_");
+      }
       if (!clsName || !this.builtins.structSignatures.has(clsName)) {
+        const curNs = this.getNamespace();
+        if (clsName && curNs) {
+          const parts = curNs.split("_");
+          for (let len = parts.length; len >= 1; len--) {
+            const candidate = `${parts.slice(0, len).join("_")}_${clsName}`;
+            if (this.builtins.structSignatures.has(candidate)) {
+              clsName = candidate;
+              break;
+            }
+          }
+        }
+      }
+      if (!clsName || !this.builtins.structSignatures.has(clsName)) {
+        const displayName = expr.callee.name || (expr.callee.type === "MemberExpression" ? this.extractMemberChain(expr.callee)?.join(".") : "undefined");
         this.reporter.addError(
           this.currentFilePath,
           expr.callee,
-          `Tanımsız sınıf veya yapı: '${clsName}'`
+          `Tanımsız sınıf veya yapı: '${displayName}'`
         );
         return "any";
       }
 
       const structMeta = this.builtins.structSignatures.get(clsName);
+      if (structMeta?.isAbstract) {
+        this.reporter.addError(
+          this.currentFilePath,
+          expr.callee,
+          `Soyut sınıf '${clsName}' doğrudan örneklenemez (instantiate edilemez).`
+        );
+        return clsName;
+      }
       const constructorMethod = structMeta.methods?.get("constructor");
       if (constructorMethod) {
         const actualArgs = expr.arguments || [];

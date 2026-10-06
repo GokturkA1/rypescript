@@ -15,6 +15,7 @@ export class SemanticAnalyzer {
     this.reporter = diagnosticReporter;
     this.headerFiles = headerFiles;
     this.currentFilePath = "";
+    this.currentNamespace = null;
 
     this.scopeManager = new ScopeManager();
     this.builtins = new BuiltinRegistry();
@@ -23,7 +24,8 @@ export class SemanticAnalyzer {
       this.scopeManager,
       this.reporter,
       () => this.currentFilePath,
-      (stmt) => this.checkStatement(stmt)
+      (stmt) => this.checkStatement(stmt),
+      () => this.currentNamespace
     );
 
     if (Array.isArray(headerFiles) && headerFiles.length > 0) {
@@ -77,6 +79,206 @@ export class SemanticAnalyzer {
         node: null,
       });
     }
+  }
+
+  getNamespaceName(idNode) {
+    if (!idNode) return "";
+    if (idNode.type === "Identifier") return idNode.name;
+    if (idNode.type === "TSQualifiedName") {
+      const left = this.getNamespaceName(idNode.left);
+      return left ? `${left}_${idNode.right.name}` : idNode.right.name;
+    }
+    return "";
+  }
+
+  collectClassSignature(decl, parentPrefix = "") {
+    const rawClsName = decl.id.name;
+    const clsName = parentPrefix ? `${parentPrefix}_${rawClsName}` : rawClsName;
+    const superClass = decl.superClass?.name || null;
+    const rawTypeParams = decl.typeParameters?.params || [];
+    const typeParams = rawTypeParams.map((p) => p.name?.name || p.name?.value || p.name || "");
+    const isAbstract = Boolean(decl.abstract);
+    const fields = new Map();
+    const methods = new Map();
+    const staticFields = new Map();
+    const staticMethods = new Map();
+
+    for (const member of decl.body?.body || []) {
+      if (member.type === "PropertyDefinition" || member.type === "TSAbstractPropertyDefinition") {
+        const fName = member.key?.name || member.key?.value;
+        const fType = this.resolveType(member.typeAnnotation);
+        const fReadonly = Boolean(member.readonly);
+        const fAccessibility = member.accessibility || "public";
+        const fAbstract = member.type === "TSAbstractPropertyDefinition" || Boolean(member.abstract);
+
+        const fieldMeta = {
+          name: fName,
+          type: fType,
+          readonly: fReadonly,
+          accessibility: fAccessibility,
+          isAbstract: fAbstract,
+          declaringClass: clsName,
+          node: member,
+        };
+
+        if (member.static) {
+          staticFields.set(fName, fieldMeta);
+        } else {
+          fields.set(fName, fieldMeta);
+        }
+      } else if (member.type === "MethodDefinition" || member.type === "TSAbstractMethodDefinition") {
+        const mName = member.key?.name || member.key?.value;
+        const isConstructor = member.kind === "constructor" || mName === "constructor";
+        const isStatic = Boolean(member.static);
+        const mAbstract = member.type === "TSAbstractMethodDefinition" || Boolean(member.abstract) || !member.value?.body;
+        const mOverride = Boolean(member.override);
+        const mAccessibility = member.accessibility || "public";
+
+        let hasRest = false;
+        let restElemType = null;
+        let fixedCount = 0;
+        const rawParams = member.value?.params || [];
+        const params = rawParams.map((p) => {
+          if (p.type === "RestElement") {
+            hasRest = true;
+            const annot = p.typeAnnotation || p.argument?.typeAnnotation;
+            const fullType = this.resolveType(annot);
+            const unwrapped = this.unwrapType(annot);
+            if (unwrapped?.type === "TSArrayType") {
+              restElemType = this.resolveType(unwrapped.elementType);
+            } else {
+              restElemType = fullType && fullType.endsWith("[]") ? fullType.slice(0, -2) : "string";
+            }
+            return fullType;
+          }
+          fixedCount++;
+          return this.resolveType(p.typeAnnotation || p.pattern?.typeAnnotation);
+        });
+        const returnType = member.value?.returnType
+          ? this.resolveType(member.value.returnType)
+          : isConstructor ? "void" : "void";
+
+        const methodMeta = {
+          name: mName,
+          params,
+          returnType,
+          isConstructor,
+          isStatic,
+          isAbstract: mAbstract,
+          isOverride: mOverride,
+          accessibility: mAccessibility,
+          declaringClass: clsName,
+          node: member,
+          hasRest,
+          minArgs: fixedCount,
+          restElemType,
+        };
+
+        if (isStatic) {
+          staticMethods.set(mName, methodMeta);
+          this.builtins.functionSignatures.set(`${clsName}_${mName}`, {
+            params,
+            returnType,
+            outerReturnType: returnType,
+            node: member,
+            hasRest,
+            minArgs: fixedCount,
+            restElemType,
+          });
+        } else {
+          methods.set(mName, methodMeta);
+        }
+      }
+    }
+    this.builtins.structSignatures.set(clsName, {
+      name: clsName,
+      superClass,
+      typeParams,
+      isAbstract,
+      fields,
+      methods,
+      staticFields,
+      staticMethods,
+      node: decl,
+      isClass: true,
+    });
+  }
+
+  collectNamespaceSignatures(moduleDecl, parentPrefix = "") {
+    const nsName = this.getNamespaceName(moduleDecl.id);
+    const fullPrefix = parentPrefix ? `${parentPrefix}_${nsName}` : nsName;
+    const ns = this.builtins.registerNamespace(fullPrefix);
+    const prevNs = this.currentNamespace;
+    this.currentNamespace = fullPrefix;
+
+    const bodyList = moduleDecl.body?.body || [];
+    for (const rawStmt of bodyList) {
+      const stmt = (rawStmt.type === "ExportNamedDeclaration" || rawStmt.type === "ExportDefaultDeclaration") && rawStmt.declaration
+        ? rawStmt.declaration
+        : rawStmt;
+      if (!stmt) continue;
+
+      if (stmt.type === "FunctionDeclaration" || stmt.type === "TSDeclareFunction") {
+        const fnName = stmt.id.name;
+        const mangled = `${fullPrefix}_${fnName}`;
+        const params = (stmt.params || []).map((p) => this.resolveType(p.typeAnnotation || p.pattern?.typeAnnotation));
+        const returnType = stmt.returnType ? this.resolveType(stmt.returnType) : "void";
+
+        let typePredicate = null;
+        const rawRet = stmt.returnType?.typeAnnotation || stmt.returnType;
+        if (rawRet && (rawRet.type === "TSTypePredicate" || rawRet.typeAnnotation?.type === "TSTypePredicate")) {
+          const predNode = rawRet.type === "TSTypePredicate" ? rawRet : rawRet.typeAnnotation;
+          const paramName = predNode.parameterName?.name;
+          const targetNode = predNode.typeAnnotation?.typeAnnotation || predNode.typeAnnotation;
+          const targetType = targetNode?.typeName?.name || targetNode?.typeName?.value || this.resolveType(targetNode);
+          typePredicate = { paramName, targetType };
+        }
+
+        this.builtins.functionSignatures.set(mangled, {
+          params,
+          returnType,
+          outerReturnType: returnType,
+          typePredicate,
+          node: stmt,
+        });
+        ns.functions.set(fnName, { mangled, params, returnType, typePredicate, node: stmt });
+      } else if (stmt.type === "VariableDeclaration") {
+        for (const d of stmt.declarations) {
+          const vName = d.id.name;
+          const mangled = `${fullPrefix}_${vName}`;
+          const vType = d.id.typeAnnotation ? this.resolveType(d.id.typeAnnotation) : "any";
+          ns.variables.set(vName, { mangled, type: vType, node: d });
+        }
+      } else if (stmt.type === "ClassDeclaration") {
+        this.collectClassSignature(stmt, fullPrefix);
+        ns.classes.set(stmt.id.name, { mangled: `${fullPrefix}_${stmt.id.name}`, node: stmt });
+      } else if (stmt.type === "TSModuleDeclaration") {
+        this.collectNamespaceSignatures(stmt, fullPrefix);
+      }
+    }
+    this.currentNamespace = prevNs;
+  }
+
+  checkNamespace(moduleDecl, parentPrefix = "") {
+    const nsName = this.getNamespaceName(moduleDecl.id);
+    const fullPrefix = parentPrefix ? `${parentPrefix}_${nsName}` : nsName;
+    const prevNs = this.currentNamespace;
+    this.currentNamespace = fullPrefix;
+
+    const bodyList = moduleDecl.body?.body || [];
+    for (const rawStmt of bodyList) {
+      const stmt = (rawStmt.type === "ExportNamedDeclaration" || rawStmt.type === "ExportDefaultDeclaration") && rawStmt.declaration
+        ? rawStmt.declaration
+        : rawStmt;
+      if (!stmt) continue;
+      if (stmt.type === "TSModuleDeclaration") {
+        this.checkNamespace(stmt, fullPrefix);
+      } else {
+        this.checkStatement(stmt);
+      }
+    }
+
+    this.currentNamespace = prevNs;
   }
 
   // Delegasyonlar (Geriye Dönük Uyumluluk)
@@ -320,38 +522,11 @@ export class SemanticAnalyzer {
         }
 
         if (decl.type === "ClassDeclaration") {
-          const clsName = decl.id.name;
-          const superClass = decl.superClass?.name || null;
-          const rawTypeParams = decl.typeParameters?.params || [];
-          const typeParams = rawTypeParams.map((p) => p.name?.name || p.name?.value || p.name || "");
-          const fields = new Map();
-          const methods = new Map();
-          for (const member of decl.body?.body || []) {
-            if (member.type === "PropertyDefinition") {
-              const fName = member.key?.name || member.key?.value;
-              const fType = this.resolveType(member.typeAnnotation);
-              fields.set(fName, { type: fType, node: member });
-            } else if (member.type === "MethodDefinition") {
-              const mName = member.key?.name || member.key?.value;
-              const params = (member.value?.params || []).map((p) =>
-                this.resolveType(p.typeAnnotation || p.pattern?.typeAnnotation)
-              );
-              const returnType = member.value?.returnType
-                ? this.resolveType(member.value.returnType)
-                : mName === "constructor"
-                ? "void"
-                : "void";
-              methods.set(mName, { params, returnType, node: member });
-            }
-          }
-          this.builtins.structSignatures.set(clsName, {
-            name: clsName,
-            superClass,
-            typeParams,
-            fields,
-            methods,
-            node: decl,
-          });
+          this.collectClassSignature(decl);
+        }
+
+        if (decl.type === "TSModuleDeclaration") {
+          this.collectNamespaceSignatures(decl);
         }
 
         if (decl.type === "FunctionDeclaration" || decl.type === "TSDeclareFunction") {
@@ -374,7 +549,24 @@ export class SemanticAnalyzer {
 
           const rawTypeParams = decl.typeParameters?.params || [];
           const typeParams = rawTypeParams.map((p) => p.name?.name || p.name?.value || p.name || "");
-          const params = (decl.params || []).map((p) => {
+          let hasRest = false;
+          let restElemType = null;
+          let fixedCount = 0;
+          const rawParams = decl.params || [];
+          const params = rawParams.map((p) => {
+            if (p.type === "RestElement") {
+              hasRest = true;
+              const annot = p.typeAnnotation || p.argument?.typeAnnotation;
+              const fullType = this.resolveType(annot);
+              const unwrapped = this.unwrapType(annot);
+              if (unwrapped?.type === "TSArrayType") {
+                restElemType = this.resolveType(unwrapped.elementType);
+              } else {
+                restElemType = fullType && fullType.endsWith("[]") ? fullType.slice(0, -2) : "string";
+              }
+              return fullType;
+            }
+            fixedCount++;
             const annot = p.typeAnnotation || p.pattern?.typeAnnotation;
             return this.resolveType(annot);
           });
@@ -382,7 +574,17 @@ export class SemanticAnalyzer {
           let innerReturnType = "void";
           let outerReturnType = "void";
 
+          let typePredicate = null;
           if (decl.returnType) {
+            const rawRet = decl.returnType?.typeAnnotation || decl.returnType;
+            if (rawRet && (rawRet.type === "TSTypePredicate" || rawRet.typeAnnotation?.type === "TSTypePredicate")) {
+              const predNode = rawRet.type === "TSTypePredicate" ? rawRet : rawRet.typeAnnotation;
+              const paramName = predNode.parameterName?.name;
+              const targetNode = predNode.typeAnnotation?.typeAnnotation || predNode.typeAnnotation;
+              const targetType = targetNode?.typeName?.name || targetNode?.typeName?.value || this.resolveType(targetNode);
+              typePredicate = { paramName, targetType };
+            }
+
             const unwrapped = this.unwrapType(decl.returnType);
             const typeName = unwrapped?.typeName?.name || unwrapped?.typeName?.value;
             if (typeName === "Promise") {
@@ -403,7 +605,11 @@ export class SemanticAnalyzer {
             returnType: innerReturnType,
             outerReturnType,
             typeParams,
+            typePredicate,
             node: decl,
+            hasRest,
+            minArgs: fixedCount,
+            restElemType,
           });
         }
       }
@@ -483,7 +689,8 @@ export class SemanticAnalyzer {
         // Parametre isim çakışması ve kayıt kontrolü
         const paramNames = new Set();
         for (const p of stmt.params || []) {
-          const pName = p.name || p.pattern?.name;
+          const isRest = p.type === "RestElement";
+          const pName = isRest ? (p.argument?.name || p.argument?.pattern?.name) : (p.name || p.pattern?.name);
           if (paramNames.has(pName)) {
             this.reporter.addError(
               this.currentFilePath,
@@ -493,7 +700,8 @@ export class SemanticAnalyzer {
           }
           paramNames.add(pName);
 
-          const pType = this.resolveType(p.typeAnnotation || p.pattern?.typeAnnotation);
+          const annot = isRest ? (p.typeAnnotation || p.argument?.typeAnnotation) : (p.typeAnnotation || p.pattern?.typeAnnotation);
+          const pType = this.resolveType(annot);
           this.scopeManager.registerSymbol(pName, {
             type: pType,
             isParam: true,
@@ -512,7 +720,8 @@ export class SemanticAnalyzer {
       }
 
       case "ClassDeclaration": {
-        const clsName = stmt.id.name;
+        const rawClsName = stmt.id.name;
+        const clsName = this.currentNamespace ? `${this.currentNamespace}_${rawClsName}` : rawClsName;
         const structMeta = this.builtins.structSignatures.get(clsName);
 
         // Üst sınıf kontrolü
@@ -547,11 +756,43 @@ export class SemanticAnalyzer {
           }
         }
 
+        // Somut sınıf ise üst sınıflardaki tüm soyut metotların ezilip ezilmediğini denetle
+        if (!structMeta.isAbstract) {
+          let currSuper = structMeta.superClass;
+          while (currSuper && this.builtins.structSignatures.has(currSuper)) {
+            const superMeta = this.builtins.structSignatures.get(currSuper);
+            if (superMeta.methods) {
+              for (const [mName, mMeta] of superMeta.methods.entries()) {
+                if (mMeta.isAbstract) {
+                  let isImplemented = false;
+                  let c = clsName;
+                  while (c && c !== currSuper && this.builtins.structSignatures.has(c)) {
+                    const sm = this.builtins.structSignatures.get(c);
+                    if (sm.methods?.has(mName) && !sm.methods.get(mName).isAbstract) {
+                      isImplemented = true;
+                      break;
+                    }
+                    c = sm.superClass;
+                  }
+                  if (!isImplemented) {
+                    this.reporter.addError(
+                      this.currentFilePath,
+                      stmt.id,
+                      `Somut sınıf '${clsName}', üst sınıftaki soyut metot '${mName}' metodunu uygulamalıdır (override etmelidir).`
+                    );
+                  }
+                }
+              }
+            }
+            currSuper = superMeta.superClass;
+          }
+        }
+
         this.scopeManager.enterScope({ isClass: true, classMeta: structMeta });
 
         // Sınıf alanları ve metot gövdelerini denetle
         for (const member of stmt.body?.body || []) {
-          if (member.type === "PropertyDefinition") {
+          if (member.type === "PropertyDefinition" || member.type === "TSAbstractPropertyDefinition") {
             if (member.value) {
               const propType = member.typeAnnotation ? this.resolveType(member.typeAnnotation) : null;
               const initType = this.inferExpressionType(member.value, propType);
@@ -563,28 +804,66 @@ export class SemanticAnalyzer {
                 );
               }
             }
-          } else if (member.type === "MethodDefinition") {
+          } else if (member.type === "MethodDefinition" || member.type === "TSAbstractMethodDefinition") {
             const mName = member.key?.name || member.key?.value;
             const isConstructor = member.kind === "constructor" || mName === "constructor";
-            const methodMeta = structMeta?.methods?.get(mName);
+            const isStatic = Boolean(member.static);
+            const isAbstract = member.type === "TSAbstractMethodDefinition" || Boolean(member.abstract) || !member.value?.body;
+
+            if (member.override) {
+              let foundInSuper = false;
+              let currSuper = structMeta.superClass;
+              while (currSuper && this.builtins.structSignatures.has(currSuper)) {
+                const superMeta = this.builtins.structSignatures.get(currSuper);
+                if (superMeta.methods?.has(mName)) {
+                  foundInSuper = true;
+                  break;
+                }
+                currSuper = superMeta.superClass;
+              }
+              if (!foundInSuper) {
+                this.reporter.addError(
+                  this.currentFilePath,
+                  member.key || member,
+                  `'${mName}' metodu 'override' olarak işaretlenmiş ancak üst sınıfta ezilecek bir metot bulunamadı.`
+                );
+              }
+            }
+
+            if (isAbstract) {
+              if (!structMeta.isAbstract) {
+                this.reporter.addError(
+                  this.currentFilePath,
+                  member.key || member,
+                  `Soyut metot '${mName}' yalnızca soyut ('abstract') sınıflar içinde tanımlanabilir.`
+                );
+              }
+              continue; // Soyut metotların gövdesi yoktur, analizi atla
+            }
+
+            const methodMeta = isStatic ? structMeta?.staticMethods?.get(mName) : structMeta?.methods?.get(mName);
             const retType = isConstructor ? "void" : methodMeta?.returnType || "void";
 
             this.scopeManager.enterScope({
               isFunction: true,
+              isStaticMethod: isStatic,
               expectedReturnType: retType,
               isConstructor,
             });
 
-            // Metot içinde 'this' sınıf tipini temsil eder
-            this.scopeManager.registerSymbol("this", {
-              type: clsName,
-              isConst: true,
-            });
+            // Metot içinde 'this' sınıf tipini temsil eder (Yalnızca instance metotlarda)
+            if (!isStatic) {
+              this.scopeManager.registerSymbol("this", {
+                type: clsName,
+                isConst: true,
+              });
+            }
 
             // Parametreleri kaydet
             const mParamNames = new Set();
             for (const p of member.value?.params || []) {
-              const pName = p.name || p.pattern?.name;
+              const isRest = p.type === "RestElement";
+              const pName = isRest ? (p.argument?.name || p.argument?.pattern?.name) : (p.name || p.pattern?.name);
               if (mParamNames.has(pName)) {
                 this.reporter.addError(
                   this.currentFilePath,
@@ -594,7 +873,8 @@ export class SemanticAnalyzer {
               }
               mParamNames.add(pName);
 
-              const pType = this.resolveType(p.typeAnnotation || p.pattern?.typeAnnotation);
+              const annot = isRest ? (p.typeAnnotation || p.argument?.typeAnnotation) : (p.typeAnnotation || p.pattern?.typeAnnotation);
+              const pType = this.resolveType(annot);
               this.scopeManager.registerSymbol(pName, {
                 type: pType,
                 isParam: true,
@@ -671,7 +951,10 @@ export class SemanticAnalyzer {
       case "IfStatement": {
         this.inferExpressionType(stmt.test, "boolean");
 
-        // Type Narrowing: if (typeof x === "string") veya if (typeof x === "number")
+        // Type Narrowing:
+        // 1. typeof x === "string" / "number"
+        // 2. hero instanceof Paladin
+        // 3. isPaladin(hero)
         let narrowedSymbol = null;
         if (
           stmt.test?.type === "BinaryExpression" &&
@@ -691,6 +974,44 @@ export class SemanticAnalyzer {
             const varName = unary.argument.name;
             const targetType = lit.value; // "string", "number", "boolean", "object"
             narrowedSymbol = { varName, targetType };
+          }
+        } else if (stmt.test?.type === "BinaryExpression" && stmt.test.operator === "instanceof") {
+          if (stmt.test.left?.type === "Identifier") {
+            let targetType = null;
+            if (stmt.test.right?.type === "Identifier") {
+              targetType = stmt.test.right.name;
+            } else if (stmt.test.right?.type === "MemberExpression") {
+              const chain = this.typeChecker.extractMemberChain(stmt.test.right);
+              if (chain) targetType = chain.join("_");
+            }
+            if (targetType) {
+              narrowedSymbol = { varName: stmt.test.left.name, targetType };
+            }
+          }
+        } else if (stmt.test?.type === "CallExpression") {
+          let fnName = stmt.test.callee?.name;
+          if (!fnName && stmt.test.callee?.type === "MemberExpression") {
+            const chain = this.typeChecker.extractMemberChain(stmt.test.callee);
+            if (chain) fnName = chain.join("_");
+          }
+          if (fnName) {
+            let fnMeta = this.builtins.functionSignatures.get(fnName);
+            if (!fnMeta && this.currentNamespace) {
+              const parts = this.currentNamespace.split("_");
+              for (let len = parts.length; len >= 1; len--) {
+                const c = `${parts.slice(0, len).join("_")}_${fnName}`;
+                if (this.builtins.functionSignatures.has(c)) {
+                  fnMeta = this.builtins.functionSignatures.get(c);
+                  break;
+                }
+              }
+            }
+            if (fnMeta && fnMeta.typePredicate) {
+              const arg = stmt.test.arguments?.[0];
+              if (arg && arg.type === "Identifier") {
+                narrowedSymbol = { varName: arg.name, targetType: fnMeta.typePredicate.targetType };
+              }
+            }
           }
         }
 
@@ -834,6 +1155,20 @@ export class SemanticAnalyzer {
 
       case "ExpressionStatement": {
         this.inferExpressionType(stmt.expression);
+        break;
+      }
+
+      case "TSModuleDeclaration": {
+        this.checkNamespace(stmt);
+        break;
+      }
+
+      case "EmptyStatement": {
+        break;
+      }
+
+      case "LabeledStatement": {
+        this.checkStatement(stmt.body);
         break;
       }
     }

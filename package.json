@@ -29,7 +29,6 @@
   },
   "dependencies": {
     "@oxc-parser/wasm": "^0.60.0",
-    "oxc-parser": "^0.151.0",
-    "typescript": "^7.0.2"
+    "oxc-parser": "^0.151.0"
   }
 }

@@ -19,57 +19,30 @@ export class ASTLowerer {
     this.enumRegistry = new Map();
     this.exportedFunctionNames = new Set();
 
-    // Generics Şablon Havuzları
-    this.genericClassTemplates = new Map();
-    this.genericFunctionTemplates = new Map();
-    this.genericTypeTemplates = new Map();
-    this.genericInterfaceTemplates = new Map();
-    this.specializedClasses = new Set();
-    this.specializedFunctions = new Set();
-    this.specializedTypes = new Set();
+    // Generics Şablon Havuzları ve Monomorphizer Entegrasyonu
+    this.monomorphizer = new Monomorphizer(this.enumRegistry, this.typeAliasRegistry);
     this.spawnRunners = new Map();
     this.globals = new Map();
     this.napiFunctions = [];
     this.asyncTaskContexts = new Map();
 
-    // Standart Kütüphane: Yerleşik Result<T, E = string> Şablonu
-    this.genericInterfaceTemplates.set("Result", {
-      type: "TSInterfaceDeclaration",
-      id: { type: "Identifier", name: "Result" },
-      typeParameters: {
-        params: [
-          { name: { name: "T" } },
-          { name: { name: "E" }, default: { type: "TSStringKeyword" } },
-        ],
-      },
-      body: {
-        type: "TSInterfaceBody",
-        body: [
-          {
-            type: "TSPropertySignature",
-            key: { name: "ok" },
-            typeAnnotation: { type: "TSTypeAnnotation", typeAnnotation: { type: "TSBooleanKeyword" } },
-          },
-          {
-            type: "TSPropertySignature",
-            key: { name: "value" },
-            typeAnnotation: { type: "TSTypeAnnotation", typeAnnotation: { type: "TSTypeReference", typeName: { name: "T" } } },
-          },
-          {
-            type: "TSPropertySignature",
-            key: { name: "error" },
-            typeAnnotation: { type: "TSTypeAnnotation", typeAnnotation: { type: "TSTypeReference", typeName: { name: "E" } } },
-          },
-        ],
-      },
-    });
-
     this.scopeStack = [];
     this.closureRegistry = new Map();
     this.thunkRegistry = new Map();
     this.requiredItables = new Map();
+    this.breakTargets = [];
+    this.continueTargets = [];
+    this.currentLoopLabel = null;
     this.builder.onAllocate = (ptr) => this.trackHeap(ptr);
   }
+
+  get genericClassTemplates() { return this.monomorphizer.genericClassTemplates; }
+  get genericFunctionTemplates() { return this.monomorphizer.genericFunctionTemplates; }
+  get genericTypeTemplates() { return this.monomorphizer.genericTypeTemplates; }
+  get genericInterfaceTemplates() { return this.monomorphizer.genericInterfaceTemplates; }
+  get specializedClasses() { return this.monomorphizer.specializedClasses; }
+  get specializedFunctions() { return this.monomorphizer.specializedFunctions; }
+  get specializedTypes() { return this.monomorphizer.specializedTypes; }
 
   getPragmas(node) {
     const pragmas = {
@@ -335,11 +308,135 @@ export class ASTLowerer {
     }
   }
 
+  cleanupScopesDownTo(targetDepth) {
+    for (let i = this.scopeStack.length - 1; i >= targetDepth; i--) {
+      const scope = this.scopeStack[i];
+      if (!scope) continue;
+
+      // 0. finally (defer) bloklarını ters sırada (LIFO) çalıştır
+      for (let j = (scope.deferrals || []).length - 1; j >= 0; j--) {
+        this.lowerStatement(scope.deferrals[j]);
+      }
+
+      // 1. using ile tanımlanan kaynakları ters sırada (LIFO) dispose et
+      for (let j = (scope.disposables || []).length - 1; j >= 0; j--) {
+        const d = scope.disposables[j];
+        if (!scope.transferred?.has(d.ptr)) {
+          this.emitDispose(d);
+        }
+      }
+
+      // 2. Kalan genel heap tahsislerini serbest bırak
+      for (const ptr of (scope.heapAllocations || [])) {
+        if (!scope.transferred?.has(ptr)) {
+          this.builder.emitFree(ptr);
+        }
+      }
+    }
+  }
+
   unwrapExport(node) {
     if ((node.type === "ExportNamedDeclaration" || node.type === "ExportDefaultDeclaration") && node.declaration) {
       return node.declaration;
     }
     return node;
+  }
+
+  getNamespaceName(idNode) {
+    if (!idNode) return "";
+    if (idNode.type === "Identifier") return idNode.name;
+    if (idNode.type === "TSQualifiedName") {
+      const left = this.getNamespaceName(idNode.left);
+      return left ? `${left}_${idNode.right.name}` : idNode.right.name;
+    }
+    return "";
+  }
+
+  extractMemberChain(node) {
+    if (!node) return null;
+    if (node.type === "Identifier") return [node.name];
+    if (node.type === "MemberExpression" && !node.computed) {
+      const objChain = this.extractMemberChain(node.object);
+      if (!objChain) return null;
+      const prop = node.property?.name || node.property?.value;
+      if (!prop) return null;
+      return [...objChain, prop];
+    }
+    return null;
+  }
+
+  resolveNamespaceGlobal(prefix, name) {
+    if (!prefix) return null;
+    const parts = prefix.split("_");
+    for (let len = parts.length; len >= 1; len--) {
+      const candidate = `${parts.slice(0, len).join("_")}_${name}`;
+      if (this.globals && this.globals.has(candidate)) return candidate;
+    }
+    return null;
+  }
+
+  resolveNamespaceFunction(prefix, name) {
+    if (!prefix) return null;
+    const parts = prefix.split("_");
+    for (let len = parts.length; len >= 1; len--) {
+      const candidate = `${parts.slice(0, len).join("_")}_${name}`;
+      if (this.functionRegistry && this.functionRegistry.has(candidate)) return candidate;
+    }
+    return null;
+  }
+
+  resolveNamespaceStruct(prefix, name) {
+    if (!prefix) return null;
+    const parts = prefix.split("_");
+    for (let len = parts.length; len >= 1; len--) {
+      const candidate = `${parts.slice(0, len).join("_")}_${name}`;
+      if (this.structRegistry && this.structRegistry.has(candidate)) return candidate;
+    }
+    return null;
+  }
+
+  flattenNamespaces(body, parentPrefix = "") {
+    const result = [];
+    for (const rawStmt of body) {
+      const isExported = rawStmt.type === "ExportNamedDeclaration" || rawStmt.type === "ExportDefaultDeclaration";
+      const stmt = this.unwrapExport(rawStmt);
+      if (stmt.type === "TSModuleDeclaration") {
+        const nsName = this.getNamespaceName(stmt.id);
+        const fullPrefix = parentPrefix ? `${parentPrefix}_${nsName}` : nsName;
+        const innerBody = stmt.body?.body || [];
+        const flattened = this.flattenNamespaces(innerBody, fullPrefix);
+        result.push(...flattened);
+      } else if (parentPrefix) {
+        if (stmt.type === "FunctionDeclaration" || stmt.type === "TSDeclareFunction") {
+          stmt.id.name = `${parentPrefix}_${stmt.id.name}`;
+          stmt._namespacePrefix = parentPrefix;
+          result.push(isExported ? rawStmt : stmt);
+        } else if (stmt.type === "VariableDeclaration") {
+          for (const decl of stmt.declarations) {
+            if (decl.id?.name) {
+              decl.id.name = `${parentPrefix}_${decl.id.name}`;
+            }
+          }
+          stmt._namespacePrefix = parentPrefix;
+          result.push(isExported ? rawStmt : stmt);
+        } else if (stmt.type === "ClassDeclaration") {
+          stmt.id.name = `${parentPrefix}_${stmt.id.name}`;
+          stmt._namespacePrefix = parentPrefix;
+          result.push(isExported ? rawStmt : stmt);
+        } else if (stmt.type === "TSEnumDeclaration") {
+          stmt.id.name = `${parentPrefix}_${stmt.id.name}`;
+          result.push(isExported ? rawStmt : stmt);
+        } else if (stmt.type === "TSInterfaceDeclaration" || stmt.type === "TSTypeAliasDeclaration") {
+          stmt.id.name = `${parentPrefix}_${stmt.id.name}`;
+          result.push(isExported ? rawStmt : stmt);
+        } else {
+          result.push(rawStmt);
+        }
+      } else {
+        result.push(rawStmt);
+      }
+    }
+    return result;
   }
 
   unwrapType(typeNode) {
@@ -461,34 +558,7 @@ export class ASTLowerer {
   }
 
   getTypeKey(typeNode) {
-    const t = this.unwrapType(typeNode);
-    if (!t) return "f64";
-    switch (t.type) {
-      case "TSNumberKeyword":
-        return "f64";
-      case "TSStringKeyword":
-        return "str";
-      case "TSBooleanKeyword":
-        return "bool";
-      case "TSVoidKeyword":
-        return "void";
-      case "TSTypeReference": {
-        const name = t.typeName?.name || t.typeName?.value;
-        if (["i64", "int64", "u64", "uint64"].includes(name)) return "i64";
-        if (["i32", "int32", "u32", "uint32", "int"].includes(name)) return "i32";
-        if (["f64", "double"].includes(name)) return "f64";
-        if (["f32", "float"].includes(name)) return "f32";
-        if (this.enumRegistry.has(name)) {
-          return this.enumRegistry.get(name).kind === "string" ? "str" : "i64";
-        }
-        if (this.typeAliasRegistry.has(name)) {
-          return this.getTypeKey(this.typeAliasRegistry.get(name));
-        }
-        return name || "ptr";
-      }
-      default:
-        return "f64";
-    }
+    return this.monomorphizer.getTypeKey(typeNode);
   }
 
   resolveType(typeNode) {
@@ -505,6 +575,8 @@ export class ASTLowerer {
     }
 
     switch (type.type) {
+      case "TSTypePredicate":
+        return "i1";
       case "TSNumberKeyword":
         return "f64";
       case "TSBooleanKeyword":
@@ -512,11 +584,12 @@ export class ASTLowerer {
       case "TSStringKeyword":
         return "!llvm.ptr";
       case "TSVoidKeyword":
+      case "TSNeverKeyword":
         return "none";
       case "TSArrayType":
         return "!llvm.ptr";
       case "TSTypeReference": {
-        const typeName = type.typeName?.name || type.typeName?.value;
+        const typeName = type.typeName?.name || type.typeName?.value || this.getNamespaceName(type.typeName);
         if (["Channel", "Arena", "Pool", "FixedBuffer", "pointer", "ptr"].includes(typeName)) return "!llvm.ptr";
         if (typeName === "f32x4") return "vector<4xf32>";
         if (typeName === "f64x2") return "vector<2xf64>";
@@ -568,7 +641,7 @@ export class ASTLowerer {
     const type = this.unwrapType(typeNode);
     if (!type) return null;
     if (type.type === "TSTypeReference") {
-      const typeName = type.typeName?.name || type.typeName?.value || null;
+      const typeName = type.typeName?.name || type.typeName?.value || this.getNamespaceName(type.typeName) || null;
       if (!typeName) return null;
       if (this.enumRegistry.has(typeName)) {
         return null;
@@ -591,7 +664,7 @@ export class ASTLowerer {
     const type = this.unwrapType(typeNode);
     if (!type) return null;
     if (type.type === "TSTypeReference") {
-      const typeName = type.typeName?.name || type.typeName?.value || null;
+      const typeName = type.typeName?.name || type.typeName?.value || this.getNamespaceName(type.typeName) || null;
       if (typeName && this.enumRegistry.has(typeName)) {
         return typeName;
       }
@@ -680,10 +753,18 @@ export class ASTLowerer {
     }
 
     // i8 conversions
+    if (targetType === "i8" && (val.type === "f64" || val.type === "f32")) {
+      const i32Val = this.coerceType(val, "i32");
+      return this.coerceType(i32Val, "i8");
+    }
     if (targetType === "i8" && (val.type === "i32" || val.type === "i64")) {
       const ssa = this.builder.nextSSA();
       this.builder.emit(`${ssa} = arith.trunci ${val.ssa || val.ptr} : ${val.type} to i8`);
       return { ssa, type: "i8" };
+    }
+    if ((targetType === "f64" || targetType === "f32") && val.type === "i8") {
+      const i32Val = this.coerceType(val, "i32");
+      return this.coerceType(i32Val, targetType);
     }
     if ((targetType === "i32" || targetType === "i64") && val.type === "i8") {
       const ssa = this.builder.nextSSA();
@@ -838,6 +919,86 @@ export class ASTLowerer {
     return null;
   }
 
+  getDescendantTypeIds(targetClassName) {
+    const ids = new Set();
+    const targetMeta = this.structRegistry.get(targetClassName);
+    if (targetMeta && targetMeta.typeId) {
+      ids.add(targetMeta.typeId);
+    }
+    for (const [name, meta] of this.structRegistry.entries()) {
+      if (meta.isClass && meta.typeId) {
+        let curr = meta;
+        while (curr && curr.superClass) {
+          if (curr.superClass === targetClassName) {
+            ids.add(meta.typeId);
+            break;
+          }
+          curr = this.structRegistry.get(curr.superClass);
+        }
+      }
+    }
+    return Array.from(ids);
+  }
+
+  extractNarrowingCheck(expr) {
+    if (!expr) return null;
+
+    // 1. typeof kontrolü (örn: typeof x === "number")
+    const typeofCheck = this.extractTypeofCheck(expr);
+    if (typeofCheck) {
+      return { kind: "typeof", ...typeofCheck };
+    }
+
+    // 2. instanceof kontrolü (örn: hero instanceof Paladin)
+    if (expr.type === "BinaryExpression" && expr.operator === "instanceof") {
+      let varName = null;
+      if (expr.left.type === "Identifier") {
+        varName = expr.left.name;
+      }
+      let targetType = null;
+      if (expr.right.type === "Identifier") {
+        targetType = expr.right.name;
+      } else if (expr.right.type === "MemberExpression") {
+        const chain = this.extractMemberChain(expr.right);
+        if (chain) targetType = chain.join("_");
+      }
+      if (targetType && !this.structRegistry.has(targetType) && this.currentFunctionNode?._namespacePrefix) {
+        const resolved = this.resolveNamespaceStruct(this.currentFunctionNode._namespacePrefix, targetType);
+        if (resolved) targetType = resolved;
+      }
+      if (varName && targetType) {
+        return { kind: "instanceof", varName, targetType };
+      }
+    }
+
+    // 3. Type Predicate Fonksiyon Çağrısı (örn: isPaladin(hero))
+    if (expr.type === "CallExpression") {
+      let calleeName = null;
+      if (expr.callee.type === "Identifier") {
+        calleeName = expr.callee.name;
+      } else if (expr.callee.type === "MemberExpression") {
+        const chain = this.extractMemberChain(expr.callee);
+        if (chain) calleeName = chain.join("_");
+      }
+      if (calleeName) {
+        const fnMeta = this.functionRegistry.get(calleeName);
+        if (fnMeta && fnMeta.typePredicate) {
+          const pIdx = fnMeta.params?.findIndex((p) => p.name === fnMeta.typePredicate.paramName) ?? 0;
+          const targetArg = expr.arguments?.[pIdx >= 0 ? pIdx : 0];
+          if (targetArg && targetArg.type === "Identifier") {
+            return {
+              kind: "predicate",
+              varName: targetArg.name,
+              targetType: fnMeta.typePredicate.targetType,
+            };
+          }
+        }
+      }
+    }
+
+    return null;
+  }
+
   walkAST(node, visitor) {
     LambdaLifter.walkAST(node, visitor);
   }
@@ -847,117 +1008,19 @@ export class ASTLowerer {
   }
 
   deepCloneWithSubst(node, substMap, specializedName) {
-    if (!node || typeof node !== "object") return node;
-
-    if (Array.isArray(node)) {
-      return node.map((item) => this.deepCloneWithSubst(item, substMap, specializedName));
-    }
-
-    if (node.type === "TSTypeReference") {
-      const typeName = node.typeName?.name || node.typeName?.value;
-      if (typeName && substMap.has(typeName)) {
-        return JSON.parse(JSON.stringify(substMap.get(typeName)));
-      }
-    }
-
-    const cloned = {};
-    for (const key of Object.keys(node)) {
-      cloned[key] = this.deepCloneWithSubst(node[key], substMap, specializedName);
-    }
-
-    if (
-      (cloned.type === "ClassDeclaration" ||
-        cloned.type === "FunctionDeclaration" ||
-        cloned.type === "TSInterfaceDeclaration" ||
-        cloned.type === "TSTypeAliasDeclaration") &&
-      specializedName
-    ) {
-      cloned.id = { type: "Identifier", name: specializedName };
-      delete cloned.typeParameters;
-      delete cloned.exportAlias;
-    }
-
-    return cloned;
+    return this.monomorphizer.deepCloneWithSubst(node, substMap, specializedName);
   }
 
   instantiateGenericClass(baseName, typeArgs) {
-    const templateNode = this.genericClassTemplates.get(baseName);
-    if (!templateNode) return baseName;
-
-    const typeKeys = typeArgs.map((t) => this.getTypeKey(t));
-    const specializedName = `${baseName}_${typeKeys.join("_")}`;
-
-    if (this.specializedClasses.has(specializedName)) {
-      return specializedName;
-    }
-    this.specializedClasses.add(specializedName);
-
-    const substMap = new Map();
-    const rawParams = templateNode.typeParameters?.params || [];
-    rawParams.forEach((param, i) => {
-      const pName = param.name?.name || param.name?.value || param.name || `T${i}`;
-      const concreteType = typeArgs[i] || { type: "TSNumberKeyword" };
-      substMap.set(pName, concreteType);
-    });
-
-    const specializedClassNode = this.deepCloneWithSubst(templateNode, substMap, specializedName);
-    return { specializedName, node: specializedClassNode };
+    return this.monomorphizer.instantiateGenericClass(baseName, typeArgs);
   }
 
   instantiateGenericFunction(baseName, typeArgs) {
-    const templateNode = this.genericFunctionTemplates.get(baseName);
-    if (!templateNode) return baseName;
-
-    const typeKeys = typeArgs.map((t) => this.getTypeKey(t));
-    const specializedName = `${baseName}_${typeKeys.join("_")}`;
-
-    if (this.specializedFunctions.has(specializedName)) {
-      return specializedName;
-    }
-    this.specializedFunctions.add(specializedName);
-
-    const substMap = new Map();
-    const rawParams = templateNode.typeParameters?.params || [];
-    rawParams.forEach((param, i) => {
-      const pName = param.name?.name || param.name?.value || param.name || `T${i}`;
-      const concreteType = typeArgs[i] || { type: "TSNumberKeyword" };
-      substMap.set(pName, concreteType);
-    });
-
-    const specializedFnNode = this.deepCloneWithSubst(templateNode, substMap, specializedName);
-    return { specializedName, node: specializedFnNode };
+    return this.monomorphizer.instantiateGenericFunction(baseName, typeArgs);
   }
 
   instantiateGenericStruct(baseName, typeArgs) {
-    const isInterface = this.genericInterfaceTemplates.has(baseName);
-    const templateNode = isInterface
-      ? this.genericInterfaceTemplates.get(baseName)
-      : this.genericTypeTemplates.get(baseName);
-
-    if (!templateNode) return baseName;
-
-    const rawParams = templateNode.typeParameters?.params || [];
-    const substMap = new Map();
-    const resolvedTypeArgs = [];
-
-    rawParams.forEach((param, i) => {
-      const pName = param.name?.name || param.name?.value || param.name || `T${i}`;
-      const defaultType = param.default || { type: "TSNumberKeyword" };
-      const concreteType = typeArgs[i] || defaultType;
-      substMap.set(pName, concreteType);
-      resolvedTypeArgs.push(concreteType);
-    });
-
-    const typeKeys = resolvedTypeArgs.map((t) => this.getTypeKey(t));
-    const specializedName = `${baseName}_${typeKeys.join("_")}`;
-
-    if (this.specializedTypes.has(specializedName)) {
-      return specializedName;
-    }
-    this.specializedTypes.add(specializedName);
-
-    const specializedNode = this.deepCloneWithSubst(templateNode, substMap, specializedName);
-    return { specializedName, node: specializedNode, isInterface };
+    return this.monomorphizer.instantiateGenericStruct(baseName, typeArgs);
   }
 
   isDirectMainCallStatement(stmt) {
@@ -984,6 +1047,12 @@ export class ASTLowerer {
     this.globals = new Map();
     this.requiredItables = new Map();
     this.syntheticDecorators = new Map();
+    this.staticFieldInitializers = [];
+
+    for (const mod of modules) {
+      mod.program.body = this.flattenNamespaces(mod.program.body);
+    }
+
     for (const mod of modules) {
       if (mod.syntheticDecorators) {
         for (const [k, v] of mod.syntheticDecorators) {
@@ -997,10 +1066,28 @@ export class ASTLowerer {
       this.currentComments = mod.comments || [];
       this.currentSyntheticDecorators = mod.syntheticDecorators || new Map();
       for (const rawNode of mod.program.body) {
+        const isExported = rawNode.type === "ExportNamedDeclaration" || rawNode.type === "ExportDefaultDeclaration";
         const node = this.unwrapExport(rawNode);
         if (node.type === "VariableDeclaration") {
           for (const decl of node.declarations) {
             const varName = decl.id.name;
+
+            if (mod.isEntry && !isExported && !node._namespacePrefix) {
+              let referencedInFunctions = false;
+              for (const other of mod.program.body) {
+                const unwrapOther = this.unwrapExport(other);
+                if (unwrapOther.type === "FunctionDeclaration" || unwrapOther.type === "ClassDeclaration") {
+                  this.walkAST(unwrapOther, (n) => {
+                    if (!referencedInFunctions && n.type === "Identifier" && n.name === varName) {
+                      referencedInFunctions = true;
+                    }
+                  });
+                }
+              }
+              if (!referencedInFunctions) {
+                continue;
+              }
+            }
             let type = "f64";
             let isString = false;
             let initVal = 0;
@@ -1008,32 +1095,33 @@ export class ASTLowerer {
             if (decl.id.typeAnnotation) {
               type = this.resolveType(decl.id.typeAnnotation);
               isString = this.isStringType(decl.id.typeAnnotation);
-            } else if (decl.init) {
+            }
+            if (decl.init) {
               if (decl.init.type === "BooleanLiteral" || (decl.init.type === "Literal" && typeof decl.init.value === "boolean")) {
-                type = "i1";
+                if (!decl.id.typeAnnotation) type = "i1";
                 initVal = Boolean(decl.init.value);
               } else if (decl.init.type === "NumericLiteral" || (decl.init.type === "Literal" && typeof decl.init.value === "number")) {
                 const raw = decl.init.raw || String(decl.init.value);
                 const isInt = !raw.includes(".") && Number.isInteger(decl.init.value);
-                type = isInt ? "i64" : "f64";
+                if (!decl.id.typeAnnotation) type = isInt ? "i64" : "f64";
                 initVal = decl.init.value;
               } else if (decl.init.type === "StringLiteral" || (decl.init.type === "Literal" && typeof decl.init.value === "string")) {
-                type = "!llvm.ptr";
+                if (!decl.id.typeAnnotation) type = "!llvm.ptr";
                 isString = true;
                 initVal = decl.init.value;
               } else if (decl.init.type === "TemplateLiteral") {
-                type = "!llvm.ptr";
+                if (!decl.id.typeAnnotation) type = "!llvm.ptr";
                 isString = true;
               } else if (decl.init.type === "NewExpression") {
-                type = "!llvm.ptr";
+                if (!decl.id.typeAnnotation) type = "!llvm.ptr";
                 structName = this.getStructName(decl.id.typeAnnotation) || decl.init.callee?.name;
               } else if (decl.init.type === "ObjectExpression") {
-                type = "!llvm.ptr";
-                structName = this.getStructName(decl.id.typeAnnotation) || this.inferStructName(decl.init);
+                if (!decl.id.typeAnnotation) type = "!llvm.ptr";
+                structName = this.getStructName(decl.id.typeAnnotation) || null;
               } else if (decl.init.type === "BinaryExpression" && decl.init.operator === "+") {
                 const isStr = (n) => n && (n.type === "StringLiteral" || (n.type === "Literal" && typeof n.value === "string") || n.type === "TemplateLiteral");
                 if (isStr(decl.init.left) || isStr(decl.init.right)) {
-                  type = "!llvm.ptr";
+                  if (!decl.id.typeAnnotation) type = "!llvm.ptr";
                   isString = true;
                 }
               }
@@ -1045,6 +1133,27 @@ export class ASTLowerer {
         }
       }
     }
+
+    // Global process.argv ve process.argc kayıtları
+    this.builder.registerGlobal("@g_process_argv", "!llvm.ptr", null);
+    this.builder.registerGlobal("@g_process_argc", "i32", null);
+    const argvGlobalMeta = {
+      name: "process_argv",
+      globalSym: "@g_process_argv",
+      type: "!llvm.ptr",
+      isArray: true,
+      elemType: "!llvm.ptr",
+      isString: true,
+    };
+    const argcGlobalMeta = {
+      name: "process_argc",
+      globalSym: "@g_process_argc",
+      type: "i32",
+    };
+    this.globals.set("process_argv", argvGlobalMeta);
+    this.globals.set("process_argc", argcGlobalMeta);
+    this.globals.set("Process_argv", { ...argvGlobalMeta, name: "Process_argv" });
+    this.globals.set("Process_argc", { ...argcGlobalMeta, name: "Process_argc" });
 
     const allParsedNodes = [];
     const entryTopLevelStatements = [];
@@ -1143,77 +1252,11 @@ export class ASTLowerer {
       allParsedNodes.push(l);
     }
 
-    const synthesizedClasses = [];
-    const synthesizedFunctions = [];
-
-    const scanAndSpecialize = (rootNode) => {
-      this.walkAST(rootNode, (n) => {
-        if (n.type === "TSTypeReference") {
-          const typeName = n.typeName?.name || n.typeName?.value;
-          const typeParams = n.typeParameters?.params || n.typeArguments?.params;
-          if (typeName && typeParams) {
-            if (this.genericClassTemplates.has(typeName)) {
-              const spec = this.instantiateGenericClass(typeName, typeParams);
-              if (spec && spec.node) {
-                synthesizedClasses.push(spec.node);
-              }
-              n.typeName.name = spec.specializedName || spec;
-              delete n.typeParameters;
-              delete n.typeArguments;
-            } else if (this.genericInterfaceTemplates.has(typeName) || this.genericTypeTemplates.has(typeName)) {
-              const spec = this.instantiateGenericStruct(typeName, typeParams);
-              if (spec && spec.node) {
-                if (spec.isInterface) {
-                  this.lowerInterface(spec.node);
-                } else {
-                  this.registerTypeAlias(spec.node);
-                }
-              }
-              n.typeName.name = spec.specializedName || spec;
-              delete n.typeParameters;
-              delete n.typeArguments;
-            }
-          }
-        } else if (n.type === "NewExpression") {
-          const calleeName = n.callee?.name;
-          const typeParams = n.typeParameters?.params || n.typeArguments?.params;
-          if (calleeName && this.genericClassTemplates.has(calleeName) && typeParams) {
-            const spec = this.instantiateGenericClass(calleeName, typeParams);
-            if (spec && spec.node) {
-              synthesizedClasses.push(spec.node);
-            }
-            n.callee.name = spec.specializedName || spec;
-            delete n.typeParameters;
-            delete n.typeArguments;
-          }
-        } else if (n.type === "CallExpression") {
-          const calleeName = n.callee?.name;
-          const typeParams = n.typeParameters?.params || n.typeArguments?.params;
-          if (calleeName && this.genericFunctionTemplates.has(calleeName) && typeParams) {
-            const spec = this.instantiateGenericFunction(calleeName, typeParams);
-            if (spec && spec.node) {
-              synthesizedFunctions.push(spec.node);
-            }
-            n.callee.name = spec.specializedName || spec;
-            delete n.typeParameters;
-            delete n.typeArguments;
-          }
-        }
-      });
-    };
-
-    for (const n of allParsedNodes) {
-      scanAndSpecialize(n);
-    }
-
-    for (const clsNode of synthesizedClasses) {
-      scanAndSpecialize(clsNode);
-      allParsedNodes.push(clsNode);
-    }
-    for (const fnNode of synthesizedFunctions) {
-      scanAndSpecialize(fnNode);
-      allParsedNodes.push(fnNode);
-    }
+    this.monomorphizer.specializeAll(
+      allParsedNodes,
+      (node) => this.lowerInterface(node),
+      (node) => this.registerTypeAlias(node)
+    );
 
     // 1. Enum'ları kaydet
     for (const node of allParsedNodes) {
@@ -1285,6 +1328,18 @@ export class ASTLowerer {
         const isRetFn = this.isFunctionType(effectiveRetNode);
         const retFnSig = isRetFn ? this.extractFunctionType(effectiveRetNode) : null;
 
+        let typePredicate = null;
+        const rawRetNode = this.unwrapType(effectiveRetNode) || effectiveRetNode;
+        if (rawRetNode && (rawRetNode.type === "TSTypePredicate" || rawRetNode.typeAnnotation?.type === "TSTypePredicate")) {
+          const predNode = rawRetNode.type === "TSTypePredicate" ? rawRetNode : rawRetNode.typeAnnotation;
+          const paramName = predNode.parameterName?.name;
+          const targetRef = predNode.typeAnnotation?.typeAnnotation || predNode.typeAnnotation;
+          const targetType = targetRef?.typeName?.name || targetRef?.name;
+          if (paramName && targetType) {
+            typePredicate = { paramName, targetType };
+          }
+        }
+
         const rawParams = Array.isArray(node.params)
           ? node.params
           : Array.isArray(node.params?.items)
@@ -1292,23 +1347,42 @@ export class ASTLowerer {
           : [];
         const params = [];
         const paramTypes = [];
+        let hasRest = false;
+        let restElemType = null;
 
         rawParams.forEach((param, i) => {
-          const typeAnnot = param.typeAnnotation || param.pattern?.typeAnnotation || param.id?.typeAnnotation;
+          const isRest = param.type === "RestElement";
+          const actualParam = isRest ? param.argument : param;
+          const pName = actualParam.name || actualParam.pattern?.name || actualParam.id?.name || `arg_${i}`;
+          const typeAnnot = param.typeAnnotation || actualParam.typeAnnotation || param.pattern?.typeAnnotation || actualParam.id?.typeAnnotation;
           const isFn = this.isFunctionType(typeAnnot);
           const fnSig = isFn ? this.extractFunctionType(typeAnnot) : null;
           const isUnion = this.isUnionType(typeAnnot);
           if (isUnion) {
             this.builder.markFeature("union");
           }
-          const isArr = this.unwrapType(typeAnnot)?.type === "TSArrayType";
-          const isStr = this.isStringType(typeAnnot);
+          const isArr = isRest || this.unwrapType(typeAnnot)?.type === "TSArrayType";
+          let arrElemType = "f64";
+          let isArrString = false;
+          if (isArr) {
+            const unwrappedArr = this.unwrapType(typeAnnot);
+            const elRaw = unwrappedArr ? this.unwrapType(unwrappedArr.elementType) : null;
+            if (elRaw && (elRaw.type === "TSStringKeyword" || elRaw.typeName?.name === "string")) {
+              arrElemType = "!llvm.ptr";
+              isArrString = true;
+            }
+          }
+          const isStr = isRest ? isArrString : this.isStringType(typeAnnot);
           const sName = this.getStructName(typeAnnot);
           const isPolyIface = this.isPolymorphicInterface(sName);
           const pType = isFn ? "!llvm.struct<(!llvm.ptr, !llvm.ptr)>" : isPolyIface ? "!llvm.struct<(!llvm.ptr, !llvm.ptr)>" : (isUnion || isArr || isStr) ? "!llvm.ptr" : this.resolveType(typeAnnot);
           const enumName = this.getEnumName(typeAnnot);
           const isChan = this.unwrapType(typeAnnot)?.typeName?.name === "Channel";
-          params.push({ name: param.name || `arg_${i}`, type: pType, structName: sName, isInterface: isPolyIface, isUnion, isArray: isArr, isFunction: isFn, isClosure: isFn, fnSig, enumName, isChannel: isChan, isString: isStr });
+          if (isRest) {
+            hasRest = true;
+            restElemType = arrElemType;
+          }
+          params.push({ name: pName, type: pType, structName: sName, isInterface: isPolyIface, isUnion, isArray: isArr, elemType: arrElemType, isFunction: isFn, isClosure: isFn, fnSig, enumName, isChannel: isChan, isString: isStr, isRest });
           paramTypes.push(pType);
         });
 
@@ -1340,7 +1414,7 @@ export class ASTLowerer {
 
         const declSig = retType === "none" ? `(${paramTypes.join(", ")})` : `(${paramTypes.join(", ")}) -> ${retType}`;
         const mlirType = `(${paramTypes.join(", ")}) -> ${retType === "none" ? "()" : retType}`;
-        const fnMeta = { isAsync, isDeclare, innerRetType, retType, structRetName, enumRetName, isRetString, isRetFn, retFnSig, params, paramTypes, mlirType, declSig, isClosure: Boolean(node.isClosure), taskContextMeta, exportAlias: node.exportAlias || null };
+        const fnMeta = { isAsync, isDeclare, innerRetType, retType, structRetName, enumRetName, isRetString, isRetFn, retFnSig, typePredicate, params, paramTypes, mlirType, declSig, isClosure: Boolean(node.isClosure), taskContextMeta, exportAlias: node.exportAlias || null, hasRest, restElemType };
         this.functionRegistry.set(funcName, fnMeta);
         if (node === userMainNode) {
           userMainMeta = fnMeta;
@@ -1374,7 +1448,85 @@ export class ASTLowerer {
 
     this.builder.block(mainHeader, () => {
       this.builder.hasTerminated = false;
+      this.isTopLevel = true;
+      this.scopeStack = [];
       this.enterScope(true, "i32");
+
+      // Global process.argc ve process.argv başlangıç atamaları
+      const argcAddr = this.builder.nextSSA();
+      this.builder.emit(`${argcAddr} = llvm.mlir.addressof @g_process_argc : !llvm.ptr`);
+      const argvAddr = this.builder.nextSSA();
+      this.builder.emit(`${argvAddr} = llvm.mlir.addressof @g_process_argv : !llvm.ptr`);
+
+      let processArgvPtrSSA = null;
+      if (isWasm) {
+        const c0_i32 = this.builder.createConstant(0, "i32");
+        this.builder.store(argcAddr, c0_i32);
+        const emptyArr = this.instantiateArray({ elements: [] }, "!llvm.ptr", true, null);
+        this.builder.store(argvAddr, emptyArr);
+        processArgvPtrSSA = emptyArr.ssa;
+      } else {
+        this.builder.store(argcAddr, { ssa: "%argc", type: "i32" });
+        this.builder.markFeature("heap");
+        this.builder.markFeature("strings");
+
+        const argcI64 = this.builder.nextSSA();
+        this.builder.emit(`${argcI64} = arith.extsi %argc : i32 to i64`);
+
+        const c8 = this.builder.nextSSA();
+        this.builder.emit(`${c8} = llvm.mlir.constant(8 : i64) : i64`);
+        const elemsSz = this.builder.nextSSA();
+        this.builder.emit(`${elemsSz} = arith.muli ${argcI64}, ${c8} : i64`);
+        const totalSz = this.builder.nextSSA();
+        this.builder.emit(`${totalSz} = arith.addi ${elemsSz}, ${c8} : i64`);
+
+        const arrPtr = this.builder.nextSSA();
+        this.builder.emit(`${arrPtr} = llvm.call @malloc(${totalSz}) : (i64) -> !llvm.ptr`);
+        this.builder.emit(`llvm.store ${argcI64}, ${arrPtr} : i64, !llvm.ptr`);
+
+        const c0Idx = this.builder.nextSSA();
+        this.builder.emit(`${c0Idx} = arith.constant 0 : index`);
+        const c1Idx = this.builder.nextSSA();
+        this.builder.emit(`${c1Idx} = arith.constant 1 : index`);
+        const limitIdx = this.builder.nextSSA();
+        this.builder.emit(`${limitIdx} = arith.index_cast %argc : i32 to index`);
+
+        this.builder.block(`scf.for %iv = ${c0Idx} to ${limitIdx} step ${c1Idx}`, () => {
+          const i64SSA = this.builder.nextSSA();
+          this.builder.emit(`${i64SSA} = arith.index_cast %iv : index to i64`);
+          const argvElemPtr = this.builder.nextSSA();
+          this.builder.emit(`${argvElemPtr} = llvm.getelementptr %argv[${i64SSA}] : (!llvm.ptr, i64) -> !llvm.ptr, !llvm.ptr`);
+          const strPtr = this.builder.nextSSA();
+          this.builder.emit(`${strPtr} = llvm.load ${argvElemPtr} : !llvm.ptr -> !llvm.ptr`);
+          const c1I64 = this.builder.nextSSA();
+          this.builder.emit(`${c1I64} = llvm.mlir.constant(1 : i64) : i64`);
+          const dstIdx = this.builder.nextSSA();
+          this.builder.emit(`${dstIdx} = arith.addi ${i64SSA}, ${c1I64} : i64`);
+          const dstElemPtr = this.builder.nextSSA();
+          this.builder.emit(`${dstElemPtr} = llvm.getelementptr ${arrPtr}[${dstIdx}] : (!llvm.ptr, i64) -> !llvm.ptr, !llvm.ptr`);
+          this.builder.emit(`llvm.store ${strPtr}, ${dstElemPtr} : !llvm.ptr, !llvm.ptr`);
+        });
+
+        this.builder.store(argvAddr, { ssa: arrPtr, ptr: arrPtr, type: "!llvm.ptr" });
+        processArgvPtrSSA = arrPtr;
+      }
+
+      for (const init of this.staticFieldInitializers) {
+        const val = this.lowerExpression(init.valueNode);
+        const addr = this.builder.nextSSA();
+        this.builder.emit(`${addr} = llvm.mlir.addressof ${init.globalSym} : !llvm.ptr`);
+        const coerced = this.coerceType(val, init.type);
+        this.builder.store(addr, coerced);
+        if (val.isArray) {
+          const g = this.globals.get(init.globalVarName);
+          if (g) {
+            g.isArray = true;
+            g.elemType = val.elemType || "f64";
+            g.isString = val.isString || false;
+            g.structName = val.structName || null;
+          }
+        }
+      }
 
       for (const stmt of nonEntryTopLevelStatements) {
         this.lowerStatement(stmt);
@@ -1415,51 +1567,7 @@ export class ASTLowerer {
           const isStringArray = (p0Meta.isArray && p0Meta.isString) || Boolean(arrMeta && arrMeta.isString);
 
           if (isStringArray) {
-            this.builder.markFeature("heap");
-            this.builder.markFeature("strings");
-            if (isWasm) {
-              const emptyArr = this.instantiateArray({ elements: [] }, "!llvm.ptr", true, null);
-              preparedArgs = [emptyArr];
-            } else {
-              const argcI64 = this.builder.nextSSA();
-              this.builder.emit(`${argcI64} = arith.extsi %argc : i32 to i64`);
-
-              const c8 = this.builder.nextSSA();
-              this.builder.emit(`${c8} = llvm.mlir.constant(8 : i64) : i64`);
-              const elemsSz = this.builder.nextSSA();
-              this.builder.emit(`${elemsSz} = arith.muli ${argcI64}, ${c8} : i64`);
-              const totalSz = this.builder.nextSSA();
-              this.builder.emit(`${totalSz} = arith.addi ${elemsSz}, ${c8} : i64`);
-
-              const arrPtr = this.builder.nextSSA();
-              this.builder.emit(`${arrPtr} = llvm.call @malloc(${totalSz}) : (i64) -> !llvm.ptr`);
-              this.builder.emit(`llvm.store ${argcI64}, ${arrPtr} : i64, !llvm.ptr`);
-
-              const c0Idx = this.builder.nextSSA();
-              this.builder.emit(`${c0Idx} = arith.constant 0 : index`);
-              const c1Idx = this.builder.nextSSA();
-              this.builder.emit(`${c1Idx} = arith.constant 1 : index`);
-              const limitIdx = this.builder.nextSSA();
-              this.builder.emit(`${limitIdx} = arith.index_cast %argc : i32 to index`);
-
-              this.builder.block(`scf.for %iv = ${c0Idx} to ${limitIdx} step ${c1Idx}`, () => {
-                const i64SSA = this.builder.nextSSA();
-                this.builder.emit(`${i64SSA} = arith.index_cast %iv : index to i64`);
-                const argvElemPtr = this.builder.nextSSA();
-                this.builder.emit(`${argvElemPtr} = llvm.getelementptr %argv[${i64SSA}] : (!llvm.ptr, i64) -> !llvm.ptr, !llvm.ptr`);
-                const strPtr = this.builder.nextSSA();
-                this.builder.emit(`${strPtr} = llvm.load ${argvElemPtr} : !llvm.ptr -> !llvm.ptr`);
-                const c1I64 = this.builder.nextSSA();
-                this.builder.emit(`${c1I64} = llvm.mlir.constant(1 : i64) : i64`);
-                const dstIdx = this.builder.nextSSA();
-                this.builder.emit(`${dstIdx} = arith.addi ${i64SSA}, ${c1I64} : i64`);
-                const dstElemPtr = this.builder.nextSSA();
-                this.builder.emit(`${dstElemPtr} = llvm.getelementptr ${arrPtr}[${dstIdx}] : (!llvm.ptr, i64) -> !llvm.ptr, !llvm.ptr`);
-                this.builder.emit(`llvm.store ${strPtr}, ${dstElemPtr} : !llvm.ptr, !llvm.ptr`);
-              });
-
-              preparedArgs = [{ ssa: arrPtr, ptr: arrPtr, type: "!llvm.ptr", isArray: true, isString: true }];
-            }
+            preparedArgs = [{ ssa: processArgvPtrSSA, ptr: processArgvPtrSSA, type: "!llvm.ptr", isArray: true, isString: true }];
           } else {
             const argcVal = isWasm ? this.builder.createConstant(0, "i32") : { ssa: "%argc", type: "i32" };
             const p0 = this.coerceType(argcVal, p0Meta.type);
@@ -1526,15 +1634,9 @@ export class ASTLowerer {
       this.exitScope();
 
       if (!this.builder.hasTerminated) {
-        if (!shouldCallUserMain || userMainMeta?.innerRetType === "none") {
-          if (!this.builder.targetInfo?.isWasm && (this.builder.usedFeatures.threads || this.builder.usedFeatures.channels)) {
-            const nullPtr = this.builder.nextSSA();
-            this.builder.emit(`${nullPtr} = llvm.mlir.zero : !llvm.ptr`);
-            this.builder.emit(`llvm.call @pthread_exit(${nullPtr}) : (!llvm.ptr) -> ()`);
-          }
-        }
         this.builder.createReturn({ ssa: exitCodeSSA, type: "i32" });
       }
+      this.isTopLevel = false;
     });
 
     this.emitItables();
@@ -2091,18 +2193,56 @@ export class ASTLowerer {
 
       const bodyElements = node.body?.body || [];
       const ownMethods = new Map();
+      const staticMethods = new Map();
+      const staticFields = new Map();
 
       for (const elem of bodyElements) {
-        if (elem.type === "PropertyDefinition") {
+        if (elem.type === "PropertyDefinition" || elem.type === "TSAbstractPropertyDefinition") {
           const fieldName = elem.key.name || elem.key.value;
           const fieldType = this.resolveType(elem.typeAnnotation);
           const structName = this.getStructName(elem.typeAnnotation);
           const isString = this.isStringType(elem.typeAnnotation);
-          fields.push({ name: fieldName, type: fieldType, structName, isString, index: fields.length });
-          types.push(fieldType);
-        } else if (elem.type === "MethodDefinition") {
+          const isArr = this.unwrapType(elem.typeAnnotation)?.type === "TSArrayType";
+          const arrMeta = isArr ? this.extractArrayTargetType(elem.typeAnnotation) : null;
+          const isArrString = Boolean(arrMeta?.isString);
+          const arrElemType = arrMeta?.elemType || "f64";
+
+          if (elem.static) {
+            const varName = `${name}_${fieldName}`;
+            const globalSym = `@g_${varName}`;
+            let initVal = 0;
+            if (elem.value) {
+              if (elem.value.type === "NumericLiteral" || (elem.value.type === "Literal" && typeof elem.value.value === "number")) {
+                initVal = elem.value.value;
+              } else if (elem.value.type === "BooleanLiteral" || (elem.value.type === "Literal" && typeof elem.value.value === "boolean")) {
+                initVal = Boolean(elem.value.value);
+              }
+            }
+            const isProcessBuiltin = (varName === "process_argc" || varName === "Process_argc" || varName === "process_argv" || varName === "Process_argv");
+            if (!isProcessBuiltin) {
+              this.globals.set(varName, { name: varName, globalSym, type: fieldType, isString: isString || isArrString, isArray: isArr, elemType: arrElemType, initVal, structName });
+              this.builder.registerGlobal(globalSym, fieldType, initVal);
+            }
+            staticFields.set(fieldName, { name: fieldName, type: fieldType, structName, isString: isString || isArrString, isArray: isArr, elemType: arrElemType, globalSym: isProcessBuiltin ? (varName.endsWith("argc") ? "@g_process_argc" : "@g_process_argv") : globalSym });
+            if (elem.value) {
+              this.staticFieldInitializers.push({
+                globalVarName: varName,
+                globalSym,
+                type: fieldType,
+                valueNode: elem.value,
+                isString: isString || isArrString,
+                structName,
+              });
+            }
+          } else {
+            fields.push({ name: fieldName, type: fieldType, structName, isString: isString || isArrString, isArray: isArr, elemType: arrElemType, index: fields.length });
+            types.push(fieldType);
+          }
+        } else if (elem.type === "MethodDefinition" || elem.type === "TSAbstractMethodDefinition") {
           const mName = elem.key.name || elem.key.value;
           const isConstructor = elem.kind === "constructor";
+          const isStatic = Boolean(elem.static);
+          const isAbstract = Boolean(elem.abstract || elem.type === "TSAbstractMethodDefinition");
           const retType = isConstructor ? "none" : this.resolveType(elem.value?.returnType);
           const structRetName = isConstructor ? name : this.getStructName(elem.value?.returnType);
           const isRetString = !isConstructor && this.isStringType(elem.value?.returnType);
@@ -2113,27 +2253,80 @@ export class ASTLowerer {
             ? elem.value.params.items
             : [];
           const params = [];
+          let hasRest = false;
+          let restElemType = null;
           rawParams.forEach((param, i) => {
-            const pName = param.name || param.pattern?.name || param.id?.name || `arg_${i}`;
-            const typeAnnot = param.typeAnnotation || param.pattern?.typeAnnotation || param.id?.typeAnnotation;
+            const isRest = param.type === "RestElement";
+            const actualParam = isRest ? param.argument : param;
+            const pName = actualParam.name || actualParam.pattern?.name || actualParam.id?.name || `arg_${i}`;
+            const typeAnnot = param.typeAnnotation || actualParam.typeAnnotation || param.pattern?.typeAnnotation || actualParam.id?.typeAnnotation;
             const isFn = this.isFunctionType(typeAnnot);
             const fnSig = isFn ? this.extractFunctionType(typeAnnot) : null;
             const isUnion = this.isUnionType(typeAnnot);
-            const isArr = this.unwrapType(typeAnnot)?.type === "TSArrayType";
-            const pType = isFn ? fnSig.mlirType : (isUnion || isArr) ? "!llvm.ptr" : this.resolveType(typeAnnot);
-            params.push({ name: pName, type: pType, isUnion, isArray: isArr, isFunction: isFn, fnSig });
+            const isArr = isRest || this.unwrapType(typeAnnot)?.type === "TSArrayType";
+            let arrElemType = "f64";
+            let isArrString = false;
+            if (isArr) {
+              const unwrappedArr = this.unwrapType(typeAnnot);
+              const elRaw = unwrappedArr ? this.unwrapType(unwrappedArr.elementType) : null;
+              if (elRaw && (elRaw.type === "TSStringKeyword" || elRaw.typeName?.name === "string")) {
+                arrElemType = "!llvm.ptr";
+                isArrString = true;
+              }
+            }
+            const isStr = isRest ? isArrString : this.isStringType(typeAnnot);
+            const pType = isFn ? fnSig.mlirType : (isUnion || isArr || isStr) ? "!llvm.ptr" : this.resolveType(typeAnnot);
+            if (isRest) {
+              hasRest = true;
+              restElemType = arrElemType;
+            }
+            params.push({ name: pName, type: pType, isUnion, isArray: isArr, elemType: arrElemType, isString: isStr, isRest, isFunction: isFn, fnSig });
           });
 
-          ownMethods.set(mName, {
+          const mMeta = {
             name: mName,
             className: name,
             isConstructor,
+            isStatic,
+            isAbstract,
             retType,
             structRetName,
             isRetString,
+            hasRest,
+            restElemType,
             params,
             node: elem,
-          });
+          };
+
+          if (isStatic) {
+            staticMethods.set(mName, mMeta);
+            const fnName = `${name}_${mName}`;
+            const paramTypes = params.map((p) => p.type);
+            const declSig = retType === "none" ? `(${paramTypes.join(", ")})` : `(${paramTypes.join(", ")}) -> ${retType}`;
+            const mlirType = `(${paramTypes.join(", ")}) -> ${retType === "none" ? "()" : retType}`;
+            this.functionRegistry.set(fnName, {
+              isAsync: false,
+              isDeclare: false,
+              innerRetType: retType,
+              retType,
+              structRetName,
+              enumRetName: null,
+              isRetString,
+              isRetFn: false,
+              retFnSig: null,
+              hasRest,
+              restElemType,
+              params,
+              paramTypes,
+              mlirType,
+              declSig,
+              isClosure: false,
+              taskContextMeta: null,
+              exportAlias: null,
+            });
+          } else {
+            ownMethods.set(mName, mMeta);
+          }
         }
       }
 
@@ -2146,7 +2339,10 @@ export class ASTLowerer {
         types,
         mlirType,
         methods: ownMethods,
+        staticMethods,
+        staticFields,
         isClass: true,
+        isAbstract: Boolean(node.abstract),
       });
     }
   }
@@ -2160,9 +2356,11 @@ export class ASTLowerer {
     const bodyElements = node.body?.body || [];
 
     for (const elem of bodyElements) {
-      if (elem.type !== "MethodDefinition") continue;
+      if (elem.type !== "MethodDefinition" && elem.type !== "TSAbstractMethodDefinition") continue;
+      if (elem.abstract || elem.type === "TSAbstractMethodDefinition" || !elem.value?.body) continue;
 
       const isConstructor = elem.kind === "constructor";
+      const isStatic = Boolean(elem.static);
       const methodName = elem.key.name || elem.key.value;
       const fnName = isConstructor ? `${className}_constructor` : `${className}_${methodName}`;
 
@@ -2173,26 +2371,28 @@ export class ASTLowerer {
         ? fnExpr.params.items
         : [];
 
-      const paramStrings = [`%arg_this: !llvm.ptr`];
-      const params = [{ name: "this", ssa: "%arg_this", type: "!llvm.ptr", structName: className }];
+      const paramStrings = isStatic ? [] : [`%arg_this: !llvm.ptr`];
+      const params = isStatic ? [] : [{ name: "this", ssa: "%arg_this", type: "!llvm.ptr", structName: className }];
 
       rawParams.forEach((param, i) => {
-        const pName = param.name || param.pattern?.name || param.id?.name || `arg_${i}`;
-        const typeAnnot = param.typeAnnotation || param.pattern?.typeAnnotation || param.id?.typeAnnotation;
+        const isRest = param.type === "RestElement";
+        const actualParam = isRest ? param.argument : param;
+        const pName = actualParam.name || actualParam.pattern?.name || actualParam.id?.name || `arg_${i}`;
+        const typeAnnot = param.typeAnnotation || actualParam.typeAnnotation || param.pattern?.typeAnnotation || actualParam.id?.typeAnnotation;
         const isFn = this.isFunctionType(typeAnnot);
         const fnSig = isFn ? this.extractFunctionType(typeAnnot) : null;
         const isUnion = this.isUnionType(typeAnnot);
-        const isArr = this.unwrapType(typeAnnot)?.type === "TSArrayType";
+        const isArr = isRest || this.unwrapType(typeAnnot)?.type === "TSArrayType";
         let arrElemType = "f64";
         let isArrString = false;
         let arrStruct = null;
         if (isArr) {
           const unwrappedArr = this.unwrapType(typeAnnot);
-          const elRaw = this.unwrapType(unwrappedArr.elementType);
-          if (elRaw.type === "TSStringKeyword") {
+          const elRaw = unwrappedArr ? this.unwrapType(unwrappedArr.elementType) : null;
+          if (elRaw && (elRaw.type === "TSStringKeyword" || elRaw.typeName?.name === "string")) {
             arrElemType = "!llvm.ptr";
             isArrString = true;
-          } else if (elRaw.type === "TSTypeReference") {
+          } else if (elRaw && elRaw.type === "TSTypeReference") {
             const tName = elRaw.typeName?.name || elRaw.typeName?.value;
             if (["i32", "int32", "u32", "int"].includes(tName)) arrElemType = "i32";
             else if (["i64", "int64", "u64"].includes(tName)) arrElemType = "i64";
@@ -2202,39 +2402,47 @@ export class ASTLowerer {
               arrElemType = isPoly ? "!llvm.struct<(!llvm.ptr, !llvm.ptr)>" : "!llvm.ptr";
               arrStruct = tName;
             }
-          } else if (elRaw.type === "TSNumberKeyword") {
+          } else if (elRaw && elRaw.type === "TSNumberKeyword") {
             arrElemType = "f64";
-          } else if (elRaw.type === "TSBooleanKeyword") {
+          } else if (elRaw && elRaw.type === "TSBooleanKeyword") {
             arrElemType = "i1";
           }
         }
-        const isStr = this.isStringType(typeAnnot);
+        const isStr = isRest ? isArrString : this.isStringType(typeAnnot);
         const structName = this.getStructName(typeAnnot);
         const isPolyIface = this.isPolymorphicInterface(structName);
         const pType = isFn ? fnSig.mlirType : isPolyIface ? "!llvm.struct<(!llvm.ptr, !llvm.ptr)>" : (isUnion || isArr || isStr) ? "!llvm.ptr" : this.resolveType(typeAnnot);
         const ssaArg = `%arg_${pName}`;
 
         paramStrings.push(`${ssaArg}: ${pType}`);
-        params.push({ name: pName, ssa: ssaArg, type: pType, structName, isInterface: isPolyIface, isUnion, isArray: isArr, elemType: arrElemType, isString: isStr || isArrString, arrStruct, isFunction: isFn, fnSig, typeAnnot });
+        params.push({ name: pName, ssa: ssaArg, type: pType, structName, isInterface: isPolyIface, isUnion, isArray: isArr, elemType: arrElemType, isString: isStr || isArrString, arrStruct, isFunction: isFn, fnSig, typeAnnot, isRest });
       });
 
       const retType = isConstructor ? "none" : this.resolveType(fnExpr.returnType);
+      const structRetName = isConstructor ? null : this.getStructName(fnExpr.returnType);
       const sig = retType === "none" ? "" : ` -> ${retType}`;
 
       this.builder.block(`func.func @${fnName}(${paramStrings.join(", ")})${sig}`, () => {
+        this.builder.hasTerminated = false;
+        if (node._namespacePrefix) {
+          elem.value._namespacePrefix = node._namespacePrefix;
+        }
+        const prevFuncNode = this.currentFunctionNode;
         this.currentFunctionNode = elem.value;
-        this.enterScope(true, retType);
+        this.enterScope(true, retType, structRetName);
 
         const prevSyms = new Map(this.symbolTable);
         this.symbolTable.clear();
 
-        this.symbolTable.set("this", {
-          ptr: "%arg_this",
-          ssa: "%arg_this",
-          type: "!llvm.ptr",
-          structName: className,
-          isRef: true,
-        });
+        if (!isStatic) {
+          this.symbolTable.set("this", {
+            ptr: "%arg_this",
+            ssa: "%arg_this",
+            type: "!llvm.ptr",
+            structName: className,
+            isRef: true,
+          });
+        }
 
         for (const p of params) {
           if (p.name === "this") continue;
@@ -2298,14 +2506,26 @@ export class ASTLowerer {
           }
         }
 
-        if (retType === "none") {
-          this.exitScope();
-          this.builder.createReturn();
+        if (!this.builder.hasTerminated) {
+          if (retType === "none") {
+            this.exitScope();
+            this.builder.createReturn();
+          } else if (retType === "!llvm.ptr") {
+            const nullPtr = this.builder.nextSSA();
+            this.builder.emit(`${nullPtr} = llvm.mlir.zero : !llvm.ptr`);
+            this.exitScope();
+            this.builder.createReturn({ ssa: nullPtr, type: "!llvm.ptr" });
+          } else {
+            const defVal = this.builder.createConstant(0, retType);
+            this.exitScope();
+            this.builder.createReturn(defVal);
+          }
         } else if (this.scopeStack.length > 0 && this.scopeStack[this.scopeStack.length - 1].isFunction) {
           this.scopeStack.pop();
         }
 
         this.symbolTable = prevSyms;
+        this.currentFunctionNode = prevFuncNode;
       });
     }
   }
@@ -2328,25 +2548,27 @@ export class ASTLowerer {
       : [];
 
     rawParams.forEach((param, i) => {
-      const pName = param.name || param.pattern?.name || param.id?.name || `arg_${i}`;
-      const typeAnnot = param.typeAnnotation || param.pattern?.typeAnnotation || param.id?.typeAnnotation;
+      const isRest = param.type === "RestElement";
+      const actualParam = isRest ? param.argument : param;
+      const pName = actualParam.name || actualParam.pattern?.name || actualParam.id?.name || `arg_${i}`;
+      const typeAnnot = param.typeAnnotation || actualParam.typeAnnotation || param.pattern?.typeAnnotation || actualParam.id?.typeAnnotation;
       const isFn = this.isFunctionType(typeAnnot);
       const fnSig = isFn ? this.extractFunctionType(typeAnnot) : null;
       const isUnion = this.isUnionType(typeAnnot);
       if (isUnion) {
         this.builder.markFeature("union");
       }
-      const isArr = this.unwrapType(typeAnnot)?.type === "TSArrayType";
+      const isArr = isRest || this.unwrapType(typeAnnot)?.type === "TSArrayType";
       let arrElemType = "f64";
       let isArrString = false;
       let arrStruct = null;
       if (isArr) {
         const unwrappedArr = this.unwrapType(typeAnnot);
-        const elRaw = this.unwrapType(unwrappedArr.elementType);
-        if (elRaw.type === "TSStringKeyword") {
+        const elRaw = unwrappedArr ? this.unwrapType(unwrappedArr.elementType) : null;
+        if (elRaw && (elRaw.type === "TSStringKeyword" || elRaw.typeName?.name === "string")) {
           arrElemType = "!llvm.ptr";
           isArrString = true;
-        } else if (elRaw.type === "TSTypeReference") {
+        } else if (elRaw && elRaw.type === "TSTypeReference") {
           const tName = elRaw.typeName?.name || elRaw.typeName?.value;
           if (["i32", "int32", "u32", "int"].includes(tName)) arrElemType = "i32";
           else if (["i64", "int64", "u64"].includes(tName)) arrElemType = "i64";
@@ -2356,14 +2578,14 @@ export class ASTLowerer {
             arrElemType = isPoly ? "!llvm.struct<(!llvm.ptr, !llvm.ptr)>" : "!llvm.ptr";
             arrStruct = tName;
           }
-        } else if (elRaw.type === "TSNumberKeyword") {
+        } else if (elRaw && elRaw.type === "TSNumberKeyword") {
           arrElemType = "f64";
-        } else if (elRaw.type === "TSBooleanKeyword") {
+        } else if (elRaw && elRaw.type === "TSBooleanKeyword") {
           arrElemType = "i1";
         }
       }
       const isChan = this.unwrapType(typeAnnot)?.typeName?.name === "Channel";
-      const isStr = this.isStringType(typeAnnot);
+      const isStr = isRest ? isArrString : this.isStringType(typeAnnot);
       const structName = this.getStructName(typeAnnot);
       const isPolyIface = this.isPolymorphicInterface(structName);
       const pType = isFn ? "!llvm.struct<(!llvm.ptr, !llvm.ptr)>" : isPolyIface ? "!llvm.struct<(!llvm.ptr, !llvm.ptr)>" : (isUnion || isArr || isChan || isStr) ? "!llvm.ptr" : this.resolveType(typeAnnot);
@@ -2371,7 +2593,7 @@ export class ASTLowerer {
       const ssaArg = `%arg_${pName}`;
       paramStrings.push(`${ssaArg}: ${pType}`);
       paramTypes.push(pType);
-      params.push({ name: pName, ssa: ssaArg, type: pType, structName, isInterface: isPolyIface, isUnion, isArray: isArr, elemType: arrElemType, isString: isStr || isArrString, arrStruct, isFunction: isFn, isClosure: isFn, fnSig, typeAnnot, isChannel: isChan });
+      params.push({ name: pName, ssa: ssaArg, type: pType, structName, isInterface: isPolyIface, isUnion, isArray: isArr, elemType: arrElemType, isString: isStr || isArrString, arrStruct, isFunction: isFn, isClosure: isFn, fnSig, typeAnnot, isChannel: isChan, isRest });
     });
 
     const innerRetType = fnMeta?.innerRetType || "f64";
@@ -2410,9 +2632,22 @@ export class ASTLowerer {
           }
         }
 
-        if (innerRetType === "none") {
-          this.exitScope();
-          this.builder.createReturn();
+        if (!this.builder.hasTerminated) {
+          if (innerRetType === "none") {
+            this.exitScope();
+            this.builder.createReturn();
+          } else if (innerRetType === "!llvm.ptr") {
+            const nullPtr = this.builder.nextSSA();
+            this.builder.emit(`${nullPtr} = llvm.mlir.zero : !llvm.ptr`);
+            this.exitScope();
+            this.builder.createReturn({ ssa: nullPtr, type: "!llvm.ptr" });
+          } else {
+            const defVal = this.builder.createConstant(0, innerRetType);
+            this.exitScope();
+            this.builder.createReturn(defVal);
+          }
+        } else if (this.scopeStack.length > 0 && this.scopeStack[this.scopeStack.length - 1].isFunction) {
+          this.scopeStack.pop();
         }
         this.symbolTable = prevSyms;
       });
@@ -2509,6 +2744,7 @@ export class ASTLowerer {
 
     const sig = retType === "none" ? "" : ` -> ${retType}`;
     this.builder.block(`func.func @${effectiveFnName}(${paramStrings.join(", ")})${sig}${attrStr}`, () => {
+      const prevFuncNode = this.currentFunctionNode;
       this.currentFunctionNode = node;
       this.builder.hasTerminated = false;
       this.enterScope(true, retType, structRetName);
@@ -2636,6 +2872,7 @@ export class ASTLowerer {
       }
 
       this.symbolTable = prevSyms;
+      this.currentFunctionNode = prevFuncNode;
     });
   }
 
@@ -2729,6 +2966,7 @@ export class ASTLowerer {
         this.builder.createIf(
           isNull,
           () => {
+            this.builder.markFeature("printf");
             const fmtErr = this.builder.nextSSA();
             this.builder.emit(`${fmtErr} = llvm.mlir.addressof @fmt_uncaught_err : !llvm.ptr`);
             this.builder.emit(`llvm.call @printf(${fmtErr}, ${excVal.ssa || excVal.ptr}) {var_callee_type = !llvm.func<i32 (!llvm.ptr, ...)>} : (!llvm.ptr, !llvm.ptr) -> i32`);
@@ -2769,7 +3007,7 @@ export class ASTLowerer {
           }
 
           // Modül seviyesinde küresel bir değişkense:
-          if (this.globals && this.globals.has(varName) && this.scopeStack.length === 1) {
+          if (!isUnion && this.isTopLevel && !this.currentFunctionNode && this.globals && this.globals.has(varName) && this.scopeStack.length === 1) {
             const g = this.globals.get(varName);
             if (decl.init) {
               let val;
@@ -2814,6 +3052,23 @@ export class ASTLowerer {
                 g.isString = true;
                 g.type = "!llvm.ptr";
               }
+              this.symbolTable.set(varName, {
+                ptr: addr,
+                ssa: (val.isFunction || val.isClosure) ? null : addr,
+                type: g.type,
+                isGlobal: true,
+                isSlot: true,
+                structName: g.structName,
+                isString: g.isString,
+                isArray: g.isArray,
+                elemType: g.elemType,
+                isMap: Boolean(g.isMap || val.isMap),
+                isSet: Boolean(g.isSet || val.isSet),
+                valType: val.valType,
+                isFunction: Boolean(val.isFunction || val.isClosure),
+                isClosure: Boolean(val.isClosure || val.isFunction),
+                fnSig: val.fnSig,
+              });
             }
             continue;
           }
@@ -2968,6 +3223,7 @@ export class ASTLowerer {
                   isSlot: true,
                   isHeap: val.isHeap,
                   isStack: val.isStack,
+                  origPtr: val.origPtr || val.ssa || val.ptr,
                 });
               } else {
                 this.symbolTable.set(varName, {
@@ -2975,6 +3231,7 @@ export class ASTLowerer {
                   type: "!llvm.ptr",
                   structName: val.structName,
                   isRef: true,
+                  origPtr: val.origPtr || val.ssa || val.ptr,
                 });
               }
             } else {
@@ -2992,6 +3249,7 @@ export class ASTLowerer {
                     isSlot: true,
                     isHeap: val.isHeap,
                     isStack: val.isStack,
+                    origPtr: val.origPtr || val.ssa || val.ptr,
                   });
                 } else {
                   this.symbolTable.set(varName, {
@@ -3001,6 +3259,7 @@ export class ASTLowerer {
                     isRef: true,
                     isHeap: val.isHeap,
                     isStack: val.isStack,
+                    origPtr: val.origPtr || val.ssa || val.ptr,
                   });
                 }
 
@@ -3130,6 +3389,18 @@ export class ASTLowerer {
         break;
       }
 
+      case "EmptyStatement": {
+        break;
+      }
+
+      case "LabeledStatement": {
+        const prevLabel = this.currentLoopLabel;
+        this.currentLoopLabel = stmt.label?.name || null;
+        this.lowerStatement(stmt.body);
+        this.currentLoopLabel = prevLabel;
+        break;
+      }
+
       case "ForStatement": {
         this.enterScope(false);
         if (stmt.init) {
@@ -3139,42 +3410,410 @@ export class ASTLowerer {
             this.lowerExpression(stmt.init);
           }
         }
-        this.builder.createWhile(
-          () => (stmt.test ? this.lowerExpression(stmt.test) : this.builder.createConstant(1, "i1")),
-          () => {
-            this.enterScope(false);
-            this.lowerStatement(stmt.body);
-            if (stmt.update) {
-              this.lowerExpression(stmt.update);
-            }
-            this.exitScope();
-          }
+
+        const condBlock = this.builder.nextBlock("for_cond");
+        const bodyBlock = this.builder.nextBlock("for_body");
+        const stepBlock = this.builder.nextBlock("for_step");
+        const exitBlock = this.builder.nextBlock("for_exit");
+        const bodyDepth = this.scopeStack.length;
+
+        const loopLabel = this.currentLoopLabel;
+        this.currentLoopLabel = null;
+        this.breakTargets.push({ label: exitBlock, cleanupDepth: bodyDepth, name: loopLabel });
+        this.continueTargets.push({ label: stepBlock, cleanupDepth: bodyDepth, name: loopLabel });
+
+        this.builder.emitBranch(condBlock);
+
+        this.builder.emitBlockLabel(condBlock);
+        this.builder.hasTerminated = false;
+        const cond = stmt.test ? this.lowerExpression(stmt.test) : this.builder.createConstant(1, "i1");
+        this.builder.emitBranchConditional(cond.ssa, bodyBlock, exitBlock);
+
+        this.builder.emitBlockLabel(bodyBlock);
+        this.builder.hasTerminated = false;
+        this.enterScope(false);
+        this.lowerStatement(stmt.body);
+        this.exitScope();
+        if (!this.builder.hasTerminated) {
+          this.builder.emitBranch(stepBlock);
+        }
+
+        this.builder.emitBlockLabel(stepBlock);
+        this.builder.hasTerminated = false;
+        if (stmt.update) {
+          this.lowerExpression(stmt.update);
+        }
+        this.builder.emitBranch(condBlock);
+
+        this.builder.emitBlockLabel(exitBlock);
+        this.builder.hasTerminated = false;
+
+        this.continueTargets.pop();
+        this.breakTargets.pop();
+        this.exitScope();
+        break;
+      }
+
+      case "ForOfStatement": {
+        this.enterScope(false);
+        const arr = this.lowerExpression(stmt.right);
+        const lenSSA = this.builder.nextSSA();
+        this.builder.emit(`${lenSSA} = llvm.load ${arr.ptr || arr.ssa} : !llvm.ptr -> i64`);
+
+        const idxSlot = this.builder.allocateStack("i64");
+        const c0 = this.builder.createConstant(0, "i64");
+        this.builder.store(idxSlot.ptr, c0);
+
+        const condBlock = this.builder.nextBlock("for_of_cond");
+        const bodyBlock = this.builder.nextBlock("for_of_body");
+        const stepBlock = this.builder.nextBlock("for_of_step");
+        const exitBlock = this.builder.nextBlock("for_of_exit");
+        const bodyDepth = this.scopeStack.length;
+
+        const loopLabel = this.currentLoopLabel;
+        this.currentLoopLabel = null;
+        this.breakTargets.push({ label: exitBlock, cleanupDepth: bodyDepth, name: loopLabel });
+        this.continueTargets.push({ label: stepBlock, cleanupDepth: bodyDepth, name: loopLabel });
+
+        this.builder.emitBranch(condBlock);
+
+        this.builder.emitBlockLabel(condBlock);
+        this.builder.hasTerminated = false;
+        const curIdx = this.builder.load(idxSlot.ptr, "i64");
+        const condSSA = this.builder.nextSSA();
+        this.builder.emit(`${condSSA} = arith.cmpi slt, ${curIdx.ssa}, ${lenSSA} : i64`);
+        this.builder.emitBranchConditional(condSSA, bodyBlock, exitBlock);
+
+        this.builder.emitBlockLabel(bodyBlock);
+        this.builder.hasTerminated = false;
+        this.enterScope(false);
+
+        const curIdxForElem = this.builder.load(idxSlot.ptr, "i64");
+        const elemType = arr.elemType || "f64";
+        const isI32 = elemType === "i32";
+        const offsetConst = this.builder.createConstant(isI32 ? 2 : 1, "i64");
+        const realIdx = this.builder.createArithmetic("+", curIdxForElem, offsetConst);
+        const elemPtr = this.builder.nextSSA();
+        this.builder.emit(
+          `${elemPtr} = llvm.getelementptr ${arr.ptr || arr.ssa}[${realIdx.ssa}] : (!llvm.ptr, i64) -> !llvm.ptr, ${elemType}`
         );
+        const elemVal = this.builder.load(elemPtr, elemType);
+        if (arr.isString) elemVal.isString = true;
+        if (arr.structName) elemVal.structName = arr.structName;
+
+        if (stmt.left.type === "VariableDeclaration") {
+          const decl = stmt.left.declarations[0];
+          const varName = decl.id.name;
+          const slot = this.builder.allocateStack(elemVal.type);
+          this.builder.store(slot.ptr, elemVal);
+          this.symbolTable.set(varName, {
+            ptr: slot.ptr,
+            type: elemVal.type,
+            isRef: true,
+            isSlot: true,
+            isString: elemVal.isString,
+            structName: elemVal.structName,
+          });
+        } else if (stmt.left.type === "Identifier") {
+          const sym = this.symbolTable.get(stmt.left.name);
+          if (sym) {
+            this.builder.store(sym.ptr, elemVal);
+          }
+        }
+
+        this.lowerStatement(stmt.body);
+        this.exitScope();
+        if (!this.builder.hasTerminated) {
+          this.builder.emitBranch(stepBlock);
+        }
+
+        this.builder.emitBlockLabel(stepBlock);
+        this.builder.hasTerminated = false;
+        const curIdxForStep = this.builder.load(idxSlot.ptr, "i64");
+        const c1 = this.builder.createConstant(1, "i64");
+        const nextIdx = this.builder.createArithmetic("+", curIdxForStep, c1);
+        this.builder.store(idxSlot.ptr, nextIdx);
+        this.builder.emitBranch(condBlock);
+
+        this.builder.emitBlockLabel(exitBlock);
+        this.builder.hasTerminated = false;
+
+        this.continueTargets.pop();
+        this.breakTargets.pop();
+        this.exitScope();
+        break;
+      }
+
+      case "ForInStatement": {
+        this.enterScope(false);
+        const arr = this.lowerExpression(stmt.right);
+        const lenSSA = this.builder.nextSSA();
+        this.builder.emit(`${lenSSA} = llvm.load ${arr.ptr || arr.ssa} : !llvm.ptr -> i64`);
+
+        const idxSlot = this.builder.allocateStack("i64");
+        const c0 = this.builder.createConstant(0, "i64");
+        this.builder.store(idxSlot.ptr, c0);
+
+        const condBlock = this.builder.nextBlock("for_in_cond");
+        const bodyBlock = this.builder.nextBlock("for_in_body");
+        const stepBlock = this.builder.nextBlock("for_in_step");
+        const exitBlock = this.builder.nextBlock("for_in_exit");
+        const bodyDepth = this.scopeStack.length;
+
+        const loopLabel = this.currentLoopLabel;
+        this.currentLoopLabel = null;
+        this.breakTargets.push({ label: exitBlock, cleanupDepth: bodyDepth, name: loopLabel });
+        this.continueTargets.push({ label: stepBlock, cleanupDepth: bodyDepth, name: loopLabel });
+
+        this.builder.emitBranch(condBlock);
+
+        this.builder.emitBlockLabel(condBlock);
+        this.builder.hasTerminated = false;
+        const curIdx = this.builder.load(idxSlot.ptr, "i64");
+        const condSSA = this.builder.nextSSA();
+        this.builder.emit(`${condSSA} = arith.cmpi slt, ${curIdx.ssa}, ${lenSSA} : i64`);
+        this.builder.emitBranchConditional(condSSA, bodyBlock, exitBlock);
+
+        this.builder.emitBlockLabel(bodyBlock);
+        this.builder.hasTerminated = false;
+        this.enterScope(false);
+
+        const curIdxForElem = this.builder.load(idxSlot.ptr, "i64");
+        const idxF64 = this.coerceType(curIdxForElem, "f64");
+
+        if (stmt.left.type === "VariableDeclaration") {
+          const decl = stmt.left.declarations[0];
+          const varName = decl.id.name;
+          const slot = this.builder.allocateStack("f64");
+          this.builder.store(slot.ptr, idxF64);
+          this.symbolTable.set(varName, {
+            ptr: slot.ptr,
+            type: "f64",
+            isRef: true,
+            isSlot: true,
+          });
+        } else if (stmt.left.type === "Identifier") {
+          const sym = this.symbolTable.get(stmt.left.name);
+          if (sym) {
+            this.builder.store(sym.ptr, idxF64);
+          }
+        }
+
+        this.lowerStatement(stmt.body);
+        this.exitScope();
+        if (!this.builder.hasTerminated) {
+          this.builder.emitBranch(stepBlock);
+        }
+
+        this.builder.emitBlockLabel(stepBlock);
+        this.builder.hasTerminated = false;
+        const curIdxForStep = this.builder.load(idxSlot.ptr, "i64");
+        const c1 = this.builder.createConstant(1, "i64");
+        const nextIdx = this.builder.createArithmetic("+", curIdxForStep, c1);
+        this.builder.store(idxSlot.ptr, nextIdx);
+        this.builder.emitBranch(condBlock);
+
+        this.builder.emitBlockLabel(exitBlock);
+        this.builder.hasTerminated = false;
+
+        this.continueTargets.pop();
+        this.breakTargets.pop();
         this.exitScope();
         break;
       }
 
       case "WhileStatement": {
-        this.builder.createWhile(
-          () => this.lowerExpression(stmt.test),
-          () => {
-            this.enterScope(false);
-            this.lowerStatement(stmt.body);
-            this.exitScope();
+        const condBlock = this.builder.nextBlock("while_cond");
+        const bodyBlock = this.builder.nextBlock("while_body");
+        const exitBlock = this.builder.nextBlock("while_exit");
+        const bodyDepth = this.scopeStack.length;
+
+        const loopLabel = this.currentLoopLabel;
+        this.currentLoopLabel = null;
+        this.breakTargets.push({ label: exitBlock, cleanupDepth: bodyDepth, name: loopLabel });
+        this.continueTargets.push({ label: condBlock, cleanupDepth: bodyDepth, name: loopLabel });
+
+        this.builder.emitBranch(condBlock);
+
+        this.builder.emitBlockLabel(condBlock);
+        this.builder.hasTerminated = false;
+        const cond = this.lowerExpression(stmt.test);
+        this.builder.emitBranchConditional(cond.ssa, bodyBlock, exitBlock);
+
+        this.builder.emitBlockLabel(bodyBlock);
+        this.builder.hasTerminated = false;
+        this.enterScope(false);
+        this.lowerStatement(stmt.body);
+        this.exitScope();
+        if (!this.builder.hasTerminated) {
+          this.builder.emitBranch(condBlock);
+        }
+
+        this.builder.emitBlockLabel(exitBlock);
+        this.builder.hasTerminated = false;
+
+        this.continueTargets.pop();
+        this.breakTargets.pop();
+        break;
+      }
+
+      case "DoWhileStatement": {
+        const bodyBlock = this.builder.nextBlock("dowhile_body");
+        const condBlock = this.builder.nextBlock("dowhile_cond");
+        const exitBlock = this.builder.nextBlock("dowhile_exit");
+        const bodyDepth = this.scopeStack.length;
+
+        const loopLabel = this.currentLoopLabel;
+        this.currentLoopLabel = null;
+        this.breakTargets.push({ label: exitBlock, cleanupDepth: bodyDepth, name: loopLabel });
+        this.continueTargets.push({ label: condBlock, cleanupDepth: bodyDepth, name: loopLabel });
+
+        this.builder.emitBranch(bodyBlock);
+
+        this.builder.emitBlockLabel(bodyBlock);
+        this.builder.hasTerminated = false;
+        this.enterScope(false);
+        this.lowerStatement(stmt.body);
+        this.exitScope();
+        if (!this.builder.hasTerminated) {
+          this.builder.emitBranch(condBlock);
+        }
+
+        this.builder.emitBlockLabel(condBlock);
+        this.builder.hasTerminated = false;
+        const cond = this.lowerExpression(stmt.test);
+        this.builder.emitBranchConditional(cond.ssa, bodyBlock, exitBlock);
+
+        this.builder.emitBlockLabel(exitBlock);
+        this.builder.hasTerminated = false;
+
+        this.continueTargets.pop();
+        this.breakTargets.pop();
+        break;
+      }
+
+      case "SwitchStatement": {
+        const discVal = this.lowerExpression(stmt.discriminant);
+        const cases = stmt.cases || [];
+        const switchExitBlock = this.builder.nextBlock("switch_exit");
+        const loopLabel = this.currentLoopLabel;
+        this.currentLoopLabel = null;
+        const breakTarget = {
+          label: switchExitBlock,
+          cleanupDepth: this.scopeStack.length,
+          referenced: cases.findIndex((c) => c.test === null) < 0,
+          name: loopLabel,
+        };
+        this.breakTargets.push(breakTarget);
+
+        const bodyBlocks = cases.map((c, i) => this.builder.nextBlock(`switch_case_body_${i}`));
+        const defaultIndex = cases.findIndex((c) => c.test === null);
+        const defaultTarget = defaultIndex >= 0 ? bodyBlocks[defaultIndex] : switchExitBlock;
+
+        const testedItems = [];
+        for (let i = 0; i < cases.length; i++) {
+          if (cases[i].test !== null) {
+            testedItems.push({ caseNode: cases[i], index: i });
           }
-        );
+        }
+
+        if (testedItems.length === 0) {
+          this.builder.emitBranch(defaultTarget);
+        } else {
+          for (let k = 0; k < testedItems.length; k++) {
+            const { caseNode, index } = testedItems[k];
+            const testVal = this.lowerExpression(caseNode.test);
+            const cmp = this.builder.createComparison("===", discVal, testVal);
+            const nextCheck = (k + 1 < testedItems.length) ? this.builder.nextBlock("switch_check") : defaultTarget;
+            this.builder.emitBranchConditional(cmp.ssa, bodyBlocks[index], nextCheck);
+
+            if (k + 1 < testedItems.length) {
+              this.builder.emitBlockLabel(nextCheck);
+              this.builder.hasTerminated = false;
+            }
+          }
+        }
+
+        for (let i = 0; i < cases.length; i++) {
+          this.builder.emitBlockLabel(bodyBlocks[i]);
+          this.builder.hasTerminated = false;
+          this.enterScope(false);
+          const stmts = cases[i].consequent || [];
+          for (const s of stmts) {
+            if (this.builder.hasTerminated) break;
+            this.lowerStatement(s);
+          }
+          this.exitScope();
+
+          if (!this.builder.hasTerminated) {
+            if (i + 1 < cases.length) {
+              this.builder.emitBranch(bodyBlocks[i + 1]);
+            } else {
+              breakTarget.referenced = true;
+              this.builder.emitBranch(switchExitBlock);
+            }
+          }
+        }
+
+        this.breakTargets.pop();
+        if (breakTarget.referenced) {
+          this.builder.emitBlockLabel(switchExitBlock);
+          this.builder.hasTerminated = false;
+        } else {
+          this.builder.hasTerminated = true;
+        }
+        break;
+      }
+
+      case "BreakStatement": {
+        if (this.breakTargets.length === 0) {
+          throw new Error("[Lowering] 'break' statement outside of switch or loop!");
+        }
+        let target = this.breakTargets[this.breakTargets.length - 1];
+        if (stmt.label) {
+          const found = this.breakTargets.slice().reverse().find((t) => t.name === stmt.label.name);
+          if (found) target = found;
+        }
+        if (target.cleanupDepth !== undefined) {
+          this.cleanupScopesDownTo(target.cleanupDepth);
+        }
+        if (typeof target === "object") {
+          target.referenced = true;
+          this.builder.emitBranch(target.label);
+        } else {
+          this.builder.emitBranch(target);
+        }
+        this.builder.hasTerminated = true;
+        break;
+      }
+
+      case "ContinueStatement": {
+        if (this.continueTargets.length === 0) {
+          throw new Error("[Lowering] 'continue' statement outside of loop!");
+        }
+        let target = this.continueTargets[this.continueTargets.length - 1];
+        if (stmt.label) {
+          const found = this.continueTargets.slice().reverse().find((t) => t.name === stmt.label.name);
+          if (found) target = found;
+        }
+        if (target.cleanupDepth !== undefined) {
+          this.cleanupScopesDownTo(target.cleanupDepth);
+        }
+        const label = typeof target === "object" ? target.label : target;
+        this.builder.emitBranch(label);
+        this.builder.hasTerminated = true;
         break;
       }
 
       case "IfStatement": {
-        const typeofCheck = this.extractTypeofCheck(stmt.test);
+        const narrowingCheck = this.extractNarrowingCheck(stmt.test);
         let originalSym = null;
         let narrowedVarName = null;
 
-        if (typeofCheck) {
-          const sym = this.symbolTable.get(typeofCheck.varName);
-          if (sym && sym.isUnion) {
-            narrowedVarName = typeofCheck.varName;
+        if (narrowingCheck) {
+          const sym = this.symbolTable.get(narrowingCheck.varName);
+          if (sym) {
+            narrowedVarName = narrowingCheck.varName;
             originalSym = sym;
           }
         }
@@ -3191,10 +3830,17 @@ export class ASTLowerer {
         this.builder.emitBlockLabel(thenBlock);
         this.builder.hasTerminated = false;
         this.enterScope(false);
-        if (narrowedVarName) {
-          const unboxed = this.unboxUnion(originalSym.ptr || originalSym.ssa, typeofCheck.targetType);
-          if (unboxed) {
-            this.symbolTable.set(narrowedVarName, unboxed);
+        if (narrowedVarName && narrowingCheck) {
+          if (narrowingCheck.kind === "typeof" && originalSym.isUnion) {
+            const unboxed = this.unboxUnion(originalSym.ptr || originalSym.ssa, narrowingCheck.targetType);
+            if (unboxed) {
+              this.symbolTable.set(narrowedVarName, unboxed);
+            }
+          } else if (narrowingCheck.kind === "instanceof" || narrowingCheck.kind === "predicate") {
+            this.symbolTable.set(narrowedVarName, {
+              ...originalSym,
+              structName: narrowingCheck.targetType,
+            });
           }
         }
         this.lowerStatement(stmt.consequent);
@@ -3214,10 +3860,10 @@ export class ASTLowerer {
           this.builder.emitBlockLabel(elseBlock);
           this.builder.hasTerminated = false;
           this.enterScope(false);
-          if (narrowedVarName) {
+          if (narrowedVarName && narrowingCheck && narrowingCheck.kind === "typeof" && originalSym.isUnion) {
             let otherType = null;
-            if (typeofCheck.targetType === "string") otherType = "number";
-            else if (typeofCheck.targetType === "number") otherType = "string";
+            if (narrowingCheck.targetType === "string") otherType = "number";
+            else if (narrowingCheck.targetType === "number") otherType = "string";
 
             if (otherType) {
               const unboxed = this.unboxUnion(originalSym.ptr || originalSym.ssa, otherType);
@@ -3270,6 +3916,9 @@ export class ASTLowerer {
           } else if (expectedRet && expectedRet !== "none") {
             val = this.coerceType(val, expectedRet);
           }
+          if (val.origPtr) {
+            this.markTransferred(val.origPtr);
+          }
           if (val.type === "!llvm.ptr" || val.isHeap) {
             this.markTransferred(val.ssa || val.ptr);
           }
@@ -3288,7 +3937,11 @@ export class ASTLowerer {
   }
 
   lowerNewExpression(expr, canStackAllocate = false) {
-    const className = expr.callee.name;
+    let className = expr.callee.name;
+    if (!className && expr.callee.type === "MemberExpression") {
+      const chain = this.extractMemberChain(expr.callee);
+      if (chain) className = chain.join("_");
+    }
 
     if (className === "Channel") {
       this.builder.markFeature("channels");
@@ -3404,6 +4057,11 @@ export class ASTLowerer {
       };
     }
 
+    if (!this.structRegistry.has(className) && this.currentFunctionNode?._namespacePrefix) {
+      const resolved = this.resolveNamespaceStruct(this.currentFunctionNode._namespacePrefix, className);
+      if (resolved) className = resolved;
+    }
+
     const classMeta = this.structRegistry.get(className);
     if (!classMeta) {
       throw new Error(`[Lowering] Tanımsız sınıf: ${className}`);
@@ -3453,6 +4111,7 @@ export class ASTLowerer {
     return {
       ssa: slot.ptr,
       ptr: slot.ptr,
+      origPtr: slot.ptr,
       type: "!llvm.ptr",
       structName: className,
       isRef: true,
@@ -3629,6 +4288,117 @@ export class ASTLowerer {
       isArray: true,
       isRef: true,
     };
+  }
+
+  packRestArguments(restArgs, restParam) {
+    if (restArgs.length === 1 && restArgs[0].type === "SpreadElement") {
+      return this.lowerExpression(restArgs[0].argument);
+    }
+
+    const len = restArgs.length;
+    const isString = restParam ? (restParam.isString || restParam.isArray) : true;
+    const isI32 = restParam?.elemType === "i32";
+    const byteSize = isI32 ? Math.max(8 + len * 4, 16) : Math.max((len + 1) * 8, 16);
+    const heapSlot = this.builder.allocateHeap(byteSize);
+
+    const lenConst = this.builder.nextSSA();
+    this.builder.emit(`${lenConst} = llvm.mlir.constant(${len} : i64) : i64`);
+    this.builder.emit(`llvm.store ${lenConst}, ${heapSlot.ptr} : i64, !llvm.ptr`);
+
+    restArgs.forEach((argNode, index) => {
+      let val = this.lowerExpression(argNode);
+      if (isString && !val.isString) {
+        val = this.builder.convertToString(val);
+      } else if (isI32) {
+        val = this.coerceType(val, "i32");
+      } else if (isString) {
+        val = this.coerceType(val, "!llvm.ptr");
+      } else {
+        val = this.coerceType(val, restParam?.elemType || "f64");
+      }
+
+      const idxConst = this.builder.nextSSA();
+      const elemPtr = this.builder.nextSSA();
+
+      if (isI32) {
+        const i32Off = index + 2;
+        this.builder.emit(`${idxConst} = llvm.mlir.constant(${i32Off} : i64) : i64`);
+        this.builder.emit(`${elemPtr} = llvm.getelementptr ${heapSlot.ptr}[${idxConst}] : (!llvm.ptr, i64) -> !llvm.ptr, i32`);
+        this.builder.emit(`llvm.store ${val.ssa}, ${elemPtr} : i32, !llvm.ptr`);
+      } else {
+        const off = index + 1;
+        this.builder.emit(`${idxConst} = llvm.mlir.constant(${off} : i64) : i64`);
+        const elemType = isString ? "!llvm.ptr" : restParam?.elemType || "f64";
+        this.builder.emit(`${elemPtr} = llvm.getelementptr ${heapSlot.ptr}[${idxConst}] : (!llvm.ptr, i64) -> !llvm.ptr, ${elemType}`);
+        this.builder.emit(`llvm.store ${val.ssa || val.ptr}, ${elemPtr} : ${elemType}, !llvm.ptr`);
+      }
+    });
+
+    return {
+      ssa: heapSlot.ptr,
+      ptr: heapSlot.ptr,
+      type: "!llvm.ptr",
+      isArray: true,
+      elemType: restParam?.elemType || (isString ? "!llvm.ptr" : "f64"),
+      isString,
+      isRef: true,
+      isHeap: true,
+    };
+  }
+
+  lowerCallArguments(paramsMeta, exprArguments) {
+    if (!paramsMeta || paramsMeta.length === 0) {
+      return exprArguments ? exprArguments.map((a) => this.lowerExpression(a)) : [];
+    }
+
+    const hasRest = paramsMeta.some((p) => p.isRest);
+    const actualArgs = exprArguments || [];
+
+    if (!hasRest) {
+      return actualArgs.map((a, i) => {
+        const isBorrowCall = a.type === "CallExpression" && a.callee?.name === "borrow";
+        const actualArgNode = isBorrowCall ? a.arguments[0] : a;
+        let val = this.lowerExpression(actualArgNode);
+        if (isBorrowCall) val.isBorrowed = true;
+
+        const paramMeta = paramsMeta[i];
+        if (paramMeta?.isUnion && !val.isUnion) {
+          const uSlot = this.builder.allocateStack("!llvm.struct<(i32, i64)>");
+          this.boxIntoUnion(uSlot.ptr, val);
+          return { ssa: uSlot.ptr, ptr: uSlot.ptr, type: "!llvm.ptr", isUnion: true };
+        }
+        if (val.isUnion) {
+          return { ssa: val.ssa || val.ptr, ptr: val.ssa || val.ptr, type: "!llvm.ptr", isUnion: true };
+        }
+        if (paramMeta?.structName && this.isPolymorphicInterface(paramMeta.structName) && !val.isInterface) {
+          val = this.boxIntoInterface(val, paramMeta.structName);
+        } else if (paramMeta && !val.isFunction) {
+          val = this.coerceType(val, paramMeta.type);
+        }
+        return val;
+      });
+    }
+
+    const restIdx = paramsMeta.findIndex((p) => p.isRest);
+    const fixedParams = paramsMeta.slice(0, restIdx);
+    const restParam = paramsMeta[restIdx];
+
+    const result = [];
+    for (let i = 0; i < fixedParams.length; i++) {
+      const a = actualArgs[i];
+      let val = this.lowerExpression(a);
+      const paramMeta = fixedParams[i];
+      if (paramMeta?.structName && this.isPolymorphicInterface(paramMeta.structName) && !val.isInterface) {
+        val = this.boxIntoInterface(val, paramMeta.structName);
+      } else if (paramMeta && !val.isFunction) {
+        val = this.coerceType(val, paramMeta.type);
+      }
+      result.push(val);
+    }
+
+    const restArgs = actualArgs.slice(fixedParams.length);
+    result.push(this.packRestArguments(restArgs, restParam));
+    return result;
   }
 
   tryLowerSIMDCall(expr) {
@@ -3907,12 +4677,22 @@ export class ASTLowerer {
     if (
       expr.type === "ParenthesizedExpression" ||
       expr.type === "NonNullExpression" ||
+      expr.type === "TSNonNullExpression" ||
+      expr.type === "ChainExpression" ||
       expr.type === "TSSatisfiesExpression"
     ) {
       return this.lowerExpression(expr.expression);
     }
 
-    if (expr.type === "TSAsExpression") {
+    if (expr.type === "SequenceExpression") {
+      let last = { ssa: "", type: "none" };
+      for (const e of expr.expressions || []) {
+        last = this.lowerExpression(e);
+      }
+      return last;
+    }
+
+    if (expr.type === "TSAsExpression" || expr.type === "TSTypeAssertion") {
       const val = this.lowerExpression(expr.expression);
       if (expr.typeAnnotation) {
         const targetType = this.resolveType(expr.typeAnnotation);
@@ -4155,6 +4935,10 @@ export class ASTLowerer {
       return { ssa: nullPtr, ptr: nullPtr, type: "!llvm.ptr", isNull: true, isHeap: false };
     }
 
+    if (expr.type === "SpreadElement") {
+      return this.lowerExpression(expr.argument);
+    }
+
     if (expr.type === "ThisExpression") {
       const thisSym = this.symbolTable.get("this");
       if (!thisSym) throw new Error("[Lowering] 'this' sadece metotlarda kullanılabilir!");
@@ -4223,6 +5007,13 @@ export class ASTLowerer {
       return this.builder.createBitwiseNot(val);
     }
 
+    if (expr.type === "UnaryExpression" && expr.operator === "void") {
+      this.lowerExpression(expr.argument);
+      const nullPtr = this.builder.nextSSA();
+      this.builder.emit(`${nullPtr} = llvm.mlir.zero : !llvm.ptr`);
+      return { ssa: nullPtr, ptr: nullPtr, type: "!llvm.ptr" };
+    }
+
     if (expr.type === "UnaryExpression" && expr.operator === "typeof") {
       const arg = expr.argument;
       if (arg.type === "Identifier") {
@@ -4258,12 +5049,19 @@ export class ASTLowerer {
           const sym = this.symbolTable.get(expr.argument.name);
           ptr = sym.ptr;
           type = sym.type;
-        } else if (this.globals && this.globals.has(expr.argument.name)) {
-          const g = this.globals.get(expr.argument.name);
-          const addr = this.builder.nextSSA();
-          this.builder.emit(`${addr} = llvm.mlir.addressof ${g.globalSym} : !llvm.ptr`);
-          ptr = addr;
-          type = g.type;
+        } else if (this.globals) {
+          let globalName = expr.argument.name;
+          if (!this.globals.has(globalName) && this.currentFunctionNode?._namespacePrefix) {
+            const resolved = this.resolveNamespaceGlobal(this.currentFunctionNode._namespacePrefix, expr.argument.name);
+            if (resolved) globalName = resolved;
+          }
+          if (this.globals.has(globalName)) {
+            const g = this.globals.get(globalName);
+            const addr = this.builder.nextSSA();
+            this.builder.emit(`${addr} = llvm.mlir.addressof ${g.globalSym} : !llvm.ptr`);
+            ptr = addr;
+            type = g.type;
+          }
         }
         if (ptr && type) {
           const oldVal = this.builder.load(ptr, type);
@@ -4274,6 +5072,28 @@ export class ASTLowerer {
           return expr.prefix ? newVal : oldVal;
         }
       } else if (expr.argument.type === "MemberExpression") {
+        if (!expr.argument.computed) {
+          const chain = this.extractMemberChain(expr.argument);
+          if (chain && chain.length >= 2) {
+            let globalKey = chain.join("_");
+            if (this.globals && !this.globals.has(globalKey) && this.currentFunctionNode?._namespacePrefix) {
+              const resolved = this.resolveNamespaceGlobal(this.currentFunctionNode._namespacePrefix, globalKey);
+              if (resolved) globalKey = resolved;
+            }
+            if (this.globals && this.globals.has(globalKey)) {
+              const g = this.globals.get(globalKey);
+              const addr = this.builder.nextSSA();
+              this.builder.emit(`${addr} = llvm.mlir.addressof ${g.globalSym} : !llvm.ptr`);
+              const oldVal = this.builder.load(addr, g.type);
+              const step = g.type === "i64" || g.type === "i32" ? 1 : 1.0;
+              const one = this.builder.createConstant(step, g.type);
+              const newVal = this.builder.createArithmetic(op, oldVal, one);
+              this.builder.store(addr, newVal);
+              return expr.prefix ? newVal : oldVal;
+            }
+          }
+        }
+
         const base = this.lowerExpression(expr.argument.object);
         if (expr.argument.computed) {
           let idxVal = this.lowerExpression(expr.argument.property);
@@ -4380,6 +5200,7 @@ export class ASTLowerer {
             return {
               ssa: loaded.ssa,
               ptr: loaded.ssa,
+              origPtr: sym.origPtr,
               type: "!llvm.ptr",
               structName: sym.structName,
               isArray: sym.isArray,
@@ -4401,6 +5222,7 @@ export class ASTLowerer {
           return {
             ssa: sym.ptr,
             ptr: sym.ptr,
+            origPtr: sym.origPtr,
             type: "!llvm.ptr",
             structName: sym.structName,
             isArray: sym.isArray,
@@ -4420,13 +5242,20 @@ export class ASTLowerer {
           };
         }
         const loaded = this.builder.load(sym.ptr, sym.type);
+        if (sym.origPtr) loaded.origPtr = sym.origPtr;
         if (sym.isString) loaded.isString = true;
         if (sym.isVector || (sym.type && sym.type.startsWith("vector<"))) loaded.isVector = true;
         return loaded;
       }
 
-      if (this.globals && this.globals.has(expr.name)) {
-        const g = this.globals.get(expr.name);
+      let globalName = expr.name;
+      if (this.globals && !this.globals.has(globalName) && this.currentFunctionNode?._namespacePrefix) {
+        const resolved = this.resolveNamespaceGlobal(this.currentFunctionNode._namespacePrefix, expr.name);
+        if (resolved) globalName = resolved;
+      }
+
+      if (this.globals && this.globals.has(globalName)) {
+        const g = this.globals.get(globalName);
         const addr = this.builder.nextSSA();
         this.builder.emit(`${addr} = llvm.mlir.addressof ${g.globalSym} : !llvm.ptr`);
         const loaded = this.builder.load(addr, g.type);
@@ -4446,11 +5275,20 @@ export class ASTLowerer {
         }
         if (g.isMap) loaded.isMap = true;
         if (g.isSet) loaded.isSet = true;
+        if (globalName === "process_argc") {
+          return this.coerceType(loaded, "f64");
+        }
         return loaded;
       }
 
-      if (this.functionRegistry.has(expr.name)) {
-        const thunk = this.getOrCreateThunk(expr.name);
+      let fnRefName = expr.name;
+      if (!this.functionRegistry.has(fnRefName) && this.currentFunctionNode?._namespacePrefix) {
+        const resolvedFn = this.resolveNamespaceFunction(this.currentFunctionNode._namespacePrefix, expr.name);
+        if (resolvedFn) fnRefName = resolvedFn;
+      }
+
+      if (this.functionRegistry.has(fnRefName)) {
+        const thunk = this.getOrCreateThunk(fnRefName);
         const fnConst = this.builder.nextSSA();
         this.builder.emit(`${fnConst} = func.constant @${thunk.thunkName} : ${thunk.thunkSig}`);
         const fnPtr = this.builder.nextSSA();
@@ -4484,7 +5322,47 @@ export class ASTLowerer {
       throw new Error(`[Lowering] Tanımsız değişken veya fonksiyon: ${expr.name}`);
     }
 
-    if (expr.type === "MemberExpression") {
+    if (expr.type === "MemberExpression" || expr.type === "OptionalMemberExpression") {
+      if (!expr.computed) {
+        const chain = this.extractMemberChain(expr);
+        if (chain && chain.length >= 2) {
+          let globalKey = chain.join("_");
+          if (this.globals && !this.globals.has(globalKey) && this.currentFunctionNode?._namespacePrefix) {
+            const resolved = this.resolveNamespaceGlobal(this.currentFunctionNode._namespacePrefix, globalKey);
+            if (resolved) globalKey = resolved;
+          }
+          if (this.globals && this.globals.has(globalKey)) {
+            const g = this.globals.get(globalKey);
+            const isProcessArgc = (globalKey === "process_argc" || globalKey === "Process_argc");
+            const isProcessArgv = (globalKey === "process_argv" || globalKey === "Process_argv");
+            const gSym = isProcessArgc ? "@g_process_argc" : isProcessArgv ? "@g_process_argv" : g.globalSym;
+            const loadType = isProcessArgc ? "i32" : (isProcessArgv ? "!llvm.ptr" : g.type);
+
+            const addr = this.builder.nextSSA();
+            this.builder.emit(`${addr} = llvm.mlir.addressof ${gSym} : !llvm.ptr`);
+            const loaded = this.builder.load(addr, loadType);
+            if (g.isString || isProcessArgv) loaded.isString = true;
+            if (g.structName) {
+              loaded.structName = g.structName;
+              loaded.ptr = loaded.ssa;
+              if (g.isInterface || this.isPolymorphicInterface(g.structName)) {
+                loaded.isInterface = true;
+              }
+            }
+            if (g.isArray || isProcessArgv) {
+              loaded.isArray = true;
+              loaded.ptr = loaded.ssa;
+              loaded.elemType = isProcessArgv ? "!llvm.ptr" : (g.elemType || "f64");
+              loaded.isString = isProcessArgv ? true : (g.isString || false);
+            }
+            if (isProcessArgc) {
+              return this.coerceType(loaded, "f64");
+            }
+            return loaded;
+          }
+        }
+      }
+
       if (expr.object.type === "Identifier" && this.enumRegistry.has(expr.object.name)) {
         const enumMeta = this.enumRegistry.get(expr.object.name);
         let memberName = null;
@@ -4528,7 +5406,8 @@ export class ASTLowerer {
         return { ssa, type: "i64" };
       }
 
-      if (!expr.computed && (expr.property.name || expr.property.value) === "length") {
+      const isStructWithLength = base.structName && this.structRegistry.get(base.structName)?.fields.some((f) => f.name === "length");
+      if (!isStructWithLength && !expr.computed && (expr.property.name || expr.property.value) === "length") {
         if (base.isString && !base.isArray) {
           this.builder.markFeature("strings");
           const ssa = this.builder.nextSSA();
@@ -4622,6 +5501,11 @@ export class ASTLowerer {
         if (fieldMeta.structName) {
           res.structName = fieldMeta.structName;
         }
+        if (fieldMeta.isArray) {
+          res.isArray = true;
+          res.elemType = fieldMeta.elemType || "!llvm.ptr";
+          res.isString = fieldMeta.isString;
+        }
         return res;
       }
 
@@ -4635,6 +5519,45 @@ export class ASTLowerer {
       let rhs = this.lowerExpression(expr.right);
 
       if (expr.left.type === "MemberExpression") {
+        if (!expr.left.computed) {
+          const chain = this.extractMemberChain(expr.left);
+          if (chain && chain.length >= 2) {
+            let globalKey = chain.join("_");
+            if (this.globals && !this.globals.has(globalKey) && this.currentFunctionNode?._namespacePrefix) {
+              const resolved = this.resolveNamespaceGlobal(this.currentFunctionNode._namespacePrefix, globalKey);
+              if (resolved) globalKey = resolved;
+            }
+            if (this.globals && this.globals.has(globalKey)) {
+              const g = this.globals.get(globalKey);
+              const addr = this.builder.nextSSA();
+              this.builder.emit(`${addr} = llvm.mlir.addressof ${g.globalSym} : !llvm.ptr`);
+              if (isCompound) {
+                let curVal = this.builder.load(addr, g.type);
+                if (g.isString) curVal.isString = true;
+                if (op === "+" && (curVal.isString || rhs.isString)) {
+                  const leftStr = this.builder.convertToString(curVal);
+                  const rightStr = this.builder.convertToString(rhs);
+                  rhs = this.builder.createStringConcat(leftStr, rightStr);
+                  g.isString = true;
+                } else if (["|", "&", "^", "<<", ">>", ">>>"].includes(op)) {
+                  const lInt = this.coerceType(curVal, "i64");
+                  const rInt = this.coerceType(rhs, "i64");
+                  rhs = this.builder.createArithmetic(op, lInt, rInt);
+                  rhs = this.coerceType(rhs, g.type);
+                } else {
+                  rhs = this.builder.createArithmetic(op, curVal, rhs);
+                  rhs = this.coerceType(rhs, g.type);
+                }
+              } else {
+                rhs = this.coerceType(rhs, g.type);
+              }
+              this.builder.store(addr, rhs);
+              if (rhs.isString) g.isString = true;
+              return rhs;
+            }
+          }
+        }
+
         const base = this.lowerExpression(expr.left.object);
 
         if (expr.left.computed && (base.isVector || (base.type && base.type.startsWith("vector<")))) {
@@ -4767,46 +5690,54 @@ export class ASTLowerer {
           }
           this.builder.store(sym.ptr, rhs);
           if (rhs.isString) sym.isString = true;
-          if (rhs.type === "!llvm.ptr" || rhs.isHeap) {
-            this.markTransferred(rhs.ssa || rhs.ptr);
+          if (rhs.origPtr || rhs.type === "!llvm.ptr" || rhs.isHeap) {
+            sym.origPtr = rhs.origPtr || rhs.ssa || rhs.ptr;
+            this.markTransferred(rhs.origPtr || rhs.ssa || rhs.ptr);
           }
           return rhs;
-        } else if (this.globals && this.globals.has(expr.left.name)) {
-          const g = this.globals.get(expr.left.name);
-          const addr = this.builder.nextSSA();
-          this.builder.emit(`${addr} = llvm.mlir.addressof ${g.globalSym} : !llvm.ptr`);
-          if (isCompound) {
-            let curVal = this.builder.load(addr, g.type);
-            if (g.isString) curVal.isString = true;
-            if (op === "+" && (curVal.isString || rhs.isString)) {
-              const leftStr = this.builder.convertToString(curVal);
-              const rightStr = this.builder.convertToString(rhs);
-              rhs = this.builder.createStringConcat(leftStr, rightStr);
-              g.isString = true;
-            } else if (["|", "&", "^", "<<", ">>", ">>>"].includes(op)) {
-              const lInt = this.coerceType(curVal, "i64");
-              const rInt = this.coerceType(rhs, "i64");
-              rhs = this.builder.createArithmetic(op, lInt, rInt);
-              rhs = this.coerceType(rhs, g.type);
-            } else {
-              rhs = this.builder.createArithmetic(op, curVal, rhs);
-              rhs = this.coerceType(rhs, g.type);
-            }
-          } else {
-            if (!g.isArray && (g.isInterface || this.isPolymorphicInterface(g.structName))) {
-              if (!rhs.isInterface) {
-                rhs = this.boxIntoInterface(rhs, g.structName);
+        } else if (this.globals) {
+          let globalName = expr.left.name;
+          if (!this.globals.has(globalName) && this.currentFunctionNode?._namespacePrefix) {
+            const resolved = this.resolveNamespaceGlobal(this.currentFunctionNode._namespacePrefix, expr.left.name);
+            if (resolved) globalName = resolved;
+          }
+          if (this.globals.has(globalName)) {
+            const g = this.globals.get(globalName);
+            const addr = this.builder.nextSSA();
+            this.builder.emit(`${addr} = llvm.mlir.addressof ${g.globalSym} : !llvm.ptr`);
+            if (isCompound) {
+              let curVal = this.builder.load(addr, g.type);
+              if (g.isString) curVal.isString = true;
+              if (op === "+" && (curVal.isString || rhs.isString)) {
+                const leftStr = this.builder.convertToString(curVal);
+                const rightStr = this.builder.convertToString(rhs);
+                rhs = this.builder.createStringConcat(leftStr, rightStr);
+                g.isString = true;
+              } else if (["|", "&", "^", "<<", ">>", ">>>"].includes(op)) {
+                const lInt = this.coerceType(curVal, "i64");
+                const rInt = this.coerceType(rhs, "i64");
+                rhs = this.builder.createArithmetic(op, lInt, rInt);
+                rhs = this.coerceType(rhs, g.type);
+              } else {
+                rhs = this.builder.createArithmetic(op, curVal, rhs);
+                rhs = this.coerceType(rhs, g.type);
               }
             } else {
-              rhs = this.coerceType(rhs, g.type);
+              if (!g.isArray && (g.isInterface || this.isPolymorphicInterface(g.structName))) {
+                if (!rhs.isInterface) {
+                  rhs = this.boxIntoInterface(rhs, g.structName);
+                }
+              } else {
+                rhs = this.coerceType(rhs, g.type);
+              }
             }
+            this.builder.store(addr, rhs);
+            if (rhs.isString) g.isString = true;
+            if (rhs.type === "!llvm.ptr" || rhs.isHeap) {
+              this.markTransferred(rhs.ssa || rhs.ptr);
+            }
+            return rhs;
           }
-          this.builder.store(addr, rhs);
-          if (rhs.isString) g.isString = true;
-          if (rhs.type === "!llvm.ptr" || rhs.isHeap) {
-            this.markTransferred(rhs.ssa || rhs.ptr);
-          }
-          return rhs;
         }
         throw new Error(`[Lowering] Atama yapılan tanımsız değişken: '${expr.left.name}'`);
       }
@@ -4819,6 +5750,114 @@ export class ASTLowerer {
     }
 
     if (expr.type === "BinaryExpression") {
+      if (expr.operator === "instanceof") {
+        let targetClassName = null;
+        if (expr.right.type === "Identifier") {
+          targetClassName = expr.right.name;
+        } else if (expr.right.type === "MemberExpression") {
+          const chain = this.extractMemberChain(expr.right);
+          if (chain) targetClassName = chain.join("_");
+        }
+        if (targetClassName && !this.structRegistry.has(targetClassName) && this.currentFunctionNode?._namespacePrefix) {
+          const resolved = this.resolveNamespaceStruct(this.currentFunctionNode._namespacePrefix, targetClassName);
+          if (resolved) targetClassName = resolved;
+        }
+        const lhs = this.lowerExpression(expr.left);
+        if (lhs.type !== "!llvm.ptr" && !lhs.ptr) {
+          return this.builder.createConstant(0, "i1");
+        }
+        const objPtr = lhs.ssa || lhs.ptr;
+
+        const resSlot = this.builder.allocateStack("i1");
+        const falseVal = this.builder.createConstant(0, "i1");
+        this.builder.store(resSlot.ptr, falseVal);
+
+        const checkBlock = this.builder.nextBlock("inst_check");
+        const doneBlock = this.builder.nextBlock("inst_done");
+
+        const nullSSA = this.builder.nextSSA();
+        this.builder.emit(`${nullSSA} = llvm.mlir.zero : !llvm.ptr`);
+        const notNull = this.builder.nextSSA();
+        this.builder.emit(`${notNull} = llvm.icmp "ne" ${objPtr}, ${nullSSA} : !llvm.ptr`);
+
+        this.builder.emitBranchConditional(notNull, checkBlock, doneBlock);
+
+        this.builder.emitBlockLabel(checkBlock);
+        this.builder.hasTerminated = false;
+
+        const targetIds = targetClassName ? this.getDescendantTypeIds(targetClassName) : [];
+        if (targetIds.length === 0) {
+          this.builder.emitBranch(doneBlock);
+        } else {
+          const typeIdSSA = this.builder.nextSSA();
+          this.builder.emit(`${typeIdSSA} = llvm.load ${objPtr} : !llvm.ptr -> i32`);
+
+          let combinedSSA = null;
+          for (const tid of targetIds) {
+            const tidSSA = this.builder.createConstant(tid, "i32");
+            const cmpSSA = this.builder.nextSSA();
+            this.builder.emit(`${cmpSSA} = arith.cmpi eq, ${typeIdSSA}, ${tidSSA.ssa} : i32`);
+            if (!combinedSSA) {
+              combinedSSA = cmpSSA;
+            } else {
+              const orSSA = this.builder.nextSSA();
+              this.builder.emit(`${orSSA} = arith.ori ${combinedSSA}, ${cmpSSA} : i1`);
+              combinedSSA = orSSA;
+            }
+          }
+          this.builder.store(resSlot.ptr, { ssa: combinedSSA, type: "i1" });
+          this.builder.emitBranch(doneBlock);
+        }
+
+        this.builder.emitBlockLabel(doneBlock);
+        this.builder.hasTerminated = false;
+        return this.builder.load(resSlot.ptr, "i1");
+      }
+
+      if (expr.operator === "in") {
+        const rhs = this.lowerExpression(expr.right);
+        if (rhs.isMap || rhs.isSet) {
+          const lhs = this.lowerExpression(expr.left);
+          const keyStr = this.builder.convertToString(lhs);
+          const ssa = this.builder.nextSSA();
+          this.builder.emit(`${ssa} = func.call @rts_map_has_str(${rhs.ptr || rhs.ssa}, ${keyStr.ssa || keyStr.ptr}) : (!llvm.ptr, !llvm.ptr) -> i1`);
+          return { ssa, type: "i1" };
+        }
+
+        let propName = null;
+        if (expr.left.type === "StringLiteral" || (expr.left.type === "Literal" && typeof expr.left.value === "string")) {
+          propName = expr.left.value;
+        } else if (expr.left.type === "Identifier") {
+          propName = expr.left.name;
+        }
+
+        const sName = rhs.structName;
+        const structMeta = sName ? this.structRegistry.get(sName) : null;
+        if (structMeta && propName) {
+          let hasMember = false;
+          let currMeta = structMeta;
+          while (currMeta) {
+            if (
+              currMeta.fields?.some((f) => f.name === propName) ||
+              currMeta.methods?.has(propName) ||
+              currMeta.staticFields?.has(propName) ||
+              currMeta.staticMethods?.has(propName)
+            ) {
+              hasMember = true;
+              break;
+            }
+            currMeta = currMeta.superClass ? this.structRegistry.get(currMeta.superClass) : null;
+          }
+          return this.builder.createConstant(hasMember ? 1 : 0, "i1");
+        }
+
+        if (rhs.isInterface && propName) {
+          return this.builder.createConstant(1, "i1");
+        }
+
+        return this.builder.createConstant(0, "i1");
+      }
+
       const lhs = this.lowerExpression(expr.left);
       const rhs = this.lowerExpression(expr.right);
 
@@ -4841,15 +5880,18 @@ export class ASTLowerer {
       }
     }
 
-    if (expr.type === "CallExpression") {
+    if (expr.type === "CallExpression" || expr.type === "OptionalCallExpression") {
       const simdRes = this.tryLowerSIMDCall(expr);
       if (simdRes !== null) {
         return simdRes;
       }
 
+      // [COMPILER_BUILTIN_STD_COMMENTED_OUT] Derleyici tarafından otomatik oluşturulan exit(code) ve process.exit(code) desteği yorum satırına alındı.
+      // Artık std/process.ts veya FFI declare function exit kullanılmalıdır.
+      /*
       // 1. exit(code) ve process.exit(code)
       if (
-        (expr.callee.type === "Identifier" && expr.callee.name === "exit") ||
+        (expr.callee.type === "Identifier" && expr.callee.name === "exit" && !this.functionRegistry.has("exit")) ||
         (expr.callee.type === "MemberExpression" && expr.callee.object?.name === "process" && (expr.callee.property?.name === "exit" || expr.callee.property?.value === "exit"))
       ) {
         this.builder.markFeature("exit");
@@ -4858,6 +5900,7 @@ export class ASTLowerer {
         this.builder.emit(`llvm.call @exit(${codeI32.ssa}) : (i32) -> ()`);
         return { ssa: "", type: "none" };
       }
+      */
 
       // 2. Ham Bellek İndeksleme ve Pointer Aritmetiği Intrinsics
       if (expr.callee.type === "Identifier" && expr.callee.name === "ptr_read_u8") {
@@ -5045,7 +6088,11 @@ export class ASTLowerer {
         return { ssa: thSlot, ptr: thSlot, type: "!llvm.ptr", isThread: true, isHeap: true };
       }
 
-      if (expr.callee.type === "Identifier" && expr.callee.name === "join") {
+      if (
+        expr.callee.type === "Identifier" &&
+        expr.callee.name === "join" &&
+        expr.arguments?.length === 1
+      ) {
         this.builder.markFeature("threads");
         const thVal = this.lowerExpression(expr.arguments[0]);
         const thId = this.builder.load(thVal.ptr || thVal.ssa, "i64");
@@ -5093,7 +6140,19 @@ export class ASTLowerer {
           sName = `Result_${valKey}_str`;
         }
 
-        const structMeta = this.structRegistry.get(sName);
+        let structMeta = this.structRegistry.get(sName);
+        if (!structMeta && this.monomorphizer) {
+          const valKeyword = val.isString ? { type: "TSStringKeyword" } : (val.type === "i1" ? { type: "TSBooleanKeyword" } : { type: "TSNumberKeyword" });
+          const spec = this.monomorphizer.instantiateGenericStruct("Result", [
+            valKeyword,
+            { type: "TSStringKeyword" },
+          ]);
+          if (spec?.node) {
+            this.lowerInterface(spec.node);
+            structMeta = this.structRegistry.get(spec.specializedName);
+            sName = spec.specializedName;
+          }
+        }
         if (!structMeta) {
           throw new Error(`[Result] '${sName}' tipi bulunamadı!`);
         }
@@ -5133,7 +6192,18 @@ export class ASTLowerer {
           sName = `Result_f64_str`;
         }
 
-        const structMeta = this.structRegistry.get(sName);
+        let structMeta = this.structRegistry.get(sName);
+        if (!structMeta && this.monomorphizer) {
+          const spec = this.monomorphizer.instantiateGenericStruct("Result", [
+            { type: "TSNumberKeyword" },
+            { type: "TSStringKeyword" },
+          ]);
+          if (spec?.node) {
+            this.lowerInterface(spec.node);
+            structMeta = this.structRegistry.get(spec.specializedName);
+            sName = spec.specializedName;
+          }
+        }
         if (!structMeta) {
           throw new Error(`[Result] '${sName}' tipi bulunamadı!`);
         }
@@ -5231,6 +6301,9 @@ export class ASTLowerer {
         return { ssa: "", type: "none" };
       }
 
+      // [COMPILER_BUILTIN_STD_COMMENTED_OUT] Derleyici tarafından otomatik oluşturulan yerleşik console.log implementasyonu.
+      // Artık std/ (Console, console veya println) import edilerek kullanılmalıdır.
+      /*
       const isConsoleLog =
         expr.callee.type === "MemberExpression" &&
         expr.callee.object?.name === "console" &&
@@ -5275,6 +6348,7 @@ export class ASTLowerer {
         this.builder.printNewline();
         return { ssa: "", type: "none" };
       }
+      */
 
       if (expr.callee.type === "MemberExpression" && expr.callee.object.type === "Super") {
         const thisSym = this.symbolTable.get("this");
@@ -5318,6 +6392,75 @@ export class ASTLowerer {
       }
 
       if (expr.callee.type === "MemberExpression") {
+        const calleeChain = this.extractMemberChain(expr.callee);
+        if (calleeChain && calleeChain.length >= 2) {
+          // Check static class method: e.g. ["ClassName", "method"] or ["A", "B", "ClassName", "method"]
+          for (let i = calleeChain.length - 1; i >= 1; i--) {
+            let classCandidate = calleeChain.slice(0, i).join("_");
+            const methodCandidate = calleeChain.slice(i).join("_");
+            if (!this.structRegistry.has(classCandidate) && this.currentFunctionNode?._namespacePrefix) {
+              const resolvedCls = this.resolveNamespaceStruct(this.currentFunctionNode._namespacePrefix, classCandidate);
+              if (resolvedCls) classCandidate = resolvedCls;
+            }
+            if (this.structRegistry.has(classCandidate)) {
+              const clsMeta = this.structRegistry.get(classCandidate);
+              if (clsMeta && clsMeta.staticMethods && clsMeta.staticMethods.has(methodCandidate)) {
+                const sMeta = clsMeta.staticMethods.get(methodCandidate);
+                const targetFn = `@${classCandidate}_${methodCandidate}`;
+                const args = this.lowerCallArguments(sMeta?.params, expr.arguments);
+                const allArgsSSA = args.map((a) => a.ssa || a.ptr).join(", ");
+                const allArgsType = (sMeta?.params || []).map((p) => p.type).join(", ");
+                const retType = sMeta?.retType || "none";
+                if (retType === "none") {
+                  this.builder.emit(`func.call ${targetFn}(${allArgsSSA}) : (${allArgsType}) -> ()`);
+                  return { ssa: "", ptr: "", type: "none" };
+                } else {
+                  const ssa = this.builder.nextSSA();
+                  this.builder.emit(`${ssa} = func.call ${targetFn}(${allArgsSSA}) : (${allArgsType}) -> ${retType}`);
+                  return {
+                    ssa,
+                    ptr: ssa,
+                    type: retType,
+                    structName: sMeta?.structRetName,
+                    isString: sMeta?.isRetString || false,
+                    isHeap: retType === "!llvm.ptr",
+                  };
+                }
+              }
+            }
+          }
+
+          // Check namespace function: e.g. ["MyNamespace", "foo"] -> "MyNamespace_foo"
+          let nsFnCandidate = calleeChain.join("_");
+          if (!this.functionRegistry.has(nsFnCandidate) && this.currentFunctionNode?._namespacePrefix) {
+            const resolvedFn = this.resolveNamespaceFunction(this.currentFunctionNode._namespacePrefix, nsFnCandidate);
+            if (resolvedFn) nsFnCandidate = resolvedFn;
+          }
+          if (this.functionRegistry.has(nsFnCandidate)) {
+            const fnMeta = this.functionRegistry.get(nsFnCandidate);
+            const targetFn = `@${fnMeta.exportAlias || nsFnCandidate}`;
+            const args = this.lowerCallArguments(fnMeta?.params, expr.arguments);
+            const allArgsSSA = args.map((a) => a.ssa || a.ptr).join(", ");
+            const allArgsType = (fnMeta?.paramTypes || []).join(", ");
+            const retType = fnMeta?.retType || "none";
+            if (retType === "none") {
+              this.builder.emit(`func.call ${targetFn}(${allArgsSSA}) : (${allArgsType}) -> ()`);
+              return { ssa: "", ptr: "", type: "none" };
+            } else {
+              const ssa = this.builder.nextSSA();
+              this.builder.emit(`${ssa} = func.call ${targetFn}(${allArgsSSA}) : (${allArgsType}) -> ${retType}`);
+              return {
+                ssa,
+                ptr: ssa,
+                type: retType,
+                structName: fnMeta?.structRetName,
+                isString: fnMeta?.isRetString || false,
+                isHeap: retType === "!llvm.ptr",
+              };
+            }
+          }
+        }
+
         const base = this.lowerExpression(expr.callee.object);
         const methodName = expr.callee.property.name || expr.callee.property.value;
 
@@ -5639,24 +6782,7 @@ export class ASTLowerer {
           const isVCall = this.vcallRouters.has(vcallName);
           const targetFn = isVCall ? `@${vcallName}` : `@${methodMeta.className || declaringClass}_${methodName}`;
 
-          const args = expr.arguments ? expr.arguments.map((a, i) => {
-            let val = this.lowerExpression(a);
-            const paramMeta = methodMeta?.params?.[i];
-            if (paramMeta?.isUnion && !val.isUnion) {
-              const uSlot = this.builder.allocateStack("!llvm.struct<(i32, i64)>");
-              this.boxIntoUnion(uSlot.ptr, val);
-              return { ssa: uSlot.ptr, ptr: uSlot.ptr, type: "!llvm.ptr", isUnion: true };
-            }
-            if (val.isUnion) {
-              return { ssa: val.ssa || val.ptr, ptr: val.ssa || val.ptr, type: "!llvm.ptr", isUnion: true };
-            }
-            if (paramMeta?.structName && this.isPolymorphicInterface(paramMeta.structName) && !val.isInterface) {
-              val = this.boxIntoInterface(val, paramMeta.structName);
-            } else if (paramMeta && !val.isFunction) {
-              val = this.coerceType(val, paramMeta.type);
-            }
-            return val;
-          }) : [];
+          const args = this.lowerCallArguments(methodMeta?.params, expr.arguments);
 
           const allArgsSSA = [base.ssa || base.ptr, ...args.map((a) => a.ssa || a.ptr)];
           const allArgsType = ["!llvm.ptr", ...args.map((a) => a.type)];
@@ -5740,7 +6866,13 @@ export class ASTLowerer {
         }
       }
 
-      if (expr.callee.type !== "Identifier" || !this.functionRegistry.has(expr.callee.name)) {
+      let resolvedFuncName = expr.callee.name;
+      if (expr.callee.type === "Identifier" && !this.functionRegistry.has(resolvedFuncName) && this.currentFunctionNode?._namespacePrefix) {
+        const nsFn = this.resolveNamespaceFunction(this.currentFunctionNode._namespacePrefix, expr.callee.name);
+        if (nsFn) resolvedFuncName = nsFn;
+      }
+
+      if (expr.callee.type !== "Identifier" || !this.functionRegistry.has(resolvedFuncName)) {
         let calleeVal = this.lowerExpression(expr.callee);
         if (
           calleeVal &&
@@ -5798,35 +6930,10 @@ export class ASTLowerer {
         }
       }
 
-      const funcName = expr.callee.name;
+      const funcName = resolvedFuncName;
       const fnMeta = this.functionRegistry.get(funcName);
 
-      const args = expr.arguments ? expr.arguments.map((a, i) => {
-        const isBorrowCall = a.type === "CallExpression" && a.callee?.name === "borrow";
-        const actualArgNode = isBorrowCall ? a.arguments[0] : a;
-
-        let val = this.lowerExpression(actualArgNode);
-        if (isBorrowCall) {
-          val.isBorrowed = true;
-        }
-
-        const paramMeta = fnMeta?.params?.[i];
-        if (paramMeta?.isUnion && !val.isUnion) {
-          const uSlot = this.builder.allocateStack("!llvm.struct<(i32, i64)>");
-          this.boxIntoUnion(uSlot.ptr, val);
-          return { ssa: uSlot.ptr, ptr: uSlot.ptr, type: "!llvm.ptr", isUnion: true };
-        }
-        if (val.isUnion) {
-          return { ssa: val.ssa || val.ptr, ptr: val.ssa || val.ptr, type: "!llvm.ptr", isUnion: true };
-        }
-        if (paramMeta?.structName && this.isPolymorphicInterface(paramMeta.structName) && !val.isInterface) {
-          val = this.boxIntoInterface(val, paramMeta.structName);
-        } else if (paramMeta && !val.isFunction) {
-          val = this.coerceType(val, paramMeta.type);
-        }
-
-        return val;
-      }) : [];
+      const args = this.lowerCallArguments(fnMeta?.params, expr.arguments);
 
       const argStr = args.map((a) => a.ssa || a.ptr).join(", ");
       const typeStr = args.map((a) => a.type).join(", ");
@@ -5857,6 +6964,46 @@ export class ASTLowerer {
           isHeap: retType === "!llvm.ptr",
         };
       }
+    }
+
+    if (expr.type === "ConditionalExpression") {
+      const cond = this.coerceType(this.lowerExpression(expr.test), "i1");
+      const trueVal = this.lowerExpression(expr.consequent);
+      const falseVal = this.lowerExpression(expr.alternate);
+
+      let targetType = trueVal.type;
+      if (trueVal.type !== falseVal.type) {
+        if (trueVal.type === "!llvm.ptr" || falseVal.type === "!llvm.ptr") {
+          targetType = "!llvm.ptr";
+        } else if (trueVal.type === "f64" || falseVal.type === "f64") {
+          targetType = "f64";
+        }
+      }
+
+      const coercedTrue = this.coerceType(trueVal, targetType);
+      const coercedFalse = this.coerceType(falseVal, targetType);
+
+      const ssa = this.builder.nextSSA();
+      if (targetType === "!llvm.ptr" || (targetType && targetType.startsWith("!llvm."))) {
+        this.builder.emit(
+          `${ssa} = llvm.select ${cond.ssa}, ${coercedTrue.ssa || coercedTrue.ptr}, ${coercedFalse.ssa || coercedFalse.ptr} : i1, ${targetType}`
+        );
+      } else {
+        this.builder.emit(
+          `${ssa} = arith.select ${cond.ssa}, ${coercedTrue.ssa || coercedTrue.ptr}, ${coercedFalse.ssa || coercedFalse.ptr} : ${targetType}`
+        );
+      }
+
+      return {
+        ssa,
+        ptr: ssa,
+        type: targetType,
+        isString: Boolean(trueVal.isString || falseVal.isString),
+        structName: trueVal.structName || falseVal.structName || null,
+        isArray: Boolean(trueVal.isArray || falseVal.isArray),
+        elemType: trueVal.elemType || falseVal.elemType || null,
+        isHeap: targetType === "!llvm.ptr",
+      };
     }
 
     throw new Error(`[Lowering] Desteklenmeyen ifade: ${expr.type}`);

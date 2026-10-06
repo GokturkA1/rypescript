@@ -14,7 +14,7 @@ export class ClassLowerer {
       if (!baseMeta) continue;
 
       for (const [mName, mMeta] of baseMeta.methods.entries()) {
-        if (mMeta.isConstructor) continue;
+        if (mMeta.isConstructor || mMeta.isStatic) continue;
 
         const overrides = [];
         for (const subCls of classList) {
@@ -54,18 +54,23 @@ export class ClassLowerer {
           const typeIdSSA = builder.nextSSA();
           builder.emit(`${typeIdSSA} = llvm.load %arg_this : !llvm.ptr -> i32`);
 
+          const isAbstractMethod = Boolean(mMeta.isAbstract);
           let resSlot = null;
           if (retType !== "none") {
             resSlot = builder.allocateStack(retType);
-            const defVal = builder.nextSSA();
-            builder.emit(
-              `${defVal} = func.call @${baseCls.name}_${mName}(${callArgsList.join(", ")}) : (${callTypesList.join(", ")}) -> ${retType}`
-            );
-            builder.emit(`llvm.store ${defVal}, ${resSlot.ptr} : ${retType}, !llvm.ptr`);
+            if (!isAbstractMethod) {
+              const defVal = builder.nextSSA();
+              builder.emit(
+                `${defVal} = func.call @${baseCls.name}_${mName}(${callArgsList.join(", ")}) : (${callTypesList.join(", ")}) -> ${retType}`
+              );
+              builder.emit(`llvm.store ${defVal}, ${resSlot.ptr} : ${retType}, !llvm.ptr`);
+            }
           } else {
-            builder.emit(
-              `func.call @${baseCls.name}_${mName}(${callArgsList.join(", ")}) : (${callTypesList.join(", ")}) -> ()`
-            );
+            if (!isAbstractMethod) {
+              builder.emit(
+                `func.call @${baseCls.name}_${mName}(${callArgsList.join(", ")}) : (${callTypesList.join(", ")}) -> ()`
+              );
+            }
           }
 
           for (const ov of overrides) {

@@ -7,6 +7,15 @@ declare global {
   // 1. SKALER VE SİSTEM TİP TANIMLARI (PRIMITIVES)
   // ==========================================
 
+  /** 8-bit işaretli tamsayı (LLVM i8). Aralık: -128 .. 127 */
+  type i8 = number;
+
+  /** 8-bit işaretsiz tamsayı (LLVM i8). Aralık: 0 .. 255 */
+  type u8 = number;
+
+  /** 8-bit işaretsiz bayt (LLVM i8). Aralık: 0 .. 255 */
+  type byte = number;
+
   /** 32-bit işaretli tamsayı (LLVM i32). Aralık: -2,147,483,648 .. 2,147,483,647 */
   type i32 = number;
 
@@ -320,6 +329,16 @@ declare global {
      * @param code Süreç çıkış kodu (Varsayılan: 0).
      */
     function exit(code?: number): never;
+
+    /**
+     * Komut satırı argümanları listesi.
+     */
+    const argv: string[];
+
+    /**
+     * Komut satırı argüman sayısı.
+     */
+    const argc: number;
   }
 
   // ==========================================

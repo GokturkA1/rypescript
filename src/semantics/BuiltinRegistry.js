@@ -11,8 +11,25 @@ export class BuiltinRegistry {
     this.typeAliasRegistry = new Map();
     this.unionRegistry = new Map();
     this.functionTypeAliases = new Set();
+    this.namespaceRegistry = new Map();
 
     this.registerBuiltins();
+  }
+
+  registerNamespace(nsName) {
+    if (!this.namespaceRegistry.has(nsName)) {
+      this.namespaceRegistry.set(nsName, {
+        name: nsName,
+        functions: new Map(),
+        variables: new Map(),
+        classes: new Map(),
+      });
+    }
+    return this.namespaceRegistry.get(nsName);
+  }
+
+  getNamespace(nsName) {
+    return this.namespaceRegistry.get(nsName) || null;
   }
 
   registerBuiltins() {
@@ -30,7 +47,8 @@ export class BuiltinRegistry {
     this.functionSignatures.set("free", { params: ["pointer"], returnType: "void" });
     this.functionSignatures.set("alloca", { params: ["number"], returnType: "pointer" });
     this.functionSignatures.set("sleep", { params: ["number"], returnType: "void" });
-    this.functionSignatures.set("exit", { params: ["number"], minArgs: 0, returnType: "never" });
+    // [COMPILER_BUILTIN_STD_COMMENTED_OUT] exit() otomatik builtin fonksiyon kaydı yorum satırına alındı. Artık std/process.ts veya FFI declare kullanılmalıdır.
+    // this.functionSignatures.set("exit", { params: ["number"], minArgs: 0, returnType: "never" });
     this.functionSignatures.set("panic", { params: ["string"], returnType: "never" });
     this.functionSignatures.set("assert", { params: ["boolean", "string"], returnType: "void" });
     this.functionSignatures.set("join", { params: ["pointer"], returnType: "void" });
@@ -139,7 +157,7 @@ export class BuiltinRegistry {
     const stringMethods = new Map([
       ["slice", { params: ["number", "number"], minArgs: 1, returnType: "string" }],
       ["substring", { params: ["number", "number"], minArgs: 1, returnType: "string" }],
-      ["charCodeAt", { params: ["number"], minArgs: 1, returnType: "number" }],
+      ["charCodeAt", { params: ["number"], minArgs: 0, returnType: "number" }],
     ]);
     this.structSignatures.set("string", {
       fields: new Map([["length", { type: "number" }]]),
@@ -153,13 +171,23 @@ export class BuiltinRegistry {
       ]),
     });
 
-    // 10. process Namespace (Süreç Kontrolü)
+    // [COMPILER_BUILTIN_STD_COMMENTED_OUT] Otomatik oluşturulan process Namespace ve struct tanımları yorum satırına alındı. Artık std/process.ts modülü kullanılmalıdır.
+    /*
     this.structSignatures.set("process", {
-      fields: new Map(),
+      fields: new Map([
+        ["argv", { type: "string[]" }],
+        ["argc", { type: "number" }],
+      ]),
       methods: new Map([
         ["exit", { params: ["number"], minArgs: 0, returnType: "never" }],
       ]),
     });
+
+    const processNs = this.registerNamespace("process");
+    processNs.variables.set("argv", { type: "string[]" });
+    processNs.variables.set("argc", { type: "number" });
+    processNs.functions.set("exit", { params: ["number"], minArgs: 0, returnType: "never" });
+    */
 
     // 10. SIMD Vektör Tipleri ve Fonksiyonları
     const vectorTypes = ["f32x4", "f64x2", "i32x4", "i64x2", "f64x4", "f32x8", "i32x8"];

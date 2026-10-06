@@ -279,6 +279,15 @@ export class Monomorphizer {
       scanAndSpecialize(n);
     }
 
+    for (const clsNode of synthesizedClasses) {
+      scanAndSpecialize(clsNode);
+      allParsedNodes.push(clsNode);
+    }
+    for (const fnNode of synthesizedFunctions) {
+      scanAndSpecialize(fnNode);
+      allParsedNodes.push(fnNode);
+    }
+
     return { synthesizedClasses, synthesizedFunctions };
   }
 }

@@ -347,10 +347,10 @@ export class MLIRBuilder {
     }
   }
 
-  createWhile(condEvaluator, bodyFn) {
+  createWhile(condEvaluator, bodyFn, customExitBlock = null) {
     const condBlock = this.nextBlock("while_cond");
     const bodyBlock = this.nextBlock("while_body");
-    const exitBlock = this.nextBlock("while_exit");
+    const exitBlock = customExitBlock || this.nextBlock("while_exit");
 
     this.emitBranch(condBlock);
     this.emitBlockLabel(condBlock);
@@ -466,6 +466,35 @@ export class MLIRBuilder {
       const ssa = this.nextSSA();
       this.emit(`${ssa} = func.call @rts_union_to_string(${val.ssa || val.ptr}) : (!llvm.ptr) -> !llvm.ptr`);
       return { ssa, ptr: ssa, type: "!llvm.ptr", isString: true, isHeap: true };
+    }
+
+    if (val.isVector || (val.type && val.type.startsWith("vector<"))) {
+      this.markFeature("vector");
+      const m = (val.type || "").match(/^vector<(\d+)x([a-z0-9]+)>$/);
+      const len = m ? parseInt(m[1], 10) : 4;
+      const elemType = m ? m[2] : "f32";
+      const lb = this.getOrRegisterString("[");
+      const lbAddr = this.nextSSA();
+      this.emit(`${lbAddr} = llvm.mlir.addressof ${lb} : !llvm.ptr`);
+      let cur = { ssa: lbAddr, type: "!llvm.ptr", isString: true };
+      const comma = this.getOrRegisterString(", ");
+      const commaAddr = this.nextSSA();
+      this.emit(`${commaAddr} = llvm.mlir.addressof ${comma} : !llvm.ptr`);
+      for (let i = 0; i < len; i++) {
+        if (i > 0) {
+          cur = this.createStringConcat(cur, { ssa: commaAddr, type: "!llvm.ptr", isString: true });
+        }
+        const idxSSA = this.nextSSA();
+        this.emit(`${idxSSA} = arith.constant ${i} : index`);
+        const elemSSA = this.nextSSA();
+        this.emit(`${elemSSA} = vector.extract ${val.ssa}[${idxSSA}] : ${elemType} from ${val.type}`);
+        const elemStr = this.convertToString({ ssa: elemSSA, type: elemType });
+        cur = this.createStringConcat(cur, elemStr);
+      }
+      const rb = this.getOrRegisterString("]");
+      const rbAddr = this.nextSSA();
+      this.emit(`${rbAddr} = llvm.mlir.addressof ${rb} : !llvm.ptr`);
+      return this.createStringConcat(cur, { ssa: rbAddr, type: "!llvm.ptr", isString: true });
     }
 
     if (val.type === "!llvm.ptr") {
@@ -668,7 +697,8 @@ export class MLIRBuilder {
       }
     }
 
-    if (this.usedFeatures.exit) {
+    // Compiler dahili exit desteği (Harici declare edilmediyse llvm.func @exit ekle)
+    if (this.usedFeatures.exit && !this.externalFunctions.has("exit")) {
       if (isWasm) {
         header += `  llvm.func @exit(%code: i32) {\n    llvm.unreachable\n  }\n`;
       } else {

@@ -22,6 +22,7 @@ export class ScopeManager {
     let isClass = false;
     let classMeta = null;
     let isConstructor = false;
+    let isStaticMethod = false;
 
     if (typeof options === "boolean") {
       isFunction = options;
@@ -33,6 +34,7 @@ export class ScopeManager {
       isClass = Boolean(options.isClass);
       classMeta = options.classMeta || null;
       isConstructor = Boolean(options.isConstructor);
+      isStaticMethod = Boolean(options.isStaticMethod);
     }
 
     this.scopes.push({
@@ -43,6 +45,7 @@ export class ScopeManager {
       isClass,
       classMeta,
       isConstructor,
+      isStaticMethod,
       symbols: new Map(),
     });
   }
@@ -89,6 +92,14 @@ export class ScopeManager {
     return false;
   }
 
+  isInConstructor() {
+    for (let i = this.scopes.length - 1; i >= 0; i--) {
+      if (this.scopes[i].isConstructor) return true;
+      if (this.scopes[i].isFunction) return false;
+    }
+    return false;
+  }
+
   isInLoop() {
     for (let i = this.scopes.length - 1; i >= 0; i--) {
       if (this.scopes[i].isLoop) return true;
@@ -106,6 +117,14 @@ export class ScopeManager {
   isInClass() {
     for (let i = this.scopes.length - 1; i >= 0; i--) {
       if (this.scopes[i].isClass) return true;
+    }
+    return false;
+  }
+
+  isInStaticMethod() {
+    for (let i = this.scopes.length - 1; i >= 0; i--) {
+      if (this.scopes[i].isStaticMethod) return true;
+      if (this.scopes[i].isFunction) return false;
     }
     return false;
   }

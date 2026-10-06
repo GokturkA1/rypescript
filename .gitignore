@@ -10,6 +10,7 @@ ast-lowerer.js
 compiler-engine.js
 diagnostics.js
 mlir-builder.js
+REFACTOR.md
 
 # --- İşletim Sistemi ve Editör Artıkları ---
 
