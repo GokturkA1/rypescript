@@ -20,6 +20,9 @@ let dumpLLVM = false;
 let isJIT = false;
 let explicitHeaderFile = null;
 let genHeader = false;
+let linkMode = "dynamic";
+const extraLibDirs = [];
+const extraLibs = [];
 
 for (let i = 0; i < args.length; i++) {
   const arg = args[i];
@@ -29,6 +32,12 @@ for (let i = 0; i < args.length; i++) {
     rawTarget = args[++i];
   } else if ((arg === "--format" || arg === "-f") && i + 1 < args.length) {
     rawFormat = args[++i];
+  } else if (arg === "--standalone") {
+    linkMode = "standalone";
+  } else if (arg === "--static") {
+    linkMode = "static";
+  } else if (arg === "--dynamic") {
+    linkMode = "dynamic";
   } else if (arg === "--dump-mlir") {
     dumpMLIR = true;
   } else if (arg === "--dump-llvm") {
@@ -40,13 +49,19 @@ for (let i = 0; i < args.length; i++) {
     if (i + 1 < args.length && !args[i + 1].startsWith("-")) {
       explicitHeaderFile = args[++i];
     }
+  } else if (arg.startsWith("-L")) {
+    const dir = arg.length > 2 ? arg.slice(2) : args[++i];
+    extraLibDirs.push(dir);
+  } else if (arg.startsWith("-l")) {
+    const lib = arg.length > 2 ? arg.slice(2) : args[++i];
+    extraLibs.push(lib);
   } else if (!arg.startsWith("-") && !inputFile) {
     inputFile = arg;
   }
 }
 
 if (!inputFile || !fs.existsSync(inputFile)) {
-  console.log("Kullanım: node index.js <giris_dosyasi.ts> [-o <cikti>] [--target <triple>] [--format <format>] [--dump-mlir] [--dump-llvm] [--jit] [--header]");
+  console.log("Kullanım: node index.js <giris_dosyasi.ts> [-o <cikti>] [--target <triple>] [--format <format>] [--standalone] [--static] [--dynamic] [--dump-mlir] [--dump-llvm] [--jit] [--header]");
   process.exit(1);
 }
 
@@ -56,10 +71,11 @@ const targetInfo = TargetManager.resolve({
   format: rawFormat,
   outputFile,
   jit: isJIT,
+  linkMode,
 });
 
 console.log(`[RTS] Giriş noktası: ${inputFile}`);
-console.log(`[RTS] Hedef Triplet: ${targetInfo.triple} [Format: ${targetInfo.format}, Linker: ${targetInfo.linkerFlavor}]`);
+console.log(`[RTS] Hedef Triplet: ${targetInfo.triple} [Format: ${targetInfo.format}, Linker: ${targetInfo.linkerFlavor}, Mod: ${targetInfo.linkMode}]`);
 
 // 1. Modül Bağımlılık Grafı Çözücü (DFS / Topological Sort)
 const { modules, nativeLibs, headerFiles } = ModuleResolver.resolve(inputFile);
@@ -99,7 +115,7 @@ if (dumpMLIR) {
 }
 
 // 3. Backend Motoru: MLIR -> LLVM -> Native Executable / Cross Binary / JIT
-CompilerEngine.compile(mlirModule, outputFile, { dumpLLVM, jit: isJIT, targetInfo, nativeLibs });
+CompilerEngine.compile(mlirModule, outputFile, { dumpLLVM, jit: isJIT, targetInfo, nativeLibs, extraLibDirs, extraLibs, linkMode });
 if (!isJIT) {
   console.log(`✓ Başarılı: ./${outputFile} [Format: ${targetInfo.format}, Hedef: ${targetInfo.triple}]`);
 

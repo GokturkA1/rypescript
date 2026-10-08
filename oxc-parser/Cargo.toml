@@ -1,0 +1,26 @@
+[package]
+name = "oxc_parser_napi"
+version = "0.153.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "oxc_parser"
+crate-type = ["cdylib", "staticlib", "lib"]
+test = false
+doctest = false
+
+[dependencies]
+oxc = { version = "0.153.0", features = ["ast_visit", "regular_expression", "semantic", "serialize"] }
+oxc_ast = { version = "0.153.0" }
+oxc_ast_macros = { version = "0.153.0" }
+oxc_ast_visit = { version = "0.153.0", features = ["serialize"] }
+oxc_diagnostics = { version = "0.153.0" }
+oxc_estree = { version = "0.153.0" }
+oxc_span = { version = "0.153.0" }
+oxc_str = { version = "0.153.0" }
+oxc_syntax = { version = "0.153.0" }
+
+rustc-hash = "2.1.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

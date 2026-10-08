@@ -1013,7 +1013,7 @@ export class ExpressionLowerer {
           this.builder.store(fieldPtr, rhs);
 
           if (rhs.type === "!llvm.ptr" || rhs.isHeap) {
-            this.markTransferred(rhs.ssa || rhs.ptr);
+            this.markTransferred(rhs.origPtr || rhs.ssa || rhs.ptr);
           }
           return rhs;
         }
@@ -1096,7 +1096,7 @@ export class ExpressionLowerer {
             this.builder.store(addr, rhs);
             if (rhs.isString) g.isString = true;
             if (rhs.type === "!llvm.ptr" || rhs.isHeap) {
-              this.markTransferred(rhs.ssa || rhs.ptr);
+              this.markTransferred(rhs.origPtr || rhs.ssa || rhs.ptr);
             }
             return rhs;
           }

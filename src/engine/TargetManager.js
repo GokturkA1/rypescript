@@ -1,5 +1,5 @@
 // src/engine/TargetManager.js
-import { existsSync } from "node:fs";
+import fs, { existsSync } from "node:fs";
 import path from "node:path";
 
 /**
@@ -73,6 +73,7 @@ export class TargetManager {
     const rawFormat = (options.format || "").toLowerCase().trim() || null;
     const outputFile = options.outputFile || "";
     const isJIT = Boolean(options.jit);
+    const linkMode = options.linkMode || "dynamic";
 
     if (isJIT) {
       return {
@@ -82,6 +83,7 @@ export class TargetManager {
         os: "linux",
         env: "gnu",
         format: "jit",
+        linkMode: "dynamic",
         isWindows: false,
         isLinux: true,
         isWasm: false,
@@ -162,7 +164,7 @@ export class TargetManager {
     // 5. LLVM Relocation Mode (0: Default/Static, 2: PIC)
     // Paylaşımlı kütüphaneler (.so, .node, .dll, .dylib) ve Linux PIE için RelocMode: 2 zorunludur
     let relocMode = 0;
-    if (isShared || format === "elf") {
+    if (isShared || (format === "elf" && linkMode !== "static")) {
       relocMode = 2; // LLVMRelocPIC
     }
 
@@ -218,6 +220,7 @@ export class TargetManager {
       os,
       env,
       format,
+      linkMode,
       isWindows,
       isLinux,
       isWasm,
@@ -230,6 +233,30 @@ export class TargetManager {
     };
   }
 
+  static findGccDir() {
+    const baseGccDirs = [
+      "/usr/lib/gcc/x86_64-pc-linux-gnu",
+      "/usr/lib/gcc/x86_64-linux-gnu",
+      "/usr/lib64/gcc/x86_64-pc-linux-gnu",
+      "/usr/lib/gcc",
+    ];
+    for (const base of baseGccDirs) {
+      if (existsSync(base)) {
+        try {
+          const entries = fs.readdirSync(base);
+          entries.sort().reverse();
+          for (const entry of entries) {
+            const cand = path.join(base, entry);
+            if (existsSync(path.join(cand, "crtbeginS.o"))) {
+              return cand;
+            }
+          }
+        } catch (e) {}
+      }
+    }
+    return null;
+  }
+
   /**
    * Hedef platforma özel LLD bağlayıcı (linker) argümanlarını üretir.
    */
@@ -239,36 +266,183 @@ export class TargetManager {
     // 1. Linux/FreeBSD ELF Linker (ld.lld)
     if (linkerFlavor === "link_elf") {
       if (format === "elf") {
+        const linkMode = targetInfo.linkMode || "dynamic";
         const crtDirs = ["/usr/lib", "/usr/lib64", "/usr/lib/x86_64-linux-gnu"];
         const crtDir = crtDirs.find((d) => existsSync(`${d}/crt1.o`) || existsSync(`${d}/Scrt1.o`)) || "/usr/lib";
-        const crt1 = existsSync(`${crtDir}/Scrt1.o`) ? `${crtDir}/Scrt1.o` : `${crtDir}/crt1.o`;
+        const gccDir = this.findGccDir();
+
+        let crt1 = `${crtDir}/crt1.o`;
+        let crtbegin = gccDir && existsSync(`${gccDir}/crtbeginT.o`) ? `${gccDir}/crtbeginT.o` : null;
+        let crtend = gccDir && existsSync(`${gccDir}/crtend.o`) ? `${gccDir}/crtend.o` : null;
+
+        if (linkMode !== "static") {
+          crt1 = existsSync(`${crtDir}/Scrt1.o`) ? `${crtDir}/Scrt1.o` : `${crtDir}/crt1.o`;
+          crtbegin = gccDir && existsSync(`${gccDir}/crtbeginS.o`) ? `${gccDir}/crtbeginS.o` : null;
+          crtend = gccDir && existsSync(`${gccDir}/crtendS.o`) ? `${gccDir}/crtendS.o` : null;
+        }
+
         const crti = `${crtDir}/crti.o`;
         const crtn = `${crtDir}/crtn.o`;
 
+        const extraLibDirs = options.extraLibDirs || [];
+        const extraLibs = options.extraLibs || [];
+        const isBuildingRypec = outputFile.includes("rypec") || extraLibDirs.some((d) => d.includes("llvm-rype"));
+
         const nativeArgs = [];
         if (options.nativeLibs && options.nativeLibs.length > 0) {
-          for (const libPath of options.nativeLibs) {
-            const libDir = path.dirname(libPath);
-            nativeArgs.push(`-L${libDir}`);
-            nativeArgs.push(`-rpath=${libDir}`);
-            nativeArgs.push(libPath);
+          for (let libPath of options.nativeLibs) {
+            if (libPath.includes("liboxc_parser")) {
+              continue; // Handled explicitly below
+            }
+            const aPath = libPath.replace(/\.(so|dylib)$/, ".a");
+            if ((linkMode === "standalone" || linkMode === "static") && existsSync(aPath)) {
+              nativeArgs.push(aPath);
+            } else {
+              const libDir = path.dirname(libPath);
+              nativeArgs.push(`-L${libDir}`);
+              if (linkMode !== "static") {
+                nativeArgs.push(`-rpath=${libDir}`);
+              }
+              nativeArgs.push(libPath);
+            }
           }
         }
 
-        return [
-          "-pie",
-          "-dynamic-linker", "/lib64/ld-linux-x86-64.so.2",
-          crt1,
-          crti,
-          objFile,
-          ...nativeArgs,
-          `-L${crtDir}`,
-          "-lc",
-          "-lm",
-          "-lpthread",
-          crtn,
-          "-o", outputFile,
-        ];
+        const args = [];
+
+        if (linkMode === "static") {
+          args.push("-static");
+        } else {
+          args.push("-pie", "-dynamic-linker", "/lib64/ld-linux-x86-64.so.2");
+        }
+
+        args.push(crt1, crti);
+        if (crtbegin) {
+          args.push(crtbegin);
+        }
+        args.push(objFile);
+
+        if (isBuildingRypec) {
+          const bridgeObj = path.resolve(process.cwd(), "bridge.o");
+          if (existsSync(bridgeObj)) {
+            args.push(bridgeObj);
+          }
+
+          if (linkMode === "dynamic") {
+            const oxcSo = path.resolve(process.cwd(), "bin/liboxc_parser.so");
+            if (existsSync(oxcSo)) {
+              args.push(oxcSo);
+            } else if (existsSync(path.resolve(process.cwd(), "bin/liboxc_parser.a"))) {
+              args.push(path.resolve(process.cwd(), "bin/liboxc_parser.a"));
+            }
+          } else {
+            const oxcA = path.resolve(process.cwd(), "bin/liboxc_parser.a");
+            if (existsSync(oxcA)) {
+              args.push(oxcA);
+            } else if (existsSync(path.resolve(process.cwd(), "bin/liboxc_parser.so"))) {
+              args.push(path.resolve(process.cwd(), "bin/liboxc_parser.so"));
+            }
+          }
+
+          if (existsSync("bin/llvm_libs.rsp")) {
+            args.push("@bin/llvm_libs.rsp");
+          } else {
+            const llvmLibDir = extraLibDirs.find((d) => d.includes("llvm-rype")) || (existsSync("/opt/llvm-rype/lib") ? "/opt/llvm-rype/lib" : null);
+            if (llvmLibDir && existsSync(llvmLibDir)) {
+              const archives = fs.readdirSync(llvmLibDir)
+                .filter((f) => f.endsWith(".a"))
+                .map((f) => path.join(llvmLibDir, f));
+              args.push("--start-group");
+              args.push(...archives);
+              args.push("--end-group");
+            }
+          }
+        }
+
+        args.push(...nativeArgs);
+
+        args.push(`-L${crtDir}`);
+        if (gccDir) {
+          args.push(`-L${gccDir}`);
+        }
+        for (const dir of extraLibDirs) {
+          args.push(`-L${dir}`);
+        }
+        if (isBuildingRypec && linkMode !== "static") {
+          args.push("-rpath=$ORIGIN");
+        }
+
+        if (linkMode === "static") {
+          args.push("--start-group");
+          if (isBuildingRypec) {
+            args.push(
+              "-lstdc++",
+              "-lgcc",
+              "-lgcc_eh",
+              "-lz",
+              "-lzstd",
+              "-lxml2"
+            );
+          }
+          args.push(
+            "-lc",
+            "-lm",
+            "-lpthread",
+            "-ldl",
+            "-lgcc",
+            "-lgcc_eh"
+          );
+          for (const lib of extraLibs) {
+            args.push(`-l${lib}`);
+          }
+          args.push("--end-group");
+        } else if (linkMode === "standalone") {
+          args.push("-Bstatic", "-lstdc++", "-lgcc", "-lgcc_eh", "-Bdynamic");
+          if (isBuildingRypec) {
+            args.push(
+              "-lz",
+              "-lzstd",
+              "-lxml2",
+              "-lpthread",
+              "-ldl",
+              "-lm",
+              "-lc"
+            );
+          } else {
+            args.push("-lc", "-lm", "-lpthread", "-ldl");
+          }
+          for (const lib of extraLibs) {
+            args.push(`-l${lib}`);
+          }
+        } else {
+          if (isBuildingRypec) {
+            args.push(
+              "-lstdc++",
+              "-lgcc",
+              "-lgcc_s",
+              "-lz",
+              "-lzstd",
+              "-lxml2",
+              "-lpthread",
+              "-ldl",
+              "-lm",
+              "-lc"
+            );
+          } else {
+            args.push("-lc", "-lm", "-lpthread");
+          }
+          for (const lib of extraLibs) {
+            args.push(`-l${lib}`);
+          }
+        }
+
+        if (crtend) {
+          args.push(crtend);
+        }
+        args.push(crtn);
+        args.push("-o", outputFile);
+
+        return args;
       }
 
       // Format: so veya node
@@ -285,9 +459,11 @@ export class TargetManager {
         "-shared",
         objFile,
         ...searchDirs.map((d) => `-L${d}`),
+        ...(options.extraLibDirs || []).map((d) => `-L${d}`),
         "-lc",
         "-lm",
         "-lpthread",
+        ...(options.extraLibs || []).map((l) => `-l${l}`),
         "-o", outputFile,
       ];
     }

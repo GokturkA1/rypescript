@@ -14,6 +14,7 @@
   },
   "include": [
     "rypescript.d.ts",
-    "playground/**/*.ts"
+    "playground/**/*.ts",
+    "stage1/**/*.ts"
   ]
 }

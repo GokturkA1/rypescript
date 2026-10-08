@@ -159,17 +159,18 @@ export class StatementLowerer {
 
           // ESCAPE KONTROLÜ: Nesne fonksiyon dışına sızmıyorsa stack'e yükselt
           let canStackAllocate = false;
+          let escapes = false;
           if (decl.init) {
             if (decl.init.type === "NewExpression") {
               const cls = decl.init.callee.name;
               if (cls !== "Map" && cls !== "Set") {
-                const escapes = this.checkEscape(varName, this.currentFunctionNode);
+                escapes = this.checkEscape(varName, this.currentFunctionNode);
                 if (!escapes) {
                   canStackAllocate = true;
                 }
               }
             } else if (decl.init.type === "ObjectExpression") {
-              const escapes = this.checkEscape(varName, this.currentFunctionNode);
+              escapes = this.checkEscape(varName, this.currentFunctionNode);
               if (!escapes) {
                 canStackAllocate = true;
               }
@@ -301,7 +302,7 @@ export class StatementLowerer {
                 const srcSym = this.symbolTable.get(decl.init.name);
                 if (srcSym) {
                   srcSym.isMoved = true;
-                  this.markTransferred(srcSym.ptr || srcSym.ssa);
+                  this.markTransferred(srcSym.origPtr || srcSym.ptr || srcSym.ssa);
                 }
               }
             } else if (val.isMap || val.isSet) {
@@ -352,6 +353,9 @@ export class StatementLowerer {
                 structName: explicitStruct || val.structName || null,
                 isRef: true,
               });
+              if (escapes) {
+                this.markTransferred(val.origPtr || val.ssa || val.ptr);
+              }
             } else if (!val.isArray && explicitStruct && this.isPolymorphicInterface(explicitStruct)) {
               if (!val.isInterface) {
                 val = this.boxIntoInterface(val, explicitStruct);
@@ -404,6 +408,9 @@ export class StatementLowerer {
                   origPtr: val.origPtr || val.ssa || val.ptr,
                 });
               }
+              if (escapes) {
+                this.markTransferred(val.origPtr || val.ssa || val.ptr);
+              }
             } else {
               const finalStruct = explicitStruct || val.structName;
 
@@ -433,13 +440,17 @@ export class StatementLowerer {
                   });
                 }
 
+                if (escapes) {
+                  this.markTransferred(val.origPtr || val.ssa || val.ptr);
+                }
+
                 // Move Semantiği: Sağdaki ifade doğrudan bir Identifier ise sahipliği taşı
                 if (decl.init.type === "Identifier" && !val.isBorrowed) {
                   const srcSym = this.symbolTable.get(decl.init.name);
                   if (srcSym && (srcSym.isHeap || srcSym.structName || srcSym.isChannel)) {
                     srcSym.isMoved = true;
                     // Taşıma yapıldığı için önceki sahibinin çift free yapmasını önle
-                    this.markTransferred(srcSym.ptr || srcSym.ssa);
+                    this.markTransferred(srcSym.origPtr || srcSym.ptr || srcSym.ssa);
                   }
                 }
               } else {

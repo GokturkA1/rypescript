@@ -778,7 +778,10 @@ export class MLIRBuilder {
     for (const [text, sym] of this.globalStrings.entries()) {
       const escaped = text
         .replace(/\\/g, "\\\\")
+        .replace(/\0/g, "\\00")
         .replace(/\n/g, "\\0A")
+        .replace(/\r/g, "\\0D")
+        .replace(/\t/g, "\\09")
         .replace(/"/g, '\\"') + "\\00";
       header += `  llvm.mlir.global internal constant ${sym}("${escaped}")\n`;
     }

@@ -9,17 +9,13 @@ import { TargetManager } from "./TargetManager.js";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, "../../");
 
-const libMLIR = existsSync("/opt/llvm-rype/lib/libMLIR-C.so")
-? "/opt/llvm-rype/lib/libMLIR-C.so"
-: existsSync("/usr/local/lib/libMLIR-C.so")
-? "/usr/local/lib/libMLIR-C.so"
-: `/usr/lib/libMLIR-C.so`;
+const libMLIR = existsSync("/usr/local/lib/libMLIR-C.so")
+  ? "/usr/local/lib/libMLIR-C.so"
+  : `/usr/lib/libMLIR-C.so`;
 
-const libLLVM = existsSync("/opt/llvm-rype/lib/libLLVM.so")
-? "/opt/llvm-rype/lib/libLLVM.so"
-: existsSync("/usr/local/lib/libLLVM.so")
-? "/usr/local/lib/libLLVM.so"
-: `/usr/lib/libLLVM.so`;
+const libLLVM = existsSync("/usr/local/lib/libLLVM.so")
+  ? "/usr/local/lib/libLLVM.so"
+  : `/usr/lib/libLLVM.so`;
 
 const { functions: mlir } = dlopen(libMLIR, {
   mlirContextCreate: { arguments: [], return: "pointer" },
@@ -224,6 +220,7 @@ export class CompilerEngine {
       format: options.format,
       outputFile,
       jit: options.jit,
+      linkMode: options.linkMode,
     });
 
     if (options.dumpLLVM) {
