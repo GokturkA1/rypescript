@@ -1,57 +1,57 @@
-# RypeScript Dil Sartnamesi (Language Specification)
+# RypeScript Dil Şartnamesi (Language Specification)
 
-Bu dokuman, RypeScript dilinin sozluksel, anlamsal, tip sistemi, bellek yonetimi, eszamanlilik, donanim hizlandirma ve dis ortam baglanti (FFI) yeteneklerini teknik ayrintilariyla tanimlar.
+Bu doküman, RypeScript dilinin sözlüksel, anlamsal, tip sistemi, bellek yönetimi, eşzamanlılık, donanım hızlandırma, derleyici pragmaları ve dış ortam bağlantı (FFI) yeteneklerini teknik ayrıntılarıyla tanımlar.
 
-Bu proje bir Proof of Concept (PoC) ve kisisel hobi calismasidir; endustriyel uretim ortamlari icin tasarlanmamistir ve boyle bir garanti tasimaz.
+Bu proje bir Proof of Concept (PoC) ve kişisel hobi çalışmasıdır; endüstriyel üretim ortamları için tasarlanmamıştır ve kararlılık/güvenlik garantisi taşımaz.
 
 ---
 
 ## 1. Tip Sistemi ve Primitifler
 
-RypeScript, statik olarak tiplenen ve dogrudan LLVM/MLIR tiplerine karsilik gelen zengin bir tur hiyerarsisine sahiptir.
+RypeScript, statik olarak tiplenen ve doğrudan LLVM/MLIR tiplerine karşılık gelen bir tür hiyerarşisine sahiptir.
 
-### 1.1. Skaler Sayisal Tipler
+### 1.1. Skaler Sayısal Tipler
 
-| Tip | Bit Genisligi | LLVM Karsiligi | Aciklama |
+| Tip | Bit Genişliği | LLVM Karşılığı | Açıklama |
 | :--- | :--- | :--- | :--- |
-| `i8` | 8-bit | `i8` | Isaretli tamsayi (-128 .. 127) |
-| `u8` / `byte` | 8-bit | `i8` | Isaretsiz tamsayi (0 .. 255) |
-| `i16` | 16-bit | `i16` | Isaretli 16-bit tamsayi |
-| `u16` | 16-bit | `i16` | Isaretsiz 16-bit tamsayi |
-| `i32` / `int` | 32-bit | `i32` | Isaretli 32-bit tamsayi (C `int` uyumlu) |
-| `u32` | 32-bit | `i32` | Isaretsiz 32-bit tamsayi |
-| `i64` | 64-bit | `i64` | Isaretli 64-bit tamsayi |
-| `u64` | 64-bit | `i64` | Isaretsiz 64-bit tamsayi |
-| `f32` / `float` | 32-bit | `f32` | Tek duyarlikli kayan noktali sayi (IEEE 754) |
-| `f64` / `double` | 64-bit | `f64` | Cift duyarlikli kayan noktali sayi (IEEE 754) |
-| `usize` | Mimari bagimli | `i64` (x86_64) | Isaretci genisliginde isaretsiz tamsayi |
-| `isize` | Mimari bagimli | `i64` (x86_64) | Isaretci genisliginde isaretli tamsayi |
-| `bool` / `boolean`| 1-bit | `i1` | Mantiksal dogruluk degeri (`true` / `false`) |
-| `number` | 64-bit | `f64` / `i32` | TypeScript uyumluluk sayisal tipi |
+| `i8` | 8-bit | `i8` | İşaretli tamsayı (-128 .. 127) |
+| `u8` / `byte` | 8-bit | `i8` | İşaretsiz tamsayı (0 .. 255) |
+| `i16` | 16-bit | `i16` | İşaretli 16-bit tamsayı |
+| `u16` | 16-bit | `i16` | İşaretsiz 16-bit tamsayı |
+| `i32` / `int` | 32-bit | `i32` | İşaretli 32-bit tamsayı (C `int` uyumlu) |
+| `u32` | 32-bit | `i32` | İşaretsiz 32-bit tamsayı |
+| `i64` | 64-bit | `i64` | İşaretli 64-bit tamsayı |
+| `u64` | 64-bit | `i64` | İşaretsiz 64-bit tamsayı |
+| `f32` / `float` | 32-bit | `f32` | Tek duyarlıklı kayan noktalı sayı (IEEE 754) |
+| `f64` / `double` | 64-bit | `f64` | Çift duyarlıklı kayan noktalı sayı (IEEE 754) |
+| `usize` | Mimari bağımlı | `i64` (x86_64) | İşaretçi genişliğinde işaretsiz tamsayı |
+| `isize` | Mimari bağımlı | `i64` (x86_64) | İşaretçi genişliğinde işaretli tamsayı |
+| `bool` / `boolean`| 1-bit | `i1` | Mantıksal doğruluk değeri (`true` / `false`) |
+| `number` | 64-bit | `f64` / `i32` | TypeScript uyumluluk sayısal tipi |
 
-### 1.2. Isaretci ve Bellek Tipleri
+### 1.2. İşaretçi ve Bellek Tipleri
 
-* **`pointer` / `ptr`:** Ham LLVM isaretcisini (`!llvm.ptr`) temsil eder. C seviyesinde bellek adreslerini, FFI cagri parametrelerini ve dinamik tahsisatlari tutar. Tip guvenligi denetiminden muaftir.
+* **`pointer` / `ptr`:** Ham LLVM işaretçisini (`!llvm.ptr`) temsil eder. C seviyesinde bellek adreslerini, FFI çağrı parametrelerini ve dinamik tahsisatları tutar. Statik tip denetiminden muaftır ve doğrudan adres aritmetiğine olanak tanır.
 
-### 1.3. Ozel Tipler
+### 1.3. Özel Tipler
 
-* **`void`:** Donus degeri olmayan fonksiyonlari tanimlar.
-* **`never`:** Calismasi sonlanan veya panik ureten fonksiyonlarin donus tipidir.
-* **`any`:** Statik tip denetimini devre disi birakan gecis tipidir.
+* **`void`:** Dönüş değeri bulunmayan fonksiyonları tanımlar.
+* **`never`:** Çalışması sonlanan veya panik üreten fonksiyonların dönüş tipidir.
+* **`any`:** Statik tip denetimini devre dışı bırakan geçiş tipidir.
 
 ---
 
-## 2. Nesne Yonelimli Programlama ve Veri Yapilari
+## 2. Nesne Yönelimli Programlama ve Veri Yapıları
 
-### 2.1. Siniflar (Classes)
+### 2.1. Sınıflar (Classes)
 
-RypeScript siniflari, C++ sinif duzenine benzer bicimde bellekte duz struct olarak yerlesir:
+RypeScript sınıfları, bellekte düz C struct düzenine benzer biçimde yerleşir:
 
-* **Alanlar ve Baslatma:** Sinif govdesinde tanimlanan alanlar sira ile bellek ofsetlerine atanir.
-* **Kurucu (`constructor`):** Nesne orneklenirken (`new Cls(...)`) cagirilir; heap uzerinde sinif boyutu kadar alan tahsis edilir ve kurucu isletilir.
-* **Statik Uyeler:** Sinif orneginden bagimsiz, global sembol tablosuna baglanan fonksiyon ve alanlardir.
-* **Kalitim (`extends`):** Tekli kalitimi destekler. Ust sinifin tum alanlari alt sinif bellek duzeninin basina yerlestirilir.
-* **Soyut Siniflar (`abstract`):** Dogrudan orneklenemez, yalnizca turetilmek uzere sablon olusturur.
+* **Alanlar ve Başlatma:** Sınıf gövdesinde tanımlanan alanlar tanımlanma sırasıyla bellek ofsetlerine atanır.
+* **Kurucu (`constructor`):** Nesne örneklenirken (`new Cls(...)`) çağrılır; heap üzerinde sınıf boyutu kadar alan tahsis edilir ve kurucu işletilir.
+* **Statik Üyeler:** Sınıf örneğinden bağımsız, global sembol tablosuna bağlanan fonksiyon ve alanlardır.
+* **Kalıtım (`extends`):** Tekli kalıtımı destekler. Üst sınıfın tüm alanları alt sınıf bellek düzeninin başına yerleştirilir (`super(...)` ile üst kurucu çağrısı zorunludur).
+* **Soyut Sınıflar (`abstract`):** Doğrudan örneklenemez, yalnızca türetilmek üzere şablon oluşturur.
 
 ```typescript
 class Animal {
@@ -60,7 +60,7 @@ class Animal {
     this.name = name;
   }
   makeSound(): void {
-    // taban davranis
+    // taban davranış
   }
 }
 
@@ -76,19 +76,19 @@ class Dog extends Animal {
 }
 ```
 
-### 2.2. Sanal Metot Yonlendirmesi (Vtable Dispatch)
+### 2.2. Sanal Metot Yönlendirmesi (Vtable Dispatch)
 
-Cok bicimlilik (polymorphism), sanal metot tablosu (vtable) araciligiyla calisma zamaninda dolayli cagri (`indirect call`) olarak yurutulur:
+Çok biçimlilik (polymorphism), sanal metot tablosu (vtable) aracılığıyla çalışma zamanında dolaylı çağrı (`indirect call`) olarak yürütülür:
 
-* Alt sinif tarafindan ezilen (override) metotlar, taban sinif gostericisi uzerinden cagirildiginda nesnenin basindaki vtable gostericisi uzerinden cozumlenir.
+* Alt sınıf tarafından ezilen (override) metotlar, taban sınıf göstericisi üzerinden çağrıldığında nesnenin başındaki vtable göstericisi üzerinden çözümlenir.
 
-### 2.3. Arayuzler ve Yapisal Alt Tipleme (Structural Typing / Duck Typing)
+### 2.3. Arayüzler ve Yapısal Alt Tipleme (Structural Typing / Duck Typing)
 
-Arayuzler (Interfaces), siniflar arasinda acik bir `implements` bildirimi olmasa dahi yapisal uyumlulugu destekler:
+Arayüzler (Interfaces), sınıflar arasında açık bir `implements` bildirimi olmasa dahi yapısal uyumluluğu destekler:
 
-* **`itable` (Interface Table) ve Fat Pointer:** Bir nesne bir arayuz referansina atandiginda, derleyici iki isaretciden olusan bir fat pointer olusturur:
-  1. Nesne ornegine isaret eden veri gostericisi (`data pointer`).
-  2. Arayuz metodlarinin gercek adreslerini iceren sanal arayuz tablosu (`itable pointer`).
+* **`itable` (Interface Table) ve Fat Pointer:** Bir nesne bir arayüz referansına atandığında, derleyici iki işaretçiden oluşan bir fat pointer oluşturur:
+  1. Nesne örneğine işaret eden veri göstericisi (`data pointer`).
+  2. Arayüz metotlarının gerçek adreslerini içeren sanal arayüz tablosu (`itable pointer`).
 
 ```typescript
 interface Writer {
@@ -97,7 +97,7 @@ interface Writer {
 
 class FileWriter {
   write(data: string): i32 {
-    // yazma islemi
+    // yazma işlemi
     return 1;
   }
 }
@@ -107,16 +107,16 @@ function processOutput(w: Writer): void {
 }
 
 let fw = new FileWriter();
-processOutput(fw); // Yapisal alt tipleme ile otomatik fat pointer sarmalama
+processOutput(fw); // Yapısal alt tipleme ile otomatik fat pointer sarmalama
 ```
 
 ### 2.4. Tagged Unions ve Untagged Unions
 
 * **Tagged Unions (Etiketli Birlikler):**
-  Farkli tiplerin calisma zamaninda bir etiket (`discriminant`) ile ayirt edilmesini saglar. `typeof`, `instanceof` veya `in` operatorleri ile tip daraltma (type narrowing) uygulanir.
+  Farklı tiplerin çalışma zamanında bir etiket (`discriminant`) ile ayırt edilmesini sağlar. `typeof`, `instanceof` veya `in` operatörleri ile tip daraltma (type narrowing) uygulanır.
 
 * **Untagged Unions (`Untagged<T>`):**
-  C birligi (union) mantigiyla calisir. Tum alanlar bellek ofseti olarak sifirinci (0.) bayti paylasir. Hicbir etiket ya da ek yuk barindirmaz (type-punning icin uygundur).
+  C birliği (union) mantığıyla çalışır. Tüm alanlar bellek ofseti olarak sıfırıncı (0.) baytı paylaşır. Hiçbir etiket ya da ek yük barındırmaz (type-punning için kullanılır).
 
 ```typescript
 type HardwareRegister = Untagged<{
@@ -125,89 +125,92 @@ type HardwareRegister = Untagged<{
 }>;
 ```
 
-### 2.5. Jenerikler (Parametrik Cok Bicimlilik)
+### 2.5. Jenerikler (Parametrik Çok Biçimlilik)
 
-Siniflar, arayuzler ve fonksiyonlar generic tip parametreleri (`<T, U>`) kabul eder. Tip parametreleri semantik analiz sirasinda somut tiplerle eslenir.
+Sınıflar, arayüzler ve fonksiyonlar generic tip parametreleri (`<T, U>`) kabul eder. Tip parametreleri semantik analiz sırasında somut tiplerle eşlenir.
 
 ---
 
-## 3. Bellek Yonetimi ve Sahiplik Modeli
+## 3. Bellek Yönetimi, Sahiplik ve RAII
 
-RypeScript, cop toplayici (garbage collector) calistirma maliyeti olmadan bellek guvenligi ve esnekligi saglamak amaciyla cok katmanli bir bellek yonetim modeli sunar.
+RypeScript, çöp toplayıcı (garbage collector) çalışma zamanı maliyeti olmadan bellek güvenliği ve esnekliği sağlamak amacıyla çok katmanlı bir bellek yönetimi sunar.
 
-### 3.1. Sahiplik ve Odunc Alma (Ownership & Borrowing)
+### 3.1. Sahiplik ve Ödünç Alma (Ownership & Borrowing)
 
 * **`move(target)`:**
-  Bir degiskenin tuttugu kaynagin sahipligini baska bir degiskene veya kapsama tasir. Tasinan kaynak artik eski degisken uzerinden erisilemez (`use-after-move` denetimi).
+  Bir değişkenin tuttuğu kaynağın sahipliğini başka bir değişkene veya kapsama taşır. Taşınan kaynak artık eski değişken üzerinden erişilemez (`use-after-move` statik ve çalışma zamanı denetimi). Kaynak yeni sahibine devredildiğinden eski sahibin çift serbest bırakma (`double-free`) yapması engellenir.
 
 * **`borrow(target)`:**
-  Kaynagin sahipligi devredilmeden, salt-okunur referans olarak fonksiyonlara aktarilmasini saglar.
+  Kaynağın sahipliği devredilmeden, salt-okunur referans olarak fonksiyonlara aktarılmasını sağlar.
 
 ```typescript
 let buffer = malloc(1024);
 let transferred = move(buffer);
-// buffer artik kullanilamaz; transferred gecerlidir.
+// buffer artık kullanılamaz; transferred geçerlidir.
 ```
 
-### 3.2. RAII ve Otomatik Temizlik (`using` Protokolu)
+### 3.2. Deterministic RAII ve `using` Anahtar Sözcüğü
 
-TypeScript'in `using` anahtar sozcugu ve `[Symbol.dispose]` arayuzu tam olarak desteklenir:
+TypeScript'in `using` anahtar sözcüğü (`Explicit Resource Management`), derleyicinin kapsam yığını (scope stack) ile doğrudan entegredir:
 
-* Tanımlanan bloktan veya fonksiyondan cikildiginda (erken `return` dahil) `[Symbol.dispose]` yontemi deterministik olarak cagirilir.
+* **Çalışma Prensibi:** `using` ile tanımlanan bir değişken bildirildiğinde, derleyici bu değişkeni geçerli kapsamın serbest bırakılabilirler listesine (`trackDisposable`) kaydeder.
+* **Kapsam Çıkışı Temizliği:** Kapsamdan (blok sonu, fonksiyon sonu, döngü sonu veya erken `return`) çıkıldığında, derleyici nesne üzerindeki `[Symbol.dispose]()` veya allokatörün `dispose()` metodunu otomatik olarak çağırır.
+* Manuel `free()` veya kaynak iadesi yazma ihtiyacını ortadan kaldırır.
 
 ```typescript
 {
   using arena = new Arena(4096);
   let ptr = arena.alloc(64);
-  // Kapsam sonlandiginda arena.dispose() otomatik calisir.
+  // Kapsam kapandığında arena.dispose() derleyici tarafından otomatik çağrılır.
 }
 ```
 
-### 3.3. Bolgesel ve Ozel Bellek Yoneticileri (Allocators)
+### 3.3. Bölgesel ve Özel Bellek Yöneticileri (Allocators)
 
 1. **`Arena` (Bump Allocator):**
-   * Sirali, sifir parcalanmali bellek ayirici.
+   * Sıralı, parçalanmasız bellek ayırıcı. İşaretçi yalnızca ileri kayar.
    * `alloc(sizeBytes: number): pointer`
-   * `reset(): void`: Isaretciyi basa sararak tum tahsisatlari sifir maliyetle geri kazanir.
-   * `dispose(): void`: Arenanin tuttugu ana bellek blogunu serbest birakir.
+   * `reset(): void`: İşaretçiyi başa sararak tüm tahsisatları sıfır maliyetle anında geri kazanır.
+   * `dispose(): void`: Arenanın tuttuğu ana bellek bloğunu işletim sistemine iade eder.
+   * `[Symbol.dispose]()`: RAII desteği sağlar.
 
 2. **`Pool` (Slab Allocator):**
    * Sabit boyutlu blok havuzu.
-   * `alloc(): pointer`: Havuzdan bos bir blok alir.
-   * `free(ptr: pointer): void`: Bloğu havuza iade eder.
-   * `dispose(): void`: Tum havuzu serbest birakir.
+   * `alloc(): pointer`: Havuzdan boşta duran bir bloğu sabit sürede ($O(1)$) tahsis eder.
+   * `free(ptr: pointer): void`: Bloğu havuza geri kabul eder.
+   * `dispose(): void`: Tüm havuz sayfalarını serbest bırakır.
 
 3. **`FixedBuffer`:**
-   * Sinirli, sabit kapasiteli deterministik tampon. Kapasite asiminda program sonlanir (trap).
+   * Sınırlı, sabit kapasiteli deterministik tampon. Kapasite aşımında program kontrollü olarak trap/abort üretir.
 
-### 3.4. Dusuk Seviyeli Bellek Intrinsics
+### 3.4. Düşük Seviyeli Bellek Intrinsics
 
-C seviyesinde dogrudan bellek manipule etmek icin yerlesik fonksiyonlar mevcuttur:
+C seviyesinde doğrudan bellek manipülasyonu için yerleşik fonksiyonlar sunulur:
 
-* `malloc(sizeBytes: number): pointer`
-* `free(ptr: pointer): void`
-* `alloca(sizeBytes: number): pointer` (Yigin cercevesinde dinamik alan)
-* `ptr_read_u8(ptr, offset?)`, `ptr_write_u8(ptr, offset, val)`
-* `ptr_read_i32(ptr, offset?)`, `ptr_write_i32(ptr, offset, val)`
-* `ptr_read_f64(ptr, offset?)`, `ptr_write_f64(ptr, offset, val)`
-* `ptr_add(ptr, byteOffset): pointer`
+* `malloc(sizeBytes: number): pointer`: Ham heap tahsisi.
+* `free(ptr: pointer): void`: Tahsis edilmiş bloğu serbest bırakma.
+* `alloca(sizeBytes: number): pointer`: Geçerli fonksiyonun yığın çerçevesinde (stack frame) dinamik alan açar; fonksiyon dönüşünde sıfır maliyetle geri kazanılır.
+* `ptr_read_u8(ptr, offset?)`, `ptr_write_u8(ptr, offset, val)`: 8-bit ham bellek okuma/yazma.
+* `ptr_read_i32(ptr, offset?)`, `ptr_write_i32(ptr, offset, val)`: 32-bit tamsayı okuma/yazma.
+* `ptr_read_f64(ptr, offset?)`, `ptr_write_f64(ptr, offset, val)`: 64-bit float okuma/yazma.
+* `ptr_add(ptr, byteOffset): pointer`: İşaretçi aritmetiği ile bayt ofseti ekleme.
 
 ---
 
-## 4. Deterministik Hata Yonetimi
+## 4. Hata Yönetimi ve Kontrol Akışı
 
 ### 4.1. `Result<T, E>` Modeli
 
-C-ABI duzeyinde calisan, sifir maliyetli basari/hata sarmalayicisidir:
+C-ABI düzeyinde çalışan, sıfır maliyetli başarı/hata sarmalayıcısıdır:
 
-* `Ok<T>(val: T): Result<T, E>`
-* `Err<E>(err: E): Result<T, E>`
-* `unwrap<T>(res: Result<T, E>): T`: Eger sonuc `Err` ise program `panic` ile sonlanir.
+* `Ok<T>(val: T): Result<T, E>`: Başarılı sonuç sarmalar (`ok = true`).
+* `Err<E>(err: E): Result<T, E>`: Hata değeri sarmalar (`ok = false`).
+* `unwrap<T>(res: Result<T, E>): T`: Sonuç hatalıysa programı panik ile sonlandırır; başarılıysa değeri döner.
 
 ```typescript
 function divide(a: f64, b: f64): Result<f64, string> {
   if (b === 0.0) {
-    return Err("Sifira bolme hatasi");
+    return Err("Sıfıra bölme hatası");
   }
   return Ok(a / b);
 }
@@ -220,100 +223,165 @@ if (r.ok) {
 
 ### 4.2. Sav ve Panik
 
-* **`panic(message?: string): never`:** Kurtarilamaz hata durumunda programi aninda LLVM abort/trap durumuna gecirir.
-* **`assert(condition: boolean, message?: string)`:** Kosul `false` ise panik uretir.
+* **`panic(message?: string): never`:** Kurtarılamaz hata durumunda programı anında LLVM abort/trap durumuna geçirerek sonlandırır.
+* **`assert(condition: boolean, message?: string)`:** Koşul `false` ise panik üretir.
 
-### 4.3. Istisnalar (`try` / `catch` / `throw`)
+### 4.3. İstisnalar (`try` / `catch` / `finally`) ve `finally` Kullanım Amacı
 
-Geleneksel istisna yonetimi kontrol akisi duzeyinde desteklenir.
+RypeScript, yerel makine kodu seviyesinde istisna yönetimini iki farklı strateji ile ele alır:
+
+1. **Sıfır Maliyetli `defer` Modu (`try { ... } finally { ... }`):**
+   * Eğer bir `try` bloğunda `catch` tanımlanmamış, yalnızca `finally` tanımlanmışsa derleyici bunu `setjmp`/`longjmp` maliyetine girmeden doğrudan bir **kapsam erteleme (`deferral`)** işlemi olarak derler.
+   * `try` bloğu ister normalamlansın, ister içeride erken bir `return`, `break` veya `continue` çalışsın, `finally` bloğu kapsamdan çıkış anında kesinlikle ve sıfır ek yükle çalıştırılır.
+
+2. **Dinamik İstisna Yakalama Modu (`try { ... } catch (e) { ... } finally { ... }`):**
+   * İstisnalar `setjmp` ve `longjmp` temelli yerel mekanizma ile yönetilir.
+   * `throw` ifadesi global istisna yuvasına hata değerini yazar ve etkin `jmp_buf` hedefine atlar.
+   * `finally` bloğunun temel kullanım amacı:
+     * **Kaynak Güvenliği:** Bir hata fırlatılsa veya fonksiyon erken sonlandırılsa dahi açık dosyaların (`fclose`), soketlerin, kilitlerin (`mutex_unlock`) veya geçici belleklerin mutlak surette serbest bırakılmasını sağlamak.
+     * **Değişmezlerin Korunması (Invariants):** Hata durumunda dahi sistem durumunun tutarlı bir aşamaya geri getirilmesi.
+
+```typescript
+let fp = fopen("data.bin", "rb");
+try {
+  // Veri işleme; hata oluşabilir veya erken return yapılabilir
+  if (fp === null) throw "Dosya açılamadı";
+} finally {
+  // Hata olsa da olmasa da dosya mutlak surette kapatılır
+  if (fp !== null) fclose(fp);
+}
+```
 
 ---
 
-## 5. Eszamanlilik ve Coklu Is Parcacigi (Concurrency)
+## 5. Eşzamanlılık ve Çoklu İş Parçacığı (Concurrency)
 
-### 5.1. Isletim Sistemi Is Parcaciklari (`spawn` / `join`)
+### 5.1. İşletim Sistemi İş Parçacıkları (`spawn` / `join`)
 
-POSIX pthread tabanli native is parcacigi baslatma ve bekleme:
+POSIX pthread tabanlı yerel iş parçacığı başlatma ve bekleme:
 
-* `spawn(worker, arg): ThreadHandle`
-* `join(handle): void`
+* `spawn(worker, arg): ThreadHandle`: Bağımsız bir işletim sistemi thread'i başlatır.
+* `join(handle): void`: İş parçacığının tamamlanmasını bekler ve sistem kaynaklarını temizler.
 
 ### 5.2. `Channel<T>` (Thread-Safe Kanal)
 
-Is parcaciklari arasinda kilitli ve guvenli FIFO iletisimi:
+İş parçacıkları arasında kilitli ve güvenli FIFO iletişimi sağlar:
 
-* `constructor(capacity?: number)`: Bounded dairesel tampon.
-* `send(value: T): void`: Kanala veri yazar (kanal doluysa bloklar).
-* `recv(): T`: Kanaldan veri okur (kanal bossa bloklar).
-* `close(): void`: Kanali kapatir ve bekleyen parcaciklari uyandirir.
+* `pthread_mutex` ve `pthread_cond` tabanlı dairesel tampon mimarisi.
+* `send(value: T): void`: Kanala veri yazar (kanal doluysa iş parçacığını kilitler).
+* `recv(): T`: Kanaldan veri okur (kanal boşsa veri gelene kadar kilitler).
+* `close(): void`: Kanalı kapatır ve bekleyen tüm iş parçacıklarını uyandırır.
 
 ### 5.3. Asenkron Programlama (`async` / `await` / `Promise<T>`)
 
-* `async` anahtar sozcugu ile tanimlanan fonksiyonlar arka planda gorev olarak calisir.
-* `await` ifadesi asenkron gorevin sonucunu bekler.
+* `async` fonksiyonlar arka planda bir görev bağlamı oluşturur.
+* `await` ifadesi asenkron görevin sonucunu senkronize eder.
 
 ---
 
-## 6. Donanim Hizlandirma ve SIMD (Vector Dialect)
+## 6. Donanım Hızlandırma ve SIMD (Vector Dialect)
 
-RypeScript, MLIR Vector Dialect uzerinden 128-bit ve 256-bit SIMD tiplerini ve islevlerini dogrudan dilde birinci sinif eleman olarak destekler:
+RypeScript, MLIR Vector Dialect üzerinden 128-bit ve 256-bit SIMD tiplerini birinci sınıf vatandaş olarak destekler:
 
-### 6.1. Desteklenen Vektor Tipleri
+### 6.1. Desteklenen Vektör Tipleri
 
-* `f32x4`: 4 adet 32-bit kayan noktali sayi (128-bit)
-* `f64x2`: 2 adet 64-bit cift duyarlikli sayi (128-bit)
-* `i32x4`: 4 adet 32-bit tamsayi (128-bit)
-* `i64x2`: 2 adet 64-bit tamsayi (128-bit)
+* `f32x4`: 4 adet 32-bit kayan noktalı sayı (128-bit)
+* `f64x2`: 2 adet 64-bit çift duyarlıklı sayı (128-bit)
+* `i32x4`: 4 adet 32-bit tamsayı (128-bit)
+* `i64x2`: 2 adet 64-bit tamsayı (128-bit)
 
-### 6.2. SIMD Islemleri
+### 6.2. SIMD İşlemleri
 
-* **`splat(scalar)`:** Skaler bir degeri tum vektor seritlerine kopyalar.
-* **`load(ptr)` / `store(ptr, vec)`:** Ham bellekten vektorel yukleme ve kaydetme.
+* **`splat(scalar)`:** Skaler bir değeri tüm vektör şeritlerine kopyalar.
+* **`load(ptr)` / `store(ptr, vec)`:** Ham bellekten vektörel yükleme ve kaydetme.
 * **Aritmetik:** `add`, `sub`, `mul`, `div`.
 * **FMA:** `fma(a, b, c)` (Fused Multiply-Add: `a * b + c`).
-* **Indirgeme (Reduction):** `reduce_add`, `reduce_mul`, `reduce_min`, `reduce_max`.
-* **Serit Erisimi:** `extract(vec, idx)`, `insert(vec, idx, val)`.
+* **İndirgeme (Reduction):** `reduce_add`, `reduce_mul`, `reduce_min`, `reduce_max`.
+* **Şerit Erişimi:** `extract(vec, idx)`, `insert(vec, idx, val)`.
 * **Matematik:** `sqrt`, `abs`.
 
 ```typescript
 let a = f32x4(1.0, 2.0, 3.0, 4.0);
 let b = f32x4(5.0, 6.0, 7.0, 8.0);
 let c = f32x4.add(a, b);
-let top: f32 = f32x4.reduce_add(c);
+let sum: f32 = f32x4.reduce_add(c);
 ```
 
 ---
 
-## 7. C-FFI ve Harici Entegrasyonlar
+## 7. Derleyici Dekorötörleri ve Pragmatikleri
 
-### 7.1. C Baslik Dosyalarini Ice Aktarma
+RypeScript, fonksiyonların ve veri tiplerinin LLVM seviyesindeki kod üretimini yönlendirmek üzere özel dekoratör/pragma desteği sunar:
 
-C `.h` dosyalari dogrudan modul gibi import edilebilir. Derleyici C fonksiyon prototiplerini ayristirir ve semantik analizore tanitir:
+### 7.1. `@inline` ve `@noinline`
+
+* **`@inline`:** Fonksiyon çağrısını kaldırarak fonksiyon gövdesini çağrıldığı yere doğrudan kopyalar (LLVM `alwaysinline` özniteliği). Çağrı ek yükünü sıfırlar.
+* **`@noinline`:** Fonksiyonun satır içine gömülmesini kesin olarak engeller (LLVM `noinline` özniteliği). Hata ayıklama veya ikili boyutunu optimize etme amacıyla kullanılır.
+
+### 7.2. `@packed`
+
+C struct veya sınıf tanımlarında alanlar arası mimari hizalama dolgusunu (`padding`) tamamen kaldırır. Verileri bayt bayt sıkıştırarak ağ paketleri veya ikili dosya başlıkları için ideal bellek düzeni oluşturur.
+
+### 7.3. `@export_name("c_symbol")`
+
+RypeScript fonksiyonunun dışarıya aktarılacak saf C sembol adını belirler (C-ABI export alias). İsim karıştırma (name mangling) uygulanmaz; harici C/C++ kodları veya dinamik yükleyiciler bu sembole doğrudan ulaşabilir.
 
 ```typescript
-import { puts, exit } from "./stdio.h";
+@export_name("calculate_hash")
+function hashData(buf: pointer, len: i64): u64 {
+  // C uyumlu sembol olarak üretilir
+  return 0;
+}
 ```
 
-### 7.2. Dinamik Kutuphane Baglama
+### 7.4. `@napi`
 
-`.so`, `.dll` veya `.dylib` dosyalari import edildiginde, LLD baglama asamasinda bu kutuphaneler otomatik olarak parametrelere eklenir:
+Fonksiyonu doğrudan bir Node.js C++ eklentisi (`.node`) olarak dışa aktaran N-API bağlayıcı sarmalayıcısı üretir. JavaScript ortamından doğrudan çağrılabilir yerel eklentiler geliştirmek için kullanılır.
+
+### 7.5. `@unique`
+
+Bir işaretçinin veya kaynağın tekil sahipliğe sahip olduğunu (unique pointer) ve takma adlandırılmadığını (no-alias) belirterek LLVM'in daha agresif optimizasyonlar yapmasını sağlar.
+
+---
+
+## 8. C-FFI ve Harici Entegrasyonlar
+
+RypeScript, C ekosistemiyle sıfır maliyetli ve doğrudan etkileşim kuracak şekilde tasarlanmıştır.
+
+### 8.1. C Başlık Dosyalarını (`.h`) Doğrudan İçe Aktarma
+
+C `.h` başlık dosyaları, ayrı bir binding yazmaya gerek kalmadan doğrudan TypeScript modülü gibi içe aktarılabilir:
+
+```typescript
+import { fopen, fclose, fread, fwrite } from "./stdio.h";
+```
+
+* **Başlık Ayrıştırıcı (Header Scraper):** Derleyicinin semantik analizörü başlık dosyasındaki fonksiyon prototiplerini tarar, makroları ve yorumları ayıklar.
+* **Otomatik Tip Dönüşümü:**
+  * `char*` $\rightarrow$ `string`
+  * `void*`, `T*` $\rightarrow$ `pointer`
+  * `int`, `long`, `double`, `float` $\rightarrow$ sayısal tipler (`number` / `i32` / `f64`)
+  * `void` $\rightarrow$ `void`
+* İçe aktarılan C fonksiyonları `llvm.func` olarak harici sembol biçiminde derleme hattına dahil edilir.
+
+### 8.2. Paylaşımlı Kütüphaneleri (`.so`, `.dll`, `.dylib`) İçe Aktarma
+
+Dinamik kütüphaneler doğrudan `import` satırıyla bildirilebilir:
 
 ```typescript
 import "./libm.so";
+import "./libcrypto.so";
 ```
 
-### 7.3. Derleyici Dekoratorleri ve Pragmalari
-
-* **`@inline`:** Fonksiyonu cagirildigi yere satir ici (alwaysinline) gomer.
-* **`@noinline`:** Fonksiyonun satir icine gomulmesini engeller.
-* **`@packed`:** Struct veya sinif alanlari arasindaki hizalama dolgusunu (padding) kaldirir.
-* **`@export_name("c_sym")`:** Fonksiyonu belirtilen C sembol adiyla disariya aktarir.
-* **`@napi`:** Fonksiyonu Node.js C++ eklentisi (N-API) olarak disa aktaran sarmalayici kod uretir.
+`ModuleResolver` bu dosyaları derleme grafiğinde tespit eder ve LLD bağlayıcısının komut satırı argümanlarına otomatik olarak ekler.
 
 ---
 
-## 8. Modul Sistemi
+## 9. Bağlayıcı Bayrakları ve Arama Yolları (`-L`, `-l`)
 
-* ES Modul (`import` / `export`) sozluksel duzeni desteklenir.
-* Dosya yollari `./` veya `../` ile belirtilir.
-* Derleme sirasinda `ModuleResolver`, giris noktasindan baslayarak derinlemesine arama (DFS) ile bagimlilik grafigini cikarir ve topolojik sira ile AST listesini hazirlar.
+Derleme sırasında harici kütüphanelerin ve dizinlerin bağlanması için komut satırından standart bağlayıcı bayrakları desteklenir:
+
+* **`-L<dizin>`:** Bağlayıcıya kütüphane arama dizini ekler (örneğin: `-Lbin`, `-L/opt/llvm-rype/lib`).
+* **`-l<kütüphane>`:** Bağlayıcıya belirli bir sistem veya kullanıcı kütüphanesini bağlamasını bildirir (örneğin: `-lm`, `-lpthread`, `-lstdc++`, `-loxc_parser`).
+
+Bu bayraklar hem Stage 0 (`index.js`) hem de Stage 1 (`stage1/main.ts`) üzerinden toplanır ve `CompilerEngine` aracılığıyla doğrudan gömülü LLD sürücüsüne iletilir.

@@ -7,7 +7,7 @@ import { MLIRBuilder } from "./src/ir/MLIRBuilder.js";
 import { ASTLowering } from "./src/ir/ASTLowerer.js";
 import { CompilerEngine } from "./src/engine/CompilerEngine.js";
 import { TargetManager } from "./src/engine/TargetManager.js";
-import { DiagnosticReporter } from "./diagnostics.js";
+import { DiagnosticReporter } from "./src/diagnostics.js";
 
 const args = process.argv.slice(2);
 
