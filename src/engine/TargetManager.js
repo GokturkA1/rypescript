@@ -501,14 +501,27 @@ export class TargetManager {
     // 4. Windows MinGW Linker (ld.lld -m i386pep)
     if (linkerFlavor === "link_mingw") {
       const archFlag = targetInfo.arch === "i686" || targetInfo.arch === "i386" ? "i386pe" : "i386pep";
+      const extraLibDirs = options.extraLibDirs || [];
+      const extraLibs = options.extraLibs || [];
+      const defaultDirs = [
+        "/usr/x86_64-w64-mingw32/lib",
+        "/usr/lib/gcc/x86_64-w64-mingw32",
+        "/usr/lib/wine/x86_64-windows",
+      ];
+      const allDirs = [...extraLibDirs, ...defaultDirs.filter((d) => existsSync(d))];
+      const libDirArgs = allDirs.map((d) => `-L${d}`);
+
       if (isShared || format === "dll") {
         return [
           "-m", archFlag,
           "--shared",
           "-o", outputFile,
           objFile,
+          ...libDirArgs,
           "-lkernel32",
           "-lmsvcrt",
+          "-lcompiler-rt",
+          ...extraLibs.map((l) => `-l${l}`),
         ];
       }
       return [
@@ -517,8 +530,11 @@ export class TargetManager {
         objFile,
         "--entry=main",
         "--subsystem=console",
-        "-lkernel32",
+        ...libDirArgs,
         "-lmsvcrt",
+        "-lkernel32",
+        "-lcompiler-rt",
+        ...extraLibs.map((l) => `-l${l}`),
       ];
     }
 

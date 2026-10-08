@@ -218,11 +218,15 @@ export class TargetManager {
 
     if (targetInfo.linkerFlavor === "link_mingw") {
       let mingwArgs: string[] = [
-        "-o",
-        outputFile,
+        "-m", "i386pep",
+        "-o", outputFile,
         objFile,
+        "--entry=main",
+        "--subsystem=console",
+        "-L/usr/lib/wine/x86_64-windows",
+        "-lmsvcrt",
         "-lkernel32",
-        "-lmsvcrt"
+        "-lcompiler-rt"
       ];
       return mingwArgs;
     }

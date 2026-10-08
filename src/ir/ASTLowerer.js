@@ -871,7 +871,9 @@ export class ASTLowerer {
     this.emitNapiWrappers();
 
     const isWasm = Boolean(this.builder.targetInfo?.isWasm);
-    const mainHeader = isWasm ? "func.func @main() -> i32" : "func.func @main(%argc: i32, %argv: !llvm.ptr) -> i32";
+    const isWindows = Boolean(this.builder.targetInfo?.isWindows);
+    const takesNoArgs = isWasm || isWindows;
+    const mainHeader = takesNoArgs ? "func.func @main() -> i32" : "func.func @main(%argc: i32, %argv: !llvm.ptr) -> i32";
 
     this.builder.block(mainHeader, () => {
       this.builder.hasTerminated = false;
@@ -886,7 +888,7 @@ export class ASTLowerer {
       this.builder.emit(`${argvAddr} = llvm.mlir.addressof @g_process_argv : !llvm.ptr`);
 
       let processArgvPtrSSA = null;
-      if (isWasm) {
+      if (takesNoArgs) {
         const c0_i32 = this.builder.createConstant(0, "i32");
         this.builder.store(argcAddr, c0_i32);
         const emptyArr = this.instantiateArray({ elements: [] }, "!llvm.ptr", true, null);
